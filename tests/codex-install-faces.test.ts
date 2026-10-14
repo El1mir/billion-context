@@ -40,20 +40,23 @@ test("plugin install codex writes MCP + route + hook + skill, and remove reverts
     const { pluginInstall, pluginRemove, pluginStatusAll } = await import(
         "../src/plugin-install.ts"
     );
+    // `dist/` must exist on disk: the installer refuses to register a hook
+    // whose script is not built. CI's test lanes run the TS sources without
+    // bundling, so materialize the single file the installer checks for and
+    // remove exactly what we created.
+    const root = path.dirname(path.dirname(path.resolve("src/plugin-install.ts")));
+    const distDir = path.join(root, "dist");
+    const codexDir = path.join(distDir, "codex");
+    const hookScript = path.join(codexDir, "bootstrap-hook.js");
+    const createdDist = !fs.existsSync(distDir);
+    const createdCodex = !fs.existsSync(codexDir);
+    const createdHook = !fs.existsSync(hookScript);
+    if (createdHook) {
+        fs.mkdirSync(codexDir, { recursive: true });
+        fs.writeFileSync(hookScript, "// test stub: presence only\n");
+    }
     try {
         await withEnv({ CODEX_HOME: home }, () => {
-            // `dist/` must exist on disk: the installer refuses to register a
-            // hook whose script is not built, so simulate a built checkout.
-            const root = path.dirname(
-                path.dirname(path.resolve("src/plugin-install.ts")),
-            );
-            const hookScript = path.join(root, "dist", "codex", "bootstrap-hook.js");
-            assert.equal(
-                fs.existsSync(hookScript),
-                true,
-                "build before running this test: npm run build",
-            );
-
             const message = pluginInstall("codex");
             assert.match(message, /^codex: installed/);
             assert.match(message, /mcp: installed \[mcp_servers\.bili\]/);
@@ -112,6 +115,9 @@ test("plugin install codex writes MCP + route + hook + skill, and remove reverts
         });
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
+        if (createdHook) fs.rmSync(hookScript, { force: true });
+        if (createdCodex) fs.rmSync(codexDir, { recursive: true, force: true });
+        if (createdDist) fs.rmSync(distDir, { recursive: true, force: true });
     }
 });
 
