@@ -26,7 +26,7 @@ export const CODEX_SKILL_NAME = "bili";
  *  another tool) and is never written or deleted — the same content-based rule
  *  the model route and the hook face use. The name alone is not proof. */
 export const CODEX_SKILL_MARKER =
-	"<!-- bili-managed: refreshed by `bili plugin install codex`; local edits are overwritten -->";
+    "<!-- bili-managed: refreshed by `bili plugin install codex`; local edits are overwritten -->";
 
 /** The skill document bili installs. Kept as a constant so `codexSkillStatus`
  *  and the installer cannot drift apart. */
@@ -73,23 +73,23 @@ tools below ride along on the \`bili\` MCP server.
 
 /** `<CODEX_HOME>/skills/bili`. */
 export function codexSkillDir(env: NodeJS.ProcessEnv = process.env): string {
-	return path.join(resolveCodexHome(env), "skills", CODEX_SKILL_NAME);
+    return path.join(resolveCodexHome(env), "skills", CODEX_SKILL_NAME);
 }
 
 /** `<CODEX_HOME>/skills/bili/SKILL.md`. */
 export function codexSkillFile(env: NodeJS.ProcessEnv = process.env): string {
-	return path.join(codexSkillDir(env), "SKILL.md");
+    return path.join(codexSkillDir(env), "SKILL.md");
 }
 
 /** The frontmatter name a skill file declares, when parseable. */
 export function readSkillName(text: string): string | undefined {
-	const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(text);
-	const body = frontmatter?.[1];
-	if (body === undefined) return undefined;
-	const match = /^name:\s*(.+?)\s*$/m.exec(body);
-	const name = match?.[1];
-	if (name === undefined) return undefined;
-	return name.replace(/^["']|["']$/g, "");
+    const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(text);
+    const body = frontmatter?.[1];
+    if (body === undefined) return undefined;
+    const match = /^name:\s*(.+?)\s*$/m.exec(body);
+    const name = match?.[1];
+    if (name === undefined) return undefined;
+    return name.replace(/^["']|["']$/g, "");
 }
 
 export type CodexSkillState = "installed" | "missing" | "outdated" | "foreign";
@@ -98,72 +98,72 @@ export type CodexSkillState = "installed" | "missing" | "outdated" | "foreign";
  *  bytes differ (an upgrade is due, or the user edited a bili-managed file);
  *  `foreign` means a same-named skill bili does not own. */
 export function codexSkillStatus(
-	env: NodeJS.ProcessEnv = process.env,
+    env: NodeJS.ProcessEnv = process.env,
 ): CodexSkillState {
-	let text: string;
-	try {
-		text = fs.readFileSync(codexSkillFile(env), "utf8");
-	} catch {
-		return "missing";
-	}
-	if (text === CODEX_SKILL_MARKDOWN) return "installed";
-	return text.includes(CODEX_SKILL_MARKER) ? "outdated" : "foreign";
+    let text: string;
+    try {
+        text = fs.readFileSync(codexSkillFile(env), "utf8");
+    } catch {
+        return "missing";
+    }
+    if (text === CODEX_SKILL_MARKDOWN) return "installed";
+    return text.includes(CODEX_SKILL_MARKER) ? "outdated" : "foreign";
 }
 
 export interface CodexSkillInstall {
-	state: CodexSkillState | "written";
-	note: string;
-	written: boolean;
+    state: CodexSkillState | "written";
+    note: string;
+    written: boolean;
 }
 
 /** Install or refresh the skill. A file bili does not own is left alone. */
 export function installCodexSkill(
-	env: NodeJS.ProcessEnv = process.env,
+    env: NodeJS.ProcessEnv = process.env,
 ): CodexSkillInstall {
-	const file = codexSkillFile(env);
-	const state = codexSkillStatus(env);
-	if (state === "installed")
-		return {
-			state,
-			note: "ACP skill already installed",
-			written: false,
-		};
-	if (state === "foreign")
-		return {
-			state,
-			note: `${file} exists but is not a bili skill — left untouched`,
-			written: false,
-		};
-	fs.mkdirSync(codexSkillDir(env), { recursive: true });
-	fs.writeFileSync(file, CODEX_SKILL_MARKDOWN, { mode: 0o644 });
-	return {
-		state: "written",
-		note:
-			state === "missing"
-				? `ACP skill installed -> ${file}`
-				: `ACP skill refreshed -> ${file}`,
-		written: true,
-	};
+    const file = codexSkillFile(env);
+    const state = codexSkillStatus(env);
+    if (state === "installed")
+        return {
+            state,
+            note: "ACP skill already installed",
+            written: false,
+        };
+    if (state === "foreign")
+        return {
+            state,
+            note: `${file} exists but is not a bili skill — left untouched`,
+            written: false,
+        };
+    fs.mkdirSync(codexSkillDir(env), { recursive: true });
+    fs.writeFileSync(file, CODEX_SKILL_MARKDOWN, { mode: 0o644 });
+    return {
+        state: "written",
+        note:
+            state === "missing"
+                ? `ACP skill installed -> ${file}`
+                : `ACP skill refreshed -> ${file}`,
+        written: true,
+    };
 }
 
 /** Remove the skill file only when it is ours; drops the directory when empty. */
 export function removeCodexSkill(env: NodeJS.ProcessEnv = process.env): {
-	removed: boolean;
-	note: string;
+    removed: boolean;
+    note: string;
 } {
-	const state = codexSkillStatus(env);
-	if (state === "missing")
-		return { removed: false, note: "ACP skill not installed" };
-	if (state === "foreign")
-		return {
-			removed: false,
-			note: "ACP skill directory is not owned by bili — left untouched",
-		};
-	fs.unlinkSync(codexSkillFile(env));
-	try {
-		fs.rmdirSync(codexSkillDir(env));
-	} catch {
-		// A user may keep notes next to the skill; a non-empty dir stays.
-	}
-	return { removed: true, note: "ACP skill removed" };
+    const state = codexSkillStatus(env);
+    if (state === "missing")
+        return { removed: false, note: "ACP skill not installed" };
+    if (state === "foreign")
+        return {
+            removed: false,
+            note: "ACP skill directory is not owned by bili — left untouched",
+        };
+    fs.unlinkSync(codexSkillFile(env));
+    try {
+        fs.rmdirSync(codexSkillDir(env));
+    } catch {
+        // A user may keep notes next to the skill; a non-empty dir stays.
+    }
+    return { removed: true, note: "ACP skill removed" };
 }

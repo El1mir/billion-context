@@ -25,18 +25,18 @@ const FEATURES_KEY = "hooks";
 export type CodexHookStage = "session_start";
 
 export interface CodexHookEntry {
-	kind: CodexHookStage;
-	command: string;
-	timeoutSec?: number;
+    kind: CodexHookStage;
+    command: string;
+    timeoutSec?: number;
 }
 
 /** True for a hook command naming bili's own Codex hook script. Path may differ
  *  across installs/upgrades (checkout vs. global npm), so match the script
  *  name, not the absolute path — same rule as the Claude lane. */
 export function isBiliCodexHookCommand(command: string): boolean {
-	return /(?:^|[\\/])codex[\\/]bootstrap-hook\.(?:js|mjs|ts)["']?\s*(?:$|\s)/.test(
-		command.trim(),
-	);
+    return /(?:^|[\\/])codex[\\/]bootstrap-hook\.(?:js|mjs|ts)["']?\s*(?:$|\s)/.test(
+        command.trim(),
+    );
 }
 
 /** Parse the hook entries out of a `hooks.SessionStart` region. Only `command`
@@ -45,33 +45,33 @@ export function isBiliCodexHookCommand(command: string): boolean {
  *  of overwriting it. Handles both `command = "..."` on its own line (the
  *  array-of-tables form bili writes) and inline tables. */
 export function readCodexHookCommands(region: string): string[] {
-	const out: string[] = [];
-	for (const match of region.matchAll(
-		/command\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^']*)')/g,
-	)) {
-		const raw = match[1];
-		if (raw === undefined) continue;
-		if (raw.startsWith("'")) {
-			out.push(raw.slice(1, -1));
-			continue;
-		}
-		try {
-			const parsed: unknown = JSON.parse(raw);
-			if (typeof parsed === "string") out.push(parsed);
-		} catch {
-			// A malformed escape is not ours to repair; skip the entry.
-		}
-	}
-	return out;
+    const out: string[] = [];
+    for (const match of region.matchAll(
+        /command\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^']*)')/g,
+    )) {
+        const raw = match[1];
+        if (raw === undefined) continue;
+        if (raw.startsWith("'")) {
+            out.push(raw.slice(1, -1));
+            continue;
+        }
+        try {
+            const parsed: unknown = JSON.parse(raw);
+            if (typeof parsed === "string") out.push(parsed);
+        } catch {
+            // A malformed escape is not ours to repair; skip the entry.
+        }
+    }
+    return out;
 }
 
 /** Does the config already carry bili's hook entry? */
 export function findBiliCodexHook(text: string): string | undefined {
-	for (const region of tableRegions(text, CODEX_HOOKS_TABLE)) {
-		const command = readCodexHookCommands(region).find(isBiliCodexHookCommand);
-		if (command !== undefined) return command;
-	}
-	return undefined;
+    for (const region of tableRegions(text, CODEX_HOOKS_TABLE)) {
+        const command = readCodexHookCommands(region).find(isBiliCodexHookCommand);
+        if (command !== undefined) return command;
+    }
+    return undefined;
 }
 
 /** The `[features] hooks` switch, when the user has set one. Scanned by hand
@@ -85,24 +85,24 @@ export function findBiliCodexHook(text: string): string | undefined {
  *  "hook execution is not enabled" on a config that plainly said
  *  `hooks = true`, and would have nagged every Windows user. */
 export function codexHooksFeature(
-	text: string,
+    text: string,
 ): { value: boolean; raw: string } | undefined {
-	for (const region of tableRegions(text, FEATURES_TABLE)) {
-		for (const line of region.split("\n").slice(1)) {
-			const match =
-				/^[ \t]*hooks[ \t]*=[ \t]*([^#\s]+)[ \t]*(?:#.*)?\r?$/.exec(line);
-			if (match === null) continue;
-			const raw = match[1];
-			if (raw === undefined) continue;
-			return { value: raw.trim().toLowerCase() === "true", raw };
-		}
-	}
-	return undefined;
+    for (const region of tableRegions(text, FEATURES_TABLE)) {
+        for (const line of region.split("\n").slice(1)) {
+            const match =
+                /^[ \t]*hooks[ \t]*=[ \t]*([^#\s]+)[ \t]*(?:#.*)?\r?$/.exec(line);
+            if (match === null) continue;
+            const raw = match[1];
+            if (raw === undefined) continue;
+            return { value: raw.trim().toLowerCase() === "true", raw };
+        }
+    }
+    return undefined;
 }
 
 export type CodexHookPlan =
-	| { action: "install" | "refresh"; text: string; note: string }
-	| { action: "keep"; text: string; note: string };
+    | { action: "install" | "refresh"; text: string; note: string }
+    | { action: "keep"; text: string; note: string };
 
 /** Render the hook entry bili owns.
  *
@@ -120,7 +120,7 @@ export type CodexHookPlan =
  *  `probe-hooks.mjs` during development, and the regression test that pins this
  *  shape in tests/codex-hooks-skill.test.ts. */
 export function codexHookTable(command: string, timeoutSec = 15): string {
-	return `[[${CODEX_HOOKS_TABLE}]]\nhooks = [{ type = "command", command = ${JSON.stringify(command)}, timeout = ${timeoutSec} }]\n`;
+    return `[[${CODEX_HOOKS_TABLE}]]\nhooks = [{ type = "command", command = ${JSON.stringify(command)}, timeout = ${timeoutSec} }]\n`;
 }
 
 /** Is this region the nested `MatcherGroup` shape Codex actually registers?
@@ -128,42 +128,42 @@ export function codexHookTable(command: string, timeoutSec = 15): string {
  *  (bili's older, silently-invisible output), which must be replaced whole
  *  rather than command-rewritten. */
 function isNestedHookRegion(region: string): boolean {
-	return /^\s*hooks\s*=\s*\[/m.test(region);
+    return /^\s*hooks\s*=\s*\[/m.test(region);
 }
 
 /** The line ending a config already uses. Follows the repo convention
  *  (src/kimi/toml-edit.ts:21, src/launcher.ts:2466): never convert a user's
  *  file, and never mix endings into it — Codex keeps CRLF on Windows. */
 function detectEol(text: string): string {
-	return text.includes("\r\n") ? "\r\n" : "\n";
+    return text.includes("\r\n") ? "\r\n" : "\n";
 }
 
 /** Replace bili's own entry inside an existing region, leaving every other
  *  entry (and any foreign formatting we cannot parse) untouched: only the
  *  matched `command = "..."` span is rewritten. */
 function rewriteBiliHookCommand(region: string, command: string): string {
-	let replaced = false;
-	return region.replace(
-		/command\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^']*)')/g,
-		(match, raw: string) => {
-			if (replaced) return match;
-			let decoded: string | undefined;
-			if (raw.startsWith("'")) {
-				decoded = raw.slice(1, -1);
-			} else {
-				try {
-					const parsed: unknown = JSON.parse(raw);
-					decoded = typeof parsed === "string" ? parsed : undefined;
-				} catch {
-					decoded = undefined;
-				}
-			}
-			if (decoded === undefined || !isBiliCodexHookCommand(decoded))
-				return match;
-			replaced = true;
-			return `command = ${JSON.stringify(command)}`;
-		},
-	);
+    let replaced = false;
+    return region.replace(
+        /command\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^']*)')/g,
+        (match, raw: string) => {
+            if (replaced) return match;
+            let decoded: string | undefined;
+            if (raw.startsWith("'")) {
+                decoded = raw.slice(1, -1);
+            } else {
+                try {
+                    const parsed: unknown = JSON.parse(raw);
+                    decoded = typeof parsed === "string" ? parsed : undefined;
+                } catch {
+                    decoded = undefined;
+                }
+            }
+            if (decoded === undefined || !isBiliCodexHookCommand(decoded))
+                return match;
+            replaced = true;
+            return `command = ${JSON.stringify(command)}`;
+        },
+    );
 }
 
 /** Pure planner for the hook face. `command` is the full hook command line
@@ -177,54 +177,54 @@ function rewriteBiliHookCommand(region: string, command: string): string {
  *  (a foreign SessionStart entry already present), meant bili's hook silently
  *  never installed. */
 export function planCodexHook(text: string, command: string): CodexHookPlan {
-	const regions = tableRegions(text, CODEX_HOOKS_TABLE);
-	const owned = regions.find(
-		(region) =>
-			readCodexHookCommands(region).find(isBiliCodexHookCommand) !== undefined,
-	);
-	if (owned === undefined) {
-		const eol = detectEol(text);
-		const prefix = text.length === 0 || text.endsWith("\n") ? text : `${text}${eol}`;
-		// A foreign entry in the same array is preserved verbatim: we only append.
-		const suffix =
-			regions.length > 0 ? " (kept existing SessionStart entries)" : "";
-		const entry = codexHookTable(command).replace(/\n$/, "").split("\n").join(eol);
-		return {
-			action: "install",
-			text: `${prefix}${eol}${entry}${eol}`,
-			note: `SessionStart hook added -> ${CODEX_HOOKS_TABLE}${suffix}`,
-		};
-	}
-	const existing = readCodexHookCommands(owned).find(isBiliCodexHookCommand);
-	// Self-heal: an entry bili wrote before the MatcherGroup fix carries
-	// `type`/`command`/`timeout` directly on the element, which Codex silently
-	// ignores. Rewriting only the command string would leave it invisible
-	// forever, so the whole region is replaced with the nested shape.
-	if (!isNestedHookRegion(owned)) {
-		const replacement = codexHookTable(command)
-			.replace(/\n$/, "")
-			.split("\n")
-			.join(detectEol(text));
-		return {
-			action: "refresh",
-			text: text.replace(owned, replacement),
-			note: "SessionStart hook upgraded to the shape Codex registers",
-		};
-	}
-	if (existing === command)
-		return {
-			action: "keep",
-			text,
-			note: "SessionStart hook already installed",
-		};
-	const next = rewriteBiliHookCommand(owned, command);
-	if (next === owned)
-		return { action: "keep", text, note: "SessionStart hook left as-is" };
-	return {
-		action: "refresh",
-		text: text.replace(owned, next),
-		note: "SessionStart hook refreshed to the current command",
-	};
+    const regions = tableRegions(text, CODEX_HOOKS_TABLE);
+    const owned = regions.find(
+        (region) =>
+            readCodexHookCommands(region).find(isBiliCodexHookCommand) !== undefined,
+    );
+    if (owned === undefined) {
+        const eol = detectEol(text);
+        const prefix = text.length === 0 || text.endsWith("\n") ? text : `${text}${eol}`;
+        // A foreign entry in the same array is preserved verbatim: we only append.
+        const suffix =
+            regions.length > 0 ? " (kept existing SessionStart entries)" : "";
+        const entry = codexHookTable(command).replace(/\n$/, "").split("\n").join(eol);
+        return {
+            action: "install",
+            text: `${prefix}${eol}${entry}${eol}`,
+            note: `SessionStart hook added -> ${CODEX_HOOKS_TABLE}${suffix}`,
+        };
+    }
+    const existing = readCodexHookCommands(owned).find(isBiliCodexHookCommand);
+    // Self-heal: an entry bili wrote before the MatcherGroup fix carries
+    // `type`/`command`/`timeout` directly on the element, which Codex silently
+    // ignores. Rewriting only the command string would leave it invisible
+    // forever, so the whole region is replaced with the nested shape.
+    if (!isNestedHookRegion(owned)) {
+        const replacement = codexHookTable(command)
+            .replace(/\n$/, "")
+            .split("\n")
+            .join(detectEol(text));
+        return {
+            action: "refresh",
+            text: text.replace(owned, replacement),
+            note: "SessionStart hook upgraded to the shape Codex registers",
+        };
+    }
+    if (existing === command)
+        return {
+            action: "keep",
+            text,
+            note: "SessionStart hook already installed",
+        };
+    const next = rewriteBiliHookCommand(owned, command);
+    if (next === owned)
+        return { action: "keep", text, note: "SessionStart hook left as-is" };
+    return {
+        action: "refresh",
+        text: text.replace(owned, next),
+        note: "SessionStart hook refreshed to the current command",
+    };
 }
 
 /** Delete bili's hook entry, keeping foreign entries. Returns the text plus
@@ -237,33 +237,33 @@ export function planCodexHook(text: string, command: string): CodexHookPlan {
  *  array-of-tables shape that pattern never matched, and uninstall silently
  *  left a `command = ""` stub hook behind. */
 export function stripCodexHook(text: string): {
-	text: string;
-	removed: boolean;
+    text: string;
+    removed: boolean;
 } {
-	let removed = false;
-	let next = text;
-	for (const region of tableRegions(text, CODEX_HOOKS_TABLE)) {
-		const ours = readCodexHookCommands(region).find(isBiliCodexHookCommand);
-		if (ours === undefined) continue;
-		removed = true;
-		next = next
-			.replace(region, "")
-			.replace(/\n{3,}/g, "\n\n")
-			.replace(/^\n+/, "");
-		if (next.length > 0 && !next.endsWith("\n")) next = `${next}\n`;
-	}
-	return { text: next, removed };
+    let removed = false;
+    let next = text;
+    for (const region of tableRegions(text, CODEX_HOOKS_TABLE)) {
+        const ours = readCodexHookCommands(region).find(isBiliCodexHookCommand);
+        if (ours === undefined) continue;
+        removed = true;
+        next = next
+            .replace(region, "")
+            .replace(/\n{3,}/g, "\n\n")
+            .replace(/^\n+/, "");
+        if (next.length > 0 && !next.endsWith("\n")) next = `${next}\n`;
+    }
+    return { text: next, removed };
 }
 
 /** `[features] hooks` must be true for Codex to run the hook. Reports what the
  *  caller has to add, without editing an existing switch the user set. */
 export function codexHooksEnabledNote(text: string): string {
-	const feature = codexHooksFeature(text);
-	if (feature === undefined)
-		return `enable hook execution with [${FEATURES_TABLE}] ${FEATURES_KEY} = true`;
-	if (!feature.value)
-		return `[${FEATURES_TABLE}] ${FEATURES_KEY} = ${feature.raw} disables hooks — set it to true to activate`;
-	return "";
+    const feature = codexHooksFeature(text);
+    if (feature === undefined)
+        return `enable hook execution with [${FEATURES_TABLE}] ${FEATURES_KEY} = true`;
+    if (!feature.value)
+        return `[${FEATURES_TABLE}] ${FEATURES_KEY} = ${feature.raw} disables hooks — set it to true to activate`;
+    return "";
 }
 
 /** Last line of defence before a hook face is written to a user's real config.
@@ -291,52 +291,52 @@ export function codexHooksEnabledNote(text: string): string {
  *  Codex accepts the entry (that needs the app-server `hooks/list` RPC), but it
  *  rules out every shape we have seen it reject or silently ignore. */
 export function assertCodexConfigLoads(text: string): string | undefined {
-	for (const line of text.split("\n")) {
-		const header = /^\s*(\[\[?[^\]]+\]\]?)\s*(?:#.*)?$/.exec(line);
-		if (header === null) continue;
-		const raw = header[1];
-		if (raw === undefined) continue;
-		const inner = raw.replace(/^\[\[?/, "").replace(/\]\]?$/, "").trim();
-		// `hooks` spans more than the stage tables bili writes: Codex keeps its
-		// OWN trust ledger at `[hooks.state.'<config>:<stage>:<i>:<j>']`, written
-		// as a single-bracket table (it holds key/value pairs, so a table is the
-		// correct shape and must never be flagged). Matching a bare `hooks`
-		// prefix treated Codex's own output as a malformed stage table and
-		// rejected the whole config, which silently skipped the hook face
-		// whenever a hook had ever been trusted. Only what bili writes is
-		// inspected: the stage table, plus the flat `[[hooks]]` misuse.
-		if (inner !== CODEX_HOOKS_TABLE && inner !== "hooks") continue;
-		// `[[hooks]]` with `event = "..."` is the flat-sequence shape Codex
-		// rejects with `expected struct HooksToml`: a bare `hooks` array cannot
-		// hold stage tables keyed by name.
-		if (inner === "hooks")
-			return "`[[hooks]]` is not a hook stage — use `[[hooks.SessionStart]]` (Codex expects a struct HooksToml keyed by stage name)";
-		if (raw.startsWith("[[")) continue;
-		return `${raw.trim()} must be [[${inner}]] (Codex reads 'hooks' as a sequence, not a table)`;
-	}
-	// A top-level `hooks = ...` assignment would also collapse the sequence.
-	for (const line of text.split("\n")) {
-		if (/^\s*\[/.test(line)) break;
-		if (/^\s*hooks\s*=/.test(line))
-			return "a top-level `hooks = ...` key must not be set (Codex reads 'hooks' as a sequence of stage tables)";
-	}
-	for (const region of tableRegions(text, CODEX_HOOKS_TABLE)) {
-		const commands = readCodexHookCommands(region);
-		if (commands.length === 0)
-			return `a ${CODEX_HOOKS_TABLE} entry carries no command`;
-		if (commands.some((command) => command.trim() === ""))
-			return `a ${CODEX_HOOKS_TABLE} entry carries an empty command`;
-		// The MatcherGroup shape: handler fields belong INSIDE `hooks = [...]`.
-		// Without this the entry loads and is silently ignored.
-		//
-		// Scoped to OUR entry on purpose. A foreign entry with the wrong shape is
-		// its owner's bug, and refusing to write bili's own correct entry because
-		// of it would strand exactly the users who already run another hook tool.
-		if (
-			commands.some(isBiliCodexHookCommand) &&
-			!isNestedHookRegion(region)
-		)
-			return `a ${CODEX_HOOKS_TABLE} entry must nest its handler in a 'hooks = [{ type = "command", ... }]' array (fields set directly on the entry are dropped by Codex, which registers nothing)`;
-	}
-	return undefined;
+    for (const line of text.split("\n")) {
+        const header = /^\s*(\[\[?[^\]]+\]\]?)\s*(?:#.*)?$/.exec(line);
+        if (header === null) continue;
+        const raw = header[1];
+        if (raw === undefined) continue;
+        const inner = raw.replace(/^\[\[?/, "").replace(/\]\]?$/, "").trim();
+        // `hooks` spans more than the stage tables bili writes: Codex keeps its
+        // OWN trust ledger at `[hooks.state.'<config>:<stage>:<i>:<j>']`, written
+        // as a single-bracket table (it holds key/value pairs, so a table is the
+        // correct shape and must never be flagged). Matching a bare `hooks`
+        // prefix treated Codex's own output as a malformed stage table and
+        // rejected the whole config, which silently skipped the hook face
+        // whenever a hook had ever been trusted. Only what bili writes is
+        // inspected: the stage table, plus the flat `[[hooks]]` misuse.
+        if (inner !== CODEX_HOOKS_TABLE && inner !== "hooks") continue;
+        // `[[hooks]]` with `event = "..."` is the flat-sequence shape Codex
+        // rejects with `expected struct HooksToml`: a bare `hooks` array cannot
+        // hold stage tables keyed by name.
+        if (inner === "hooks")
+            return "`[[hooks]]` is not a hook stage — use `[[hooks.SessionStart]]` (Codex expects a struct HooksToml keyed by stage name)";
+        if (raw.startsWith("[[")) continue;
+        return `${raw.trim()} must be [[${inner}]] (Codex reads 'hooks' as a sequence, not a table)`;
+    }
+    // A top-level `hooks = ...` assignment would also collapse the sequence.
+    for (const line of text.split("\n")) {
+        if (/^\s*\[/.test(line)) break;
+        if (/^\s*hooks\s*=/.test(line))
+            return "a top-level `hooks = ...` key must not be set (Codex reads 'hooks' as a sequence of stage tables)";
+    }
+    for (const region of tableRegions(text, CODEX_HOOKS_TABLE)) {
+        const commands = readCodexHookCommands(region);
+        if (commands.length === 0)
+            return `a ${CODEX_HOOKS_TABLE} entry carries no command`;
+        if (commands.some((command) => command.trim() === ""))
+            return `a ${CODEX_HOOKS_TABLE} entry carries an empty command`;
+        // The MatcherGroup shape: handler fields belong INSIDE `hooks = [...]`.
+        // Without this the entry loads and is silently ignored.
+        //
+        // Scoped to OUR entry on purpose. A foreign entry with the wrong shape is
+        // its owner's bug, and refusing to write bili's own correct entry because
+        // of it would strand exactly the users who already run another hook tool.
+        if (
+            commands.some(isBiliCodexHookCommand) &&
+            !isNestedHookRegion(region)
+        )
+            return `a ${CODEX_HOOKS_TABLE} entry must nest its handler in a 'hooks = [{ type = "command", ... }]' array (fields set directly on the entry are dropped by Codex, which registers nothing)`;
+    }
+    return undefined;
 }

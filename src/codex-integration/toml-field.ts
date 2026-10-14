@@ -8,191 +8,191 @@
 
 /** A located top-level scalar. `line` is a 0-based index into `text.split("\n")`. */
 export interface TopLevelScalar {
-	key: string;
-	value: string;
-	line: number;
+    key: string;
+    value: string;
+    line: number;
 }
 
 /** TOML basic (double-quoted) and literal (single-quoted) string bodies. A
  *  line whose value is an array/inline-table/multiline string is NOT a scalar
  *  we can own — it is reported as not-found rather than mis-parsed. */
 const SCALAR_RE =
-	/^([A-Za-z0-9_-]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\s*(?:#.*)?$/;
+    /^([A-Za-z0-9_-]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\s*(?:#.*)?$/;
 
 function decode(raw: string, quoted: "basic" | "literal"): string {
-	if (quoted === "literal") return raw;
-	try {
-		const parsed: unknown = JSON.parse(`"${raw}"`);
-		return typeof parsed === "string" ? parsed : raw;
-	} catch {
-		return raw;
-	}
+    if (quoted === "literal") return raw;
+    try {
+        const parsed: unknown = JSON.parse(`"${raw}"`);
+        return typeof parsed === "string" ? parsed : raw;
+    } catch {
+        return raw;
+    }
 }
 
 function preserveInlineComment(original: string, rendered: string): string {
-	let quote: "basic" | "literal" | undefined;
-	let escaped = false;
-	for (let i = 0; i < original.length; i++) {
-		const char = original[i]!;
-		if (quote === "basic") {
-			if (escaped) escaped = false;
-			else if (char === "\\") escaped = true;
-			else if (char === '"') quote = undefined;
-		} else if (quote === "literal") {
-			if (char === "'") quote = undefined;
-		} else if (char === '"') quote = "basic";
-		else if (char === "'") quote = "literal";
-		else if (char === "#") return `${rendered} ${original.slice(i).trimEnd()}`;
-	}
-	return rendered;
+    let quote: "basic" | "literal" | undefined;
+    let escaped = false;
+    for (let i = 0; i < original.length; i++) {
+        const char = original[i]!;
+        if (quote === "basic") {
+            if (escaped) escaped = false;
+            else if (char === "\\") escaped = true;
+            else if (char === '"') quote = undefined;
+        } else if (quote === "literal") {
+            if (char === "'") quote = undefined;
+        } else if (char === '"') quote = "basic";
+        else if (char === "'") quote = "literal";
+        else if (char === "#") return `${rendered} ${original.slice(i).trimEnd()}`;
+    }
+    return rendered;
 }
 
 /** Locate a top-level scalar, stopping at the first table header: a key after
  *  `[some.table]` belongs to that table, not to the file root. */
 export function findTopLevelScalar(
-	text: string,
-	key: string,
+    text: string,
+    key: string,
 ): TopLevelScalar | undefined {
-	const lines = text.split("\n");
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i]!.trim();
-		if (line.startsWith("[")) return undefined;
-		if (line === "" || line.startsWith("#")) continue;
-		const m = SCALAR_RE.exec(line);
-		if (m === null || m[1] !== key) continue;
-		return {
-			key,
-			value:
-				m[2] !== undefined ? decode(m[2], "basic") : decode(m[3]!, "literal"),
-			line: i,
-		};
-	}
-	return undefined;
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!.trim();
+        if (line.startsWith("[")) return undefined;
+        if (line === "" || line.startsWith("#")) continue;
+        const m = SCALAR_RE.exec(line);
+        if (m === null || m[1] !== key) continue;
+        return {
+            key,
+            value:
+                m[2] !== undefined ? decode(m[2], "basic") : decode(m[3]!, "literal"),
+            line: i,
+        };
+    }
+    return undefined;
 }
 
 /** Set (or insert) a top-level scalar. JSON.stringify emits a valid TOML basic
  *  string — both grammars escape `\` and `"` identically — which is the same
  *  serialization plugin-install.ts `codexBlock` relies on. */
 export function setTopLevelScalar(
-	text: string,
-	key: string,
-	value: string,
+    text: string,
+    key: string,
+    value: string,
 ): string {
-	const rendered = `${key} = ${JSON.stringify(value)}`;
-	const lines = text.split("\n");
-	const existing = findTopLevelScalar(text, key);
-	if (existing !== undefined) {
-		lines[existing.line] = preserveInlineComment(
-			lines[existing.line]!,
-			rendered,
-		);
-		return lines.join("\n");
-	}
-	// Insert after the last top-level key; with none, at the very top so the
-	// key can never land inside a nested table.
-	let at = 0;
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i]!.trim();
-		if (line.startsWith("[")) break;
-		if (line === "" || line.startsWith("#")) continue;
-		at = i + 1;
-	}
-	lines.splice(at, 0, rendered);
-	return lines.join("\n");
+    const rendered = `${key} = ${JSON.stringify(value)}`;
+    const lines = text.split("\n");
+    const existing = findTopLevelScalar(text, key);
+    if (existing !== undefined) {
+        lines[existing.line] = preserveInlineComment(
+            lines[existing.line]!,
+            rendered,
+        );
+        return lines.join("\n");
+    }
+    // Insert after the last top-level key; with none, at the very top so the
+    // key can never land inside a nested table.
+    let at = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!.trim();
+        if (line.startsWith("[")) break;
+        if (line === "" || line.startsWith("#")) continue;
+        at = i + 1;
+    }
+    lines.splice(at, 0, rendered);
+    return lines.join("\n");
 }
 
 /** Delete a top-level scalar line. Only that line goes; surrounding comments
  *  and blank lines are left exactly as the user had them. */
 export function removeTopLevelScalar(text: string, key: string): string {
-	const existing = findTopLevelScalar(text, key);
-	if (existing === undefined) return text;
-	const lines = text.split("\n");
-	lines.splice(existing.line, 1);
-	return lines.join("\n");
+    const existing = findTopLevelScalar(text, key);
+    if (existing === undefined) return text;
+    const lines = text.split("\n");
+    lines.splice(existing.line, 1);
+    return lines.join("\n");
 }
 
 /** A located scalar inside an exact TOML table. */
 export interface TableScalar extends TopLevelScalar {
-	table: string;
+    table: string;
 }
 
 export function findTableScalar(
-	text: string,
-	table: string,
-	key: string,
+    text: string,
+    table: string,
+    key: string,
 ): TableScalar | undefined {
-	const lines = text.split("\n");
-	let active = false;
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i]!.trim();
-		const header = /^\[([^\]]+)\]\s*(?:#.*)?$/.exec(line);
-		if (header) {
-			if (active) return undefined;
-			active = header[1]!.trim() === table;
-			continue;
-		}
-		if (!active || line === "" || line.startsWith("#")) continue;
-		const match = SCALAR_RE.exec(line);
-		if (!match || match[1] !== key) continue;
-		return {
-			table,
-			key,
-			value:
-				match[2] !== undefined
-					? decode(match[2], "basic")
-					: decode(match[3]!, "literal"),
-			line: i,
-		};
-	}
-	return undefined;
+    const lines = text.split("\n");
+    let active = false;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!.trim();
+        const header = /^\[([^\]]+)\]\s*(?:#.*)?$/.exec(line);
+        if (header) {
+            if (active) return undefined;
+            active = header[1]!.trim() === table;
+            continue;
+        }
+        if (!active || line === "" || line.startsWith("#")) continue;
+        const match = SCALAR_RE.exec(line);
+        if (!match || match[1] !== key) continue;
+        return {
+            table,
+            key,
+            value:
+                match[2] !== undefined
+                    ? decode(match[2], "basic")
+                    : decode(match[3]!, "literal"),
+            line: i,
+        };
+    }
+    return undefined;
 }
 
 export function setTableScalar(
-	text: string,
-	table: string,
-	key: string,
-	value: string,
+    text: string,
+    table: string,
+    key: string,
+    value: string,
 ): string {
-	const lines = text.split("\n");
-	const rendered = `${key} = ${JSON.stringify(value)}`;
-	const existing = findTableScalar(text, table, key);
-	if (existing) {
-		lines[existing.line] = preserveInlineComment(
-			lines[existing.line]!,
-			rendered,
-		);
-		return lines.join("\n");
-	}
-	let tableLine = -1;
-	let tableEnd = lines.length;
-	for (let i = 0; i < lines.length; i++) {
-		const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(lines[i]!);
-		if (!header) continue;
-		if (tableLine >= 0) {
-			tableEnd = i;
-			break;
-		}
-		if (header[1]!.trim() === table) tableLine = i;
-	}
-	if (tableLine < 0) {
-		const prefix =
-			text.length === 0 || text.endsWith("\n") ? text : `${text}\n`;
-		return `${prefix}\n[${table}]\n${rendered}\n`;
-	}
-	lines.splice(tableEnd, 0, rendered);
-	return lines.join("\n");
+    const lines = text.split("\n");
+    const rendered = `${key} = ${JSON.stringify(value)}`;
+    const existing = findTableScalar(text, table, key);
+    if (existing) {
+        lines[existing.line] = preserveInlineComment(
+            lines[existing.line]!,
+            rendered,
+        );
+        return lines.join("\n");
+    }
+    let tableLine = -1;
+    let tableEnd = lines.length;
+    for (let i = 0; i < lines.length; i++) {
+        const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(lines[i]!);
+        if (!header) continue;
+        if (tableLine >= 0) {
+            tableEnd = i;
+            break;
+        }
+        if (header[1]!.trim() === table) tableLine = i;
+    }
+    if (tableLine < 0) {
+        const prefix =
+            text.length === 0 || text.endsWith("\n") ? text : `${text}\n`;
+        return `${prefix}\n[${table}]\n${rendered}\n`;
+    }
+    lines.splice(tableEnd, 0, rendered);
+    return lines.join("\n");
 }
 
 export function removeTableScalar(
-	text: string,
-	table: string,
-	key: string,
+    text: string,
+    table: string,
+    key: string,
 ): string {
-	const existing = findTableScalar(text, table, key);
-	if (!existing) return text;
-	const lines = text.split("\n");
-	lines.splice(existing.line, 1);
-	return lines.join("\n");
+    const existing = findTableScalar(text, table, key);
+    if (!existing) return text;
+    const lines = text.split("\n");
+    lines.splice(existing.line, 1);
+    return lines.join("\n");
 }
 
 /** Insert a raw (already rendered) line inside an exact table, after its last
@@ -201,63 +201,63 @@ export function removeTableScalar(
  *  and for array-of-inline-table hook entries. Existing content is untouched;
  *  when the key is already present the caller decides (replace vs. refuse). */
 export function insertTableRaw(
-	text: string,
-	table: string,
-	rendered: string,
+    text: string,
+    table: string,
+    rendered: string,
 ): string {
-	const lines = text.split("\n");
-	let tableLine = -1;
-	let tableEnd = lines.length;
-	for (let i = 0; i < lines.length; i++) {
-		const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(lines[i]!);
-		if (!header) continue;
-		if (tableLine >= 0) {
-			tableEnd = i;
-			break;
-		}
-		if (header[1]!.trim() === table) tableLine = i;
-	}
-	if (tableLine < 0) {
-		const prefix =
-			text.length === 0 || text.endsWith("\n") ? text : `${text}\n`;
-		return `${prefix}\n[${table}]\n${rendered}\n`;
-	}
-	// Land before trailing blank/comment lines so the new scalar stays inside
-	// the table's own block instead of after a user's separator comment.
-	let at = tableEnd;
-	while (at > tableLine + 1) {
-		const line = lines[at - 1]!.trim();
-		if (line !== "" && !line.startsWith("#")) break;
-		at--;
-	}
-	lines.splice(at, 0, rendered);
-	return lines.join("\n");
+    const lines = text.split("\n");
+    let tableLine = -1;
+    let tableEnd = lines.length;
+    for (let i = 0; i < lines.length; i++) {
+        const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(lines[i]!);
+        if (!header) continue;
+        if (tableLine >= 0) {
+            tableEnd = i;
+            break;
+        }
+        if (header[1]!.trim() === table) tableLine = i;
+    }
+    if (tableLine < 0) {
+        const prefix =
+            text.length === 0 || text.endsWith("\n") ? text : `${text}\n`;
+        return `${prefix}\n[${table}]\n${rendered}\n`;
+    }
+    // Land before trailing blank/comment lines so the new scalar stays inside
+    // the table's own block instead of after a user's separator comment.
+    let at = tableEnd;
+    while (at > tableLine + 1) {
+        const line = lines[at - 1]!.trim();
+        if (line !== "" && !line.startsWith("#")) break;
+        at--;
+    }
+    lines.splice(at, 0, rendered);
+    return lines.join("\n");
 }
 
 /** Replace an entire table header line and its scalars with `rendered` (which
  *  must itself include the `[table]` header). Used for hook tables bili owns
  *  end-to-end; a table with foreign structure is reported, never clobbered. */
 export function replaceTable(
-	text: string,
-	table: string,
-	rendered: string,
+    text: string,
+    table: string,
+    rendered: string,
 ): string {
-	const lines = text.split("\n");
-	let start = -1;
-	let end = lines.length;
-	for (let i = 0; i < lines.length; i++) {
-		const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(lines[i]!);
-		if (!header) continue;
-		if (start >= 0) {
-			end = i;
-			break;
-		}
-		if (header[1]!.trim() === table) start = i;
-	}
-	if (start < 0) return text;
-	const block = rendered.replace(/\n+$/, "").split("\n");
-	lines.splice(start, end - start, ...block);
-	return lines.join("\n");
+    const lines = text.split("\n");
+    let start = -1;
+    let end = lines.length;
+    for (let i = 0; i < lines.length; i++) {
+        const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(lines[i]!);
+        if (!header) continue;
+        if (start >= 0) {
+            end = i;
+            break;
+        }
+        if (header[1]!.trim() === table) start = i;
+    }
+    if (start < 0) return text;
+    const block = rendered.replace(/\n+$/, "").split("\n");
+    lines.splice(start, end - start, ...block);
+    return lines.join("\n");
 }
 
 /** Every region of `text` covered by an exact `[table]` or `[[table]]` header
@@ -269,20 +269,20 @@ export function replaceTable(
  *  and a caller that rewrote or dropped the region while leaving `[hooks...]`
  *  behind would silently corrupt the array into a map. */
 export function tableRegions(text: string, table: string): string[] {
-	const lines = text.split("\n");
-	const out: string[] = [];
-	let current: string[] | undefined;
-	for (const line of lines) {
-		const header = /^\s*(\[\[?[^\]]+\]\]?)\s*(?:#.*)?$/.exec(line);
-		if (header) {
-			if (current !== undefined) out.push(current.join("\n"));
-			const raw = header[1];
-			const inner = raw?.replace(/^\[\[?/, "").replace(/\]\]?$/, "").trim();
-			current = inner === table ? [line] : undefined;
-			continue;
-		}
-		if (current !== undefined) current.push(line);
-	}
-	if (current !== undefined) out.push(current.join("\n"));
-	return out.filter((region) => region.trim().startsWith("["));
+    const lines = text.split("\n");
+    const out: string[] = [];
+    let current: string[] | undefined;
+    for (const line of lines) {
+        const header = /^\s*(\[\[?[^\]]+\]\]?)\s*(?:#.*)?$/.exec(line);
+        if (header) {
+            if (current !== undefined) out.push(current.join("\n"));
+            const raw = header[1];
+            const inner = raw?.replace(/^\[\[?/, "").replace(/\]\]?$/, "").trim();
+            current = inner === table ? [line] : undefined;
+            continue;
+        }
+        if (current !== undefined) current.push(line);
+    }
+    if (current !== undefined) out.push(current.join("\n"));
+    return out.filter((region) => region.trim().startsWith("["));
 }
