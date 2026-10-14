@@ -1860,6 +1860,7 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili plugin install <agent>` | Install the native-tool plugin / MCP bridge into a host — see [Plugin Mode](#plugin-mode-native-tools) |
 | `bili plugin remove <agent>` | Remove it again |
 | `bili plugin list` | Show install status for every host |
+| `bili service install\|status\|restart\|enable\|disable\|remove` | Manage the persistent per-user proxy service (Task Scheduler logon task on Windows, systemd user unit on Linux) that zero-touch lanes like codex rely on; JSON output, exit code 1 when the desired state is not reached (#3176) |
 | `bili mcp` | Run the bili MCP server standalone on stdio |
 | `bili plugin-register <id> [--origin URL] [--agent name]` | Pre-bind a conversation id to plugin mode (advanced) |
 | `bili --version` / `bili --help` | Print version / help |
@@ -2086,7 +2087,7 @@ bili plugin install pi      # add this billion-context install to pi's settings.
 bili plugin install omp     # same for omp (config.yml extensions)
 bili plugin install claude  # register the bili MCP server (claude mcp add, user scope) + write
                                    # <configdir>/commands/acp-cache.md (model-mediated /acp-cache)
-bili plugin install codex   # append [mcp_servers.bili] to ~/.codex/config.toml
+bili plugin install codex   # manage codex's MCP+ACP tools / model route / SessionStart hook / ACP skill in ~/.codex/config.toml (+ auto-start proxy service) — see CLIENTS.md (Codex)
 bili plugin install opencode  # self-spawning native plugin (+ tools) in ~/.config/opencode/opencode.json
                                   # --with-mcp also adds the mcp.bili MCP face (no origin pin — live discovery)
 bili plugin list            # install status for every supported host

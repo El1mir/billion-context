@@ -1833,6 +1833,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `bili update` | 立即检查并安装新版本（绕过 3 分钟节流） |
 | `bili plugin install <agent>` | 把原生工具插件 / MCP 桥装进宿主 —— 见[插件模式（原生工具）](#插件模式原生工具) |
 | `bili plugin remove <agent>` | 卸载 |
+| `bili service install\|status\|restart\|enable\|disable\|remove` | 管理常驻的当前用户代理服务（Windows：Task Scheduler 登录任务；Linux：systemd 用户单元），供 codex 等零接触通道使用；JSON 输出，未达预期状态时退出码为 1（#3176） |
 | `bili plugin list` | 显示每个宿主的安装状态 |
 | `bili mcp` | 独立运行 bili MCP 服务器（stdio） |
 | `bili plugin-register <id> [--origin URL] [--agent name]` | 预绑定会话 id 到插件模式（高级用法） |
@@ -2060,7 +2061,7 @@ bili plugin install pi      # 把本 billion-context 安装加入 pi 的 setting
 bili plugin install omp     # omp 同理（config.yml extensions）
 bili plugin install claude  # 注册 bili MCP 服务器（claude mcp add，user 作用域）+ 写入
                                    # <configdir>/commands/acp-cache.md（模型中介的 /acp-cache）
-bili plugin install codex   # 向 ~/.codex/config.toml 追加 [mcp_servers.bili]
+bili plugin install codex   # 托管 ~/.codex/config.toml 的 MCP+ACP 工具 / 模型路由 / SessionStart hook / ACP skill（并注册自启动代理服务）—— 见 CLIENTS.zh-CN.md（Codex）
 bili plugin install opencode  # 向 ~/.config/opencode/opencode.json 加 mcp.bili
 bili plugin list            # 所有受支持宿主的安装状态
 bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
