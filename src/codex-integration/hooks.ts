@@ -20,16 +20,6 @@ export const CODEX_HOOKS_TABLE = "hooks.SessionStart";
 const FEATURES_TABLE = "features";
 const FEATURES_KEY = "hooks";
 
-/** Codex's stage names it groups hook tables under. Kept in the type so a
- *  future ticket can add stages without re-typing the entry shape. */
-export type CodexHookStage = "session_start";
-
-export interface CodexHookEntry {
-    kind: CodexHookStage;
-    command: string;
-    timeoutSec?: number;
-}
-
 /** True for a hook command naming bili's own Codex hook script. Path may differ
  *  across installs/upgrades (checkout vs. global npm), so match the script
  *  name, not the absolute path — same rule as the Claude lane. */

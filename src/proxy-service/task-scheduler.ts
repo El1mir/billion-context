@@ -58,33 +58,6 @@ function checkedOptions(options: ProxyTaskOptions): Required<ProxyTaskOptions> {
     };
 }
 
-/** Build a per-user, at-logon Task Scheduler registration. Paths remain
- * separate argv values for the runner; only schtasks' /TR payload is composed
- * into a Windows command line, with each executable/path quoted.
- *
- * Prefer planTaskRegisterXml: this flag form cannot express <Hidden>, and an
- * unhidden at-logon task runs the proxy WITH a console window in the user's
- * session (#silent-backend). Kept for runners/tests that assert the old shape. */
-export function planTaskRegister(options: ProxyTaskOptions): TaskCommand {
-    const o = checkedOptions(options);
-    const run = `"${o.nodePath}" "${o.entryPath}" start --host "${o.host}" --port ${o.port} --no-auto-update`;
-    return {
-        file: "schtasks.exe",
-        args: [
-            "/Create",
-            "/TN",
-            o.taskName,
-            "/SC",
-            "ONLOGON",
-            "/RL",
-            "LIMITED",
-            "/TR",
-            run,
-            "/F",
-        ],
-    };
-}
-
 function xmlEscape(value: string): string {
     return value
         .replace(/&/g, "&amp;")

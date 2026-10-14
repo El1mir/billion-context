@@ -19,6 +19,23 @@ export interface TopLevelScalar {
 const SCALAR_RE =
     /^([A-Za-z0-9_-]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\s*(?:#.*)?$/;
 
+/** Any TOML table header, including `[[array-of-tables]]`. In TOML every new
+ *  header ENDS the previous table's scope — an array-of-tables header included.
+ *  Treating only single-bracket headers as boundaries lets an inserted or read
+ *  scalar bleed into a following `[[...]]` element, where Codex's serde drops
+ *  unknown keys silently (the exact failure class this module exists to avoid). */
+function parseTableHeader(
+    line: string,
+): { kind: "table" | "array"; name: string } | undefined {
+    const m = /^\s*(\[\[?)([^\]]+)(\]\]?)\s*(?:#.*)?$/.exec(line);
+    if (m === null) return undefined;
+    const opening = m[1]!;
+    const closing = m[3]!;
+    if (opening === "[[" && closing !== "]]") return undefined;
+    if (opening === "[" && closing !== "]") return undefined;
+    return { kind: opening === "[[" ? "array" : "table", name: m[2]!.trim() };
+}
+
 function decode(raw: string, quoted: "basic" | "literal"): string {
     if (quoted === "literal") return raw;
     try {
@@ -125,10 +142,10 @@ export function findTableScalar(
     let active = false;
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i]!.trim();
-        const header = /^\[([^\]]+)\]\s*(?:#.*)?$/.exec(line);
-        if (header) {
+        const header = parseTableHeader(line);
+        if (header !== undefined) {
             if (active) return undefined;
-            active = header[1]!.trim() === table;
+            active = header.kind === "table" && header.name === table;
             continue;
         }
         if (!active || line === "" || line.startsWith("#")) continue;
@@ -166,13 +183,13 @@ export function setTableScalar(
     let tableLine = -1;
     let tableEnd = lines.length;
     for (let i = 0; i < lines.length; i++) {
-        const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(lines[i]!);
-        if (!header) continue;
+        const header = parseTableHeader(lines[i]!);
+        if (header === undefined) continue;
         if (tableLine >= 0) {
             tableEnd = i;
             break;
         }
-        if (header[1]!.trim() === table) tableLine = i;
+        if (header.kind === "table" && header.name === table) tableLine = i;
     }
     if (tableLine < 0) {
         const prefix =
@@ -209,13 +226,13 @@ export function insertTableRaw(
     let tableLine = -1;
     let tableEnd = lines.length;
     for (let i = 0; i < lines.length; i++) {
-        const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(lines[i]!);
-        if (!header) continue;
+        const header = parseTableHeader(lines[i]!);
+        if (header === undefined) continue;
         if (tableLine >= 0) {
             tableEnd = i;
             break;
         }
-        if (header[1]!.trim() === table) tableLine = i;
+        if (header.kind === "table" && header.name === table) tableLine = i;
     }
     if (tableLine < 0) {
         const prefix =
@@ -231,32 +248,6 @@ export function insertTableRaw(
         at--;
     }
     lines.splice(at, 0, rendered);
-    return lines.join("\n");
-}
-
-/** Replace an entire table header line and its scalars with `rendered` (which
- *  must itself include the `[table]` header). Used for hook tables bili owns
- *  end-to-end; a table with foreign structure is reported, never clobbered. */
-export function replaceTable(
-    text: string,
-    table: string,
-    rendered: string,
-): string {
-    const lines = text.split("\n");
-    let start = -1;
-    let end = lines.length;
-    for (let i = 0; i < lines.length; i++) {
-        const header = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(lines[i]!);
-        if (!header) continue;
-        if (start >= 0) {
-            end = i;
-            break;
-        }
-        if (header[1]!.trim() === table) start = i;
-    }
-    if (start < 0) return text;
-    const block = rendered.replace(/\n+$/, "").split("\n");
-    lines.splice(start, end - start, ...block);
     return lines.join("\n");
 }
 

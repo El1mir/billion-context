@@ -1,7 +1,10 @@
 import { resolveCodexHome } from "../client-config.js";
 import { lanePreferredPort } from "../instance.js";
-import { readCodexRoute, readCodexRouteRecord } from "./route.js";
-import { codexRouteRecordPath } from "./route.js";
+import {
+    codexRouteRecordPath,
+    readCodexRoute,
+    readCodexRouteRecord,
+} from "./route.js";
 import fs from "node:fs";
 import path from "node:path";
 
