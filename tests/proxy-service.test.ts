@@ -10,12 +10,13 @@ import {
     planTaskEnable,
     planTaskEnd,
     planTaskQuery,
-    planTaskRegister,
     planTaskRegisterXml,
     planTaskRun,
     renderTaskLauncherVbs,
     renderTaskXml,
+    type TaskCommand,
     type TaskRunner,
+    type TaskRunnerResult,
 } from "../src/proxy-service/task-scheduler.ts";
 import {
     disableProxyService,
@@ -24,9 +25,7 @@ import {
     proxyServiceStatus,
     removeProxyService,
     restartProxyService,
-    type TaskCommand,
-    type TaskRunnerResult,
-} from "../src/proxy-service/index.ts";
+} from "../src/proxy-service/service.ts";
 import {
     planDaemonReload,
     planSystemdEnableNow,
@@ -45,25 +44,21 @@ const taskRow =
     '<Task version="1.2"><RegistrationInfo/><Triggers/><Principals/><Settings><Enabled>true</Enabled></Settings><Actions/></Task>';
 
 test("Task Scheduler command plans are per-user logon and safely quoted", () => {
-    const planned = planTaskRegister({
+    const vbs = renderTaskLauncherVbs({
+        taskName: BILI_TASK_NAME,
         nodePath: "C:\\Program Files\\nodejs\\node.exe",
         entryPath:
             "C:\\Users\\Alice Example\\AppData\\Roaming\\npm\\node_modules\\billion-context\\dist\\index.js",
         port: 18787,
         host: "127.0.0.1",
     });
-    assert.equal(planned.file, "schtasks.exe");
-    assert.deepEqual(planned.args.slice(0, 2), ["/Create", "/TN"]);
-    assert.ok(planned.args.includes("ONLOGON"));
-    assert.ok(planned.args.includes("LIMITED"));
-    const taskRun = planned.args[planned.args.indexOf("/TR") + 1]!;
-    assert.ok(taskRun.includes('"C:\\Program Files\\nodejs\\node.exe"'));
+    assert.ok(vbs.includes('"C:\\Program Files\\nodejs\\node.exe"'));
     assert.ok(
-        taskRun.includes(
+        vbs.includes(
             '"C:\\Users\\Alice Example\\AppData\\Roaming\\npm\\node_modules\\billion-context\\dist\\index.js"',
         ),
     );
-    assert.ok(taskRun.includes("--port 18787"));
+    assert.ok(vbs.includes("--port 18787"));
     assert.equal(
         planTaskQuery().args.join(" "),
         `/Query /TN ${BILI_TASK_NAME} /XML`,
@@ -75,19 +70,23 @@ test("Task Scheduler command plans are per-user logon and safely quoted", () => 
     assert.ok(planTaskDelete().args.includes("/F"));
     assert.throws(
         () =>
-            planTaskRegister({
+            renderTaskLauncherVbs({
+                taskName: BILI_TASK_NAME,
                 nodePath: "node.exe",
                 entryPath: "C:\\bili.js",
                 port: 8787,
+                host: "127.0.0.1",
             }),
         /absolute/,
     );
     assert.throws(
         () =>
-            planTaskRegister({
+            renderTaskLauncherVbs({
+                taskName: BILI_TASK_NAME,
                 nodePath: "C:\\node.exe",
                 entryPath: "C:\\bili.js",
                 port: 65536,
+                host: "127.0.0.1",
             }),
         /port/,
     );
