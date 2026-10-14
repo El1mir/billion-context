@@ -1,0 +1,25 @@
+export {
+	BILI_TASK_NAME,
+	planTaskDelete,
+	planTaskDisable,
+	planTaskEnable,
+	planTaskEnd,
+	planTaskQuery,
+	planTaskRegister,
+	planTaskRun,
+	type ProxyTaskOptions,
+	type TaskCommand,
+	type TaskRunner,
+	type TaskRunnerResult,
+} from "./task-scheduler.js";
+export {
+	disableProxyService,
+	enableProxyService,
+	installProxyService,
+	proxyServiceStatus,
+	removeProxyService,
+	restartProxyService,
+	type ProxyServiceConfig,
+	type ProxyServiceRecord,
+	type ProxyServiceResult,
+} from "./service.js";
