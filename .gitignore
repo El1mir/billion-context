@@ -7,3 +7,5 @@ dist/
 tmp/
 tests/.pp-stamp-state-*/
 .tmp/
+# Local development specifications and ticket drafts (not published)
+.scratch/
