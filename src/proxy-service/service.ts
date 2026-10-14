@@ -130,29 +130,33 @@ function recordBackend(record: ServiceRecord): ServiceBackend {
     return record.backend === "systemd" ? "systemd" : "schtasks";
 }
 
-function defaultRunner(command: TaskCommand): Promise<TaskRunnerResult> {
-    return new Promise((resolve, reject) => {
-        import("node:child_process").then(({ spawn }) => {
-            const child = spawn(command.file, command.args, {
-                windowsHide: true,
-                stdio: ["ignore", "pipe", "pipe"],
-            });
-            const stdout: Buffer[] = [];
-            const stderr: Buffer[] = [];
-            child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
-            child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-            child.once("error", reject);
-            child.once("close", (code) => {
-                const decode = (chunks: Buffer[]): string =>
-                    new TextDecoder("gbk").decode(Buffer.concat(chunks));
-                resolve({
-                    exitCode: code ?? 1,
-                    stdout: decode(stdout),
-                    stderr: decode(stderr),
+/** schtasks on a Chinese Windows prints GBK; systemctl output is UTF-8. A
+ *  single hard-wired label garbles one backend's error text on the other OS. */
+function spawnRunner(platform: NodeJS.Platform): TaskRunner {
+    const label = platform === "win32" ? "gbk" : "utf8";
+    return (command: TaskCommand) =>
+        new Promise((resolve, reject) => {
+            import("node:child_process").then(({ spawn }) => {
+                const child = spawn(command.file, command.args, {
+                    windowsHide: true,
+                    stdio: ["ignore", "pipe", "pipe"],
+                });
+                const stdout: Buffer[] = [];
+                const stderr: Buffer[] = [];
+                child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+                child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+                child.once("error", reject);
+                child.once("close", (code) => {
+                    const decode = (chunks: Buffer[]): string =>
+                        new TextDecoder(label).decode(Buffer.concat(chunks));
+                    resolve({
+                        exitCode: code ?? 1,
+                        stdout: decode(stdout),
+                        stderr: decode(stderr),
+                    });
                 });
             });
         });
-    });
 }
 
 function serviceRecordPath(directory = stateDir()): string {
@@ -210,6 +214,7 @@ function removeRecord(file: string): void {
 
 function resolveConfig(config: ProxyServiceConfig) {
     const taskName = config.taskName ?? BILI_TASK_NAME;
+    const platform = config.platform ?? process.platform;
     const entryPath =
         config.entryPath ??
         process.argv[1] ??
@@ -220,8 +225,8 @@ function resolveConfig(config: ProxyServiceConfig) {
         entryPath,
         port: config.port ?? lanePreferredPort("codex"),
         host: config.host ?? "127.0.0.1",
-        platform: config.platform ?? process.platform,
-        runner: config.runner ?? defaultRunner,
+        platform,
+        runner: config.runner ?? spawnRunner(platform),
         stateDirectory: config.stateDirectory ?? stateDir(),
         unitPath: config.unitPath ?? defaultUnitPath(),
     };
@@ -725,13 +730,6 @@ export async function enableProxyService(
 
 type ResolvedConfig = ReturnType<typeof resolveConfig>;
 
-function systemdResult(
-    result: TaskRunnerResult,
-    action: string,
-): ProxyServiceResult {
-    return describeFailure(action, result);
-}
-
 /** Bus reachability preflight shared by every mutating systemd path. Returns a
  *  failure result when `systemctl --user` cannot talk to a user manager, else
  *  undefined. Writing a unit into a machine whose user manager will never load
@@ -832,22 +830,26 @@ async function installSystemd(c: ResolvedConfig): Promise<ProxyServiceResult> {
         };
     }
     const previous = readRecord(file);
-    const record = readRecord(file);
     if (
         existing !== undefined &&
-        record !== undefined &&
-        recordBackend(record) === "systemd" &&
-        record.entryPath === c.entryPath &&
-        record.port === c.port &&
-        record.host === c.host &&
-        record.registrationVersion === REGISTRATION_VERSION
+        previous !== undefined &&
+        recordBackend(previous) === "systemd" &&
+        previous.entryPath === c.entryPath &&
+        previous.port === c.port &&
+        previous.host === c.host &&
+        previous.registrationVersion === REGISTRATION_VERSION
     ) {
+        const active = await invoke(
+            c.runner,
+            planSystemdIsActive({ unitName: c.taskName }),
+        );
         return {
             ok: true,
             action: "already-installed",
-            state: "ready",
-            message:
-                "systemd user unit is already registered with the current bili entry",
+            state: systemdUnitActive(active) ? "ready" : "disabled",
+            message: systemdUnitActive(active)
+                ? "systemd user unit is already registered with the current bili entry"
+                : "systemd user unit is registered but not running",
         };
     }
     return writeAndEnableSystemd(c, file, previous);
@@ -889,7 +891,7 @@ async function writeAndEnableSystemd(
     const reload = await invoke(c.runner, planDaemonReload());
     if (reload.exitCode !== 0) {
         restoreUnit(c.unitPath, priorText);
-        return systemdResult(reload, "reload systemd user manager");
+        return describeFailure("reload systemd user manager", reload);
     }
     const enable = await invoke(
         c.runner,
@@ -898,7 +900,7 @@ async function writeAndEnableSystemd(
     if (enable.exitCode !== 0) {
         restoreUnit(c.unitPath, priorText);
         await invoke(c.runner, planDaemonReload());
-        return systemdResult(enable, "enable systemd user unit");
+        return describeFailure("enable systemd user unit", enable);
     }
     writeRecord(file, {
         taskName: c.taskName,
@@ -981,13 +983,13 @@ async function removeSystemd(c: ResolvedConfig): Promise<ProxyServiceResult> {
         planSystemdDisable({ unitName: c.taskName }),
     );
     if (disable.exitCode !== 0 && !systemdUnitMissing(disable))
-        return systemdResult(disable, "disable systemd user unit");
+        return describeFailure("disable systemd user unit", disable);
     const stop = await invoke(
         c.runner,
         planSystemdStop({ unitName: c.taskName }),
     );
     if (stop.exitCode !== 0 && !systemdUnitMissing(stop))
-        return systemdResult(stop, "stop systemd user unit");
+        return describeFailure("stop systemd user unit", stop);
     try {
         fs.unlinkSync(c.unitPath);
     } catch (error) {
@@ -1026,7 +1028,7 @@ async function disableSystemd(c: ResolvedConfig): Promise<ProxyServiceResult> {
         result.exitCode !== 0 &&
         !/not enabled|already disabled/i.test(`${result.stdout}\n${result.stderr}`)
     )
-        return systemdResult(result, "disable systemd user unit");
+        return describeFailure("disable systemd user unit", result);
     const stop = await invoke(
         c.runner,
         planSystemdStop({ unitName: c.taskName }),
@@ -1036,7 +1038,7 @@ async function disableSystemd(c: ResolvedConfig): Promise<ProxyServiceResult> {
         !systemdUnitMissing(stop) &&
         !/not running/i.test(`${stop.stdout}\n${stop.stderr}`)
     )
-        return systemdResult(stop, "stop systemd user unit");
+        return describeFailure("stop systemd user unit", stop);
     return {
         ok: true,
         action: "disabled",
@@ -1059,7 +1061,7 @@ async function enableSystemd(c: ResolvedConfig): Promise<ProxyServiceResult> {
         planSystemdEnableNow({ unitName: c.taskName }),
     );
     if (result.exitCode !== 0)
-        return systemdResult(result, "enable systemd user unit");
+        return describeFailure("enable systemd user unit", result);
     return {
         ok: true,
         action: "enabled",
@@ -1086,13 +1088,13 @@ async function restartSystemd(c: ResolvedConfig): Promise<ProxyServiceResult> {
         !/not running/i.test(`${stop.stdout}\n${stop.stderr}`) &&
         !systemdUnitMissing(stop)
     )
-        return systemdResult(stop, "stop systemd user unit");
+        return describeFailure("stop systemd user unit", stop);
     const start = await invoke(
         c.runner,
         planSystemdStart({ unitName: c.taskName }),
     );
     if (start.exitCode !== 0)
-        return systemdResult(start, "start systemd user unit");
+        return describeFailure("start systemd user unit", start);
     return {
         ok: true,
         action: "restarted",
