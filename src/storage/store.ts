@@ -58,6 +58,11 @@ export interface SessionRow {
     tailJson: string;
     /** Verbatim CCR store JSON (dying subsystem, Phase 3 removes it). */
     ccrJson: string | null;
+    /** #3133 ingest watermark: highest absolute message seq whose bytes this
+     *  index has verified (NULL = no trusted prefix → next save ingests
+     *  fully). Computed by ingestSession only (delta provenance or full-path
+     * alignment) — never by planners or callers; read via ingestWatermark(). */
+    lastIngestedSeq?: number | null;
 }
 
 export interface MessageRow {
@@ -246,8 +251,10 @@ export class UnifiedStore {
     /** Content CAS: insert-if-absent + refcount bump; returns hash. */
     private putContent(content: string | Buffer, precomputedHash?: string): string {
         const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : content;
-        // #3133: delta-interned plan rows already carry the digest — skip the
-        // per-message re-hash (same value: sha256 over the same utf8 bytes).
+        // #3133: planner-produced rows carry the digest from their intern or
+        // delta pass — skip the per-message re-hash here (same value: sha256
+        // over the same utf8 bytes). Only direct callers without a planner
+        // pay the hash at this layer.
         const hash = precomputedHash ?? sha256Hex(bytes);
         const existing = this.db.prepare("SELECT refcount FROM content WHERE hash = ?").get(hash) as
             | { refcount: number }
@@ -268,58 +275,88 @@ export class UnifiedStore {
         this.db.prepare("UPDATE content SET refcount = MAX(refcount - 1, 0) WHERE hash = ?").run(hash);
     }
 
-    ingestSession(input: IngestSessionInput): void {
+    /** Ingests one session plan as a single transaction. Full path (no
+     *  `delta`): identity-based absolute-seq remap of every plan row; the
+     *  watermark becomes the abs seq backing the plan's LAST tail message
+     *  (NULL when the plan carries no tail) — the trusted tip need not be
+     *  the table's max, because delta appends anchor at max(seq)+1, never
+     *  at watermark+1, so rows above the tip (a fold's summary) cannot
+     *  collide with them.
+     *
+     *  Delta path (#3133, `delta` given): the plan carries ONLY messages
+     *  past the trusted prefix, with placeholder seqs (renumbered here).
+     *  The boundary row (msg_id + content_hash at seq trustedSeq) is
+     *  RE-VERIFIED inside this transaction (BEGIN IMMEDIATE serializes
+     *  writers, so the in-tx check is authoritative — the caller's pre-plan
+     *  probe was just an optimization), every delta message's identity must
+     *  be absent (strictly-append — a re-derived tail would otherwise be
+     *  silently dropped by the UNIQUE constraint), and new rows take
+     *  max(seq)+1.. so no slot can collide. On any disagreement this
+     *  returns false WITHOUT writing anything; the caller falls back to the
+     *  full plan. A stale or foreign-written watermark therefore costs one
+     *  redundant full write — never wrong rows — and the watermark write
+     *  itself rides the SAME transaction as the rows. */
+    ingestSession(
+        input: IngestSessionInput,
+        delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
+    ): boolean {
         const s = input.session;
-        this.db.transaction(() => {
-            // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
-            // RELATIVE to the current snapshot's log (pluginSnapshot first,
-            // then tail). For a folded session whose tail slides every save
-            // (and no pluginSnapshot to pin the prefix), plan seq 0 re-bases
-            // to a DIFFERENT message each save — while messages is keyed
-            // (session_id, seq) with INSERT OR IGNORE, so the FIRST row wins
-            // forever and tail pointers resolve to stale turns. Remap to
-            // stable absolute seqs: same identity (msgId + content hash)
-            // keeps its old seq; new identities continue after max(seq).
-            const existing = this.db
-                .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
-                .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
-            const seqByIdentity = new Map<string, number>();
-            let nextSeq = 0;
-            for (const row of existing) {
-                seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, row.seq);
-                if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
-            }
-            const planToAbs = new Map<number, number>();
-            const messages = input.messages.map((m) => {
-                // #3133: plan rows carry the intern-pass hash; only direct
-                // callers without a planner pay the sha256 here.
-                const hash = m.contentHash ?? sha256Hex(m.content);
-                const key = `${m.msgId}\u0000${hash}`;
-                let abs = seqByIdentity.get(key);
-                if (abs === undefined) {
-                    abs = nextSeq++;
-                    seqByIdentity.set(key, abs);
+        return this.db.transaction((): boolean => {
+            let messages: MessageRow[];
+            let watermark: number | null;
+            if (delta) {
+                const probe = this.probeIngestBoundary(s.sessionId, delta.trustedSeq);
+                if (!probe || probe.msgId !== delta.boundaryMsgId || probe.contentHash !== delta.boundaryHash) {
+                    return false;
                 }
-                planToAbs.set(m.seq, abs);
-                return { ...m, seq: abs };
-            });
-            const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
-                seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
-            const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
-            const tailSeqs = remapSeqs(input.tailSeqs);
-            s.tailJson = JSON.stringify({
-                ...(JSON.parse(s.tailJson) as Record<string, unknown>),
-                ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
-                ...(tailSeqs !== undefined ? { tailSeqs } : {}),
-            });
+                // Strictly-append guard: a delta message whose identity
+                // already has a row (rewound/re-derived tail) must not be
+                // silently skipped by the UNIQUE(session_id, msg_id,
+                // content_hash) constraint — its tailSeqs slot would point
+                // at nothing and the read view would drop it. One indexed
+                // probe per NEW message; any hit → full ingest instead.
+                const existingIdentity = this.db.prepare(
+                    "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ?",
+                );
+                for (const m of input.messages) {
+                    if (!m.contentHash) return false;
+                    if (existingIdentity.get(s.sessionId, m.msgId, m.contentHash)) return false;
+                }
+                // Placeholder→absolute renumber: the plan emitted
+                // watermark+1.. under the aligned assumption; anchoring at
+                // the CURRENT max(seq)+1 (re-read inside this transaction)
+                // is what makes slot collisions structurally impossible —
+                // identical to the full path's nextSeq discipline, and it
+                // keeps the delta valid even when a fold left rows above
+                // the trusted tip.
+                messages = input.messages.map((m, i) => ({ ...m, seq: probe.maxSeq + 1 + i }));
+                const tail = JSON.parse(s.tailJson) as { tailSeqs?: number[] | null };
+                // Defense: the plan's tailSeqs prefix must be exactly the
+                // trusted prefix the watermark read produced (same-tick by
+                // construction; disagreement means a stale plan).
+                const prefixOk =
+                    Array.isArray(tail.tailSeqs) &&
+                    tail.tailSeqs.length === delta.trustedTailSeqs.length + input.messages.length &&
+                    delta.trustedTailSeqs.every((v, i) => tail.tailSeqs?.[i] === v);
+                if (!prefixOk) return false;
+                s.tailJson = JSON.stringify({
+                    ...tail,
+                    tailSeqs: [...delta.trustedTailSeqs, ...messages.map((m) => m.seq)],
+                });
+                watermark = messages.length > 0 ? messages[messages.length - 1].seq : delta.trustedSeq;
+            } else {
+                const full = this.remapPlanToAbsolute(input);
+                messages = full.messages;
+                watermark = full.watermark;
+            }
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
                        status, created_at, updated_at, next_block_id, next_run_id,
-                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json)
+                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq)
                      VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle, @namespace, @origin,
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
-                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson)
+                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq)
                      ON CONFLICT(session_id) DO UPDATE SET
                        parent_session_id = excluded.parent_session_id,
                        fork_point_seq = excluded.fork_point_seq,
@@ -338,7 +375,8 @@ export class UnifiedStore {
                        metadata_json = excluded.metadata_json,
                        kstate_json = excluded.kstate_json,
                        tail_json = excluded.tail_json,
-                       ccr_json = excluded.ccr_json`,
+                       ccr_json = excluded.ccr_json,
+                       last_ingested_seq = excluded.last_ingested_seq`,
                 )
                 .run({
                     sessionId: s.sessionId,
@@ -361,6 +399,7 @@ export class UnifiedStore {
                     kstateJson: s.kstateJson,
                     tailJson: s.tailJson,
                     ccrJson: s.ccrJson,
+                    lastIngestedSeq: watermark,
                 });
 
             // Identity index (#2960 R2.1): claim (namespace, conversation_id)
@@ -496,7 +535,113 @@ export class UnifiedStore {
                     .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
                     .run(s.sessionId, e.ord, e.key, hash);
             }
+            return true;
         });
+    }
+
+    /** Full-ingest path of ingestSession, extracted for readability: the
+     *  absolute-seq remap plus the #3133 watermark alignment decision.
+     *  Mutates input.session.tailJson (pointer sequences become absolute). */
+    private remapPlanToAbsolute(input: IngestSessionInput): { messages: MessageRow[]; watermark: number | null } {
+        const s = input.session;
+        // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
+        // RELATIVE to the current snapshot's log (pluginSnapshot first,
+        // then tail). For a folded session whose tail slides every save
+        // (and no pluginSnapshot to pin the prefix), plan seq 0 re-bases
+        // to a DIFFERENT message each save — while messages is keyed
+        // (session_id, seq) with INSERT OR IGNORE, so the FIRST row wins
+        // forever and tail pointers resolve to stale turns. Remap to
+        // stable absolute seqs: same identity (msgId + content hash)
+        // keeps its old seq; new identities continue after max(seq).
+        const existing = this.db
+            .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
+            .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+        const seqByIdentity = new Map<string, number>();
+        let nextSeq = 0;
+        for (const row of existing) {
+            seqByIdentity.set(`${row.msg_id}\u0000${row.content_hash}`, row.seq);
+            if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
+        }
+        // #3133 watermark gate (full path): the watermark names the abs seq
+        // backing the plan's LAST tail message. It need not be the table's
+        // max — a fold's summary lands above surviving old rows — because
+        // delta appends anchor at max(seq)+1, never at watermark+1. NULL
+        // when the plan carries no tail (envelope-only imports): the next
+        // save runs the full ingest.
+        const planToAbs = new Map<number, number>();
+        const messages = input.messages.map((m) => {
+            // #3133: plan rows carry the intern-pass hash; only direct
+            // callers without a planner pay the sha256 here.
+            const hash = m.contentHash ?? sha256Hex(m.content);
+            const key = `${m.msgId}\u0000${hash}`;
+            let abs = seqByIdentity.get(key);
+            if (abs === undefined) {
+                abs = nextSeq++;
+                seqByIdentity.set(key, abs);
+            }
+            planToAbs.set(m.seq, abs);
+            return { ...m, seq: abs };
+        });
+        const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
+            seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
+        const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
+        const tailSeqs = remapSeqs(input.tailSeqs);
+        const watermark = tailSeqs !== null && tailSeqs !== undefined && tailSeqs.length > 0 ? tailSeqs[tailSeqs.length - 1] : null;
+        s.tailJson = JSON.stringify({
+            ...(JSON.parse(s.tailJson) as Record<string, unknown>),
+            ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
+            ...(tailSeqs !== undefined ? { tailSeqs } : {}),
+        });
+        return { messages, watermark };
+    }
+
+    /** #3133: the session's ingest watermark — the absolute seq backing the
+     *  LAST message of the tail as ingested by the most recent save, plus
+     *  that save's trusted tailSeqs (same transaction wrote both). NULL (or
+     *  a shape that disagrees with tail_json — foreign write, partial
+     *  upgrade) means "no trusted prefix": the next save runs the full
+     *  ingest. Point read on the sessions PK. */
+    ingestWatermark(sessionId: string): { seq: number; tailSeqs: number[] } | null {
+        const row = this.db
+            .prepare("SELECT last_ingested_seq, tail_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { last_ingested_seq: number | null; tail_json: string } | undefined;
+        if (!row) return null;
+        const seq = row.last_ingested_seq;
+        if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
+        const tail = JSON.parse(row.tail_json) as { tailSeqs?: number[] | null };
+        const seqs = tail.tailSeqs;
+        if (!Array.isArray(seqs) || seqs.length === 0 || seqs[seqs.length - 1] !== seq) return null;
+        return { seq, tailSeqs: seqs };
+    }
+
+    /** #3166 review (heal half of the sampled-verify backstop): drop the
+     *  durable watermark so the next save takes the exact full path and
+     *  re-points every tail slot. Called when the read-back digest proves
+     *  the stored prefix no longer matches the record of truth — without it
+     *  every same-length save would re-take the unverified empty delta
+     *  against a stale watermark and the divergence would be permanent. */
+    clearIngestWatermark(sessionId: string): void {
+        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
+    }
+
+    /** #3133 boundary probe: the identity of the messages row at
+     *  (session_id, seq) plus the session's current max seq — both lookups
+     *  ride the PRIMARY KEY (session_id, seq) / idx_messages_session (no
+     *  full existing-rows scan, no seqByIdentity map). null when the row is
+     *  missing. The identity half is the trust decision; the max-seq half
+     *  is the ANCHOR delta appends continue after (max+1, the same
+     *  strictly-above discipline as the full path's remap, so appends can
+     *  never collide with an existing slot — rows above the watermark,
+     *  e.g. a fold's summary, are expected and harmless). */
+    probeIngestBoundary(sessionId: string, seq: number): { msgId: string; contentHash: string; maxSeq: number } | null {
+        const row = this.db
+            .prepare("SELECT msg_id, content_hash FROM messages WHERE session_id = ? AND seq = ?")
+            .get(sessionId, seq) as { msg_id: string; content_hash: string } | undefined;
+        if (!row) return null;
+        const max = this.db
+            .prepare("SELECT MAX(seq) AS m FROM messages WHERE session_id = ?")
+            .get(sessionId) as { m: number | null };
+        return { msgId: row.msg_id, contentHash: row.content_hash, maxSeq: max.m ?? -1 };
     }
 
     /** Deletes one session and releases every CAS refcount it holds
@@ -945,7 +1090,7 @@ export class UnifiedStore {
             .prepare(
                 `SELECT session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin, status,
                         created_at, updated_at, next_block_id, next_run_id,
-                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json
+                        meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq
                  FROM sessions WHERE session_id = ?`,
             )
             .get(sessionId) as Record<string, unknown> | undefined;
@@ -971,6 +1116,7 @@ export class UnifiedStore {
             kstateJson: row.kstate_json as string,
             tailJson: row.tail_json as string,
             ccrJson: (row.ccr_json as string | null) ?? null,
+            lastIngestedSeq: (row.last_ingested_seq as number | null | undefined) ?? null,
         };
     }
 

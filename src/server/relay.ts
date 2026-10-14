@@ -41,6 +41,7 @@ import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, w
 import { adoptContentStore, ccrLoopConfig, commitRetrievalNotes, commitRetrievals, contentStoreOf, dropRetrievals } from "../store.js";
 import { emitStreamError } from "../stream-error.js";
 import { rewriteGoogleJsonResponseAsync } from "../stream-google.js";
+import { v1UnwrapStream, wrapV1Internal, wrapV1ResponseJson, wrapV1SseFrame } from "../v1internal.js";
 import { rewriteOpenaiJsonResponseAsync } from "../stream-openai.js";
 import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
@@ -66,6 +67,64 @@ function inferWireProtocol(path: string): "openai" | "responses" | "google" | nu
     if (p.endsWith("/responses") || p.endsWith("/responses/compact")) return "responses";
     if (googlePathKind(p) !== null) return "google";
     return null;
+}
+
+// #3129: wrap every SSE data frame written to a v1internal client into the
+// {"response":...} envelope. Buffers blank-line-delimited frames across write()
+// calls, rewrites only `data:` payloads carrying a JSON object ([DONE]/empty/
+// non-JSON and event:/comment keep-alive lines pass through), preserves the
+// write() backpressure boolean on flush, and flushes a trailing partial frame
+// on end(). Installs over res.write/res.end only for v1 responses.
+function installV1ResponseFramer(res: http.ServerResponse): void {
+    let buf = "";
+    const origWrite = res.write.bind(res);
+    const origEnd = res.end.bind(res);
+    const flushFrames = (): string => {
+        let out = "";
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+            out += wrapV1SseFrame(buf.slice(0, idx)) + "\n\n";
+            buf = buf.slice(idx + 2);
+        }
+        return out;
+    };
+    const toStr = (c: unknown): string =>
+        typeof c === "string" ? c : c == null ? "" : Buffer.isBuffer(c) ? c.toString("utf8") : Buffer.from(c as Uint8Array).toString("utf8");
+    const pickCb = (a?: unknown, b?: unknown): (() => void) | undefined => {
+        if (typeof a === "function") return a as () => void;
+        if (typeof b === "function") return b as () => void;
+        return undefined;
+    };
+    // A trailing chunk with no blank-line terminator is either an unterminated
+    // SSE frame (has a data: line) or a whole non-streaming JSON body — wrap
+    // accordingly so neither leaks to the client un-enveloped.
+    const wrapChunk = (s: string): string =>
+        /(^|\n)\s*data:/.test(s) ? wrapV1SseFrame(s) : wrapV1ResponseJson(s);
+    res.write = ((chunk?: unknown, a?: unknown, b?: unknown): boolean => {
+        const cb = pickCb(a, b);
+        if (chunk == null) {
+            if (cb) setImmediate(cb);
+            return true;
+        }
+        buf += toStr(chunk);
+        const s = flushFrames();
+        if (s.length > 0) return origWrite(s, cb);
+        if (cb) setImmediate(cb);
+        return true;
+    }) as typeof res.write;
+    res.end = ((chunk?: unknown, a?: unknown, b?: unknown): http.ServerResponse => {
+        const cb = pickCb(a, b);
+        if (chunk != null) {
+            buf += toStr(chunk);
+            const s = flushFrames();
+            if (s.length > 0) origWrite(s);
+        }
+        if (buf.trim().length > 0) {
+            origWrite(wrapChunk(buf));
+            buf = "";
+        }
+        return origEnd(cb);
+    }) as typeof res.end;
 }
 
 /** #604/#1839: record an upstream failure that will never report usage
@@ -118,6 +177,7 @@ export async function forward(
     instanceId: string,
     affinity?: string,
     overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
+    v1Meta?: Record<string, unknown>,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
     // E2: a codex native-compaction request intercepted in prepare() carries a
@@ -149,6 +209,19 @@ export async function forward(
     // compress-retry bodies must carry the same drops as the initial forward).
     let compatDropPaths: string[] = [];
     const { upstreamUrl, headers, proxyUrl, skippedProxy } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
+    // #3129: v1internal egress re-wrap — every outbound model body (initial send,
+    // role-ladder retry, overflow refold, compress-loop round 2+) must go back to
+    // Antigravity inside the CloudCode envelope it arrived in. String-level for
+    // the direct fetch sites; object-level via wireTransform below for loop re-sends.
+    const v1Active = v1Meta !== undefined && prepared !== null;
+    const v1Wrap = (b: string | Buffer): string | Buffer => {
+        if (!v1Active || typeof b !== "string") return b;
+        try {
+            return JSON.stringify(wrapV1Internal(JSON.parse(b) as Record<string, unknown>, v1Meta));
+        } catch {
+            return b;
+        }
+    };
     // #1884 re-sign arm: the native lane tunneled this request with the
     // signing credential (x-bili-resign markers — stripped in
     // buildForwardTarget, they must never reach the upstream). Every egress
@@ -274,12 +347,13 @@ export async function forward(
     // otherwise a developer-role 400 would hit mid-stream on the first retry.
     // Reads compatRoles at CALL time: a role learned mid-request (retry below)
     // applies to later re-sends within the same request.
-    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active
         ? (b: Record<string, unknown>): Record<string, unknown> => {
             if (compatProtocol && compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
             if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(b, steerProtocol, steerCfg);
             if (compatDropPaths.length > 0) dropCompatFieldsJson(b, compatDropPaths);
-            return b;
+            // #3129: re-nest the rebuilt inner request into the CloudCode envelope.
+            return v1Active ? wrapV1Internal(b, v1Meta) : b;
         }
         : undefined;
     // Show the final proxied URL (where the request actually lands) as the
@@ -409,7 +483,7 @@ export async function forward(
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
-        body: req.method === "GET" || req.method === "HEAD" ? undefined : wireBody,
+        body: req.method === "GET" || req.method === "HEAD" ? undefined : v1Wrap(wireBody),
     };
     if (dispatcher) init.dispatcher = dispatcher;
     // #1843 L1: capture this round's image facts at the SEND chokepoint so the
@@ -596,7 +670,7 @@ export async function forward(
                     let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
                     try {
                         applyResign(headers, fixed.body);
-                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: fixed.body }, undefined, clientAbort.signal);
+                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(fixed.body) }, undefined, clientAbort.signal);
                     } catch {
                         return "other"; // transport failure — keep the original 400
                     }
@@ -753,7 +827,7 @@ export async function forward(
                         // surrogate can't poison the retry (see the #1884 seam).
                         const wireRefolded = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
                         applyResign(headers, wireRefolded);
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: wireRefolded }, undefined, clientAbort.signal);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(wireRefolded) }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
                             wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
@@ -1155,6 +1229,15 @@ export async function forward(
         const [a, b] = responseBody.tee();
         responseBody = a;
         dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${safeSessionId(prepared.session.id)}-raw.sse`);
+    }
+    // #3129: v1internal response envelope — unwrap upstream frames so every
+    // branch below (compress loop, strip pipes, JSON rewriter) reads a standard
+    // GenerateContentResponse, and wrap every frame written back to the client
+    // (including bili's synthesized acp_status / Compressed markers) into the
+    // {"response":...} envelope Antigravity's language_server requires.
+    if (v1Active && prepared !== null) {
+        installV1ResponseFramer(res);
+        if (responseBody) responseBody = v1UnwrapStream(responseBody);
     }
     // We only rewrite when THIS request actually had the compress tool
     // injected (per-request). Non-injected requests (OpenAI title-gen

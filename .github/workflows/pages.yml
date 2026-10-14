@@ -25,7 +25,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # enablement: true lets this action CREATE the Pages site when the repo
+      # has never enabled it (Settings → Pages). Without it the very first
+      # step fails with "Get Pages site failed: Not Found" on every master
+      # push — the state since 959d4418 landed the workflow. The workflow's
+      # `permissions: pages: write` already authorizes this.
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       # No build step — publish the folder contents as-is, so the site root is website/
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -53,7 +53,17 @@
 //        these tables are outside the LegacySessionLike view). Fresh
 //        databases create the v4 shape directly; the migration is two
 //        idempotent CREATE TABLE IF NOT EXISTS statements.
-const STORAGE_SCHEMA_VERSION = 4;
+//      - v5: per-session ingest watermark (#3133) — sessions gains
+//        `last_ingested_seq`, the absolute seq backing the last tail
+//        message of the most recent save (NULL = no trusted prefix, full
+//        ingest). The trusted prefix length is re-read from the existing
+//        tail_json tailSeqs written by the same transaction — no second
+//        column. Point lookups and MAX(seq) stay on the pre-existing
+//        PRIMARY KEY (session_id, seq) / idx_messages_session — no new
+//        index. Both directions compatible: an older build opening a v5
+//        file no-ops at the version gate (extra column ignored); a newer
+//        build upgrades a v4 file with one idempotent ALTER TABLE.
+const STORAGE_SCHEMA_VERSION = 5;
 
 export const STORAGE_PRAGMAS = [
     "PRAGMA journal_mode = WAL",
@@ -82,7 +92,8 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     metadata_json       TEXT NOT NULL DEFAULT '{}',
     kstate_json         TEXT NOT NULL DEFAULT '{}',
     tail_json           TEXT NOT NULL DEFAULT '{}',
-    ccr_json            TEXT
+    ccr_json            TEXT,
+    last_ingested_seq   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS content (
@@ -258,6 +269,16 @@ export function migrateSchema(db: {
             // the tables re-lands cleanly.
             db.exec("CREATE TABLE IF NOT EXISTS session_ext (\n                session_id      TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (session_id, key)\n            ) WITHOUT ROWID");
             db.exec("CREATE TABLE IF NOT EXISTS kv_store (\n                namespace       TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (namespace, key)\n            ) WITHOUT ROWID");
+        }
+        if (from < 5) {
+            // v5 ingest watermark (#3133): additive NULLable column on
+            // sessions. Probe first — same duplicate-column discipline as v2
+            // (a dev-window build that already carried it re-lands cleanly).
+            const cols = (db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!cols.includes("last_ingested_seq")) {
+                db.exec("ALTER TABLE sessions ADD COLUMN last_ingested_seq INTEGER");
+            }
         }
         db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
     });

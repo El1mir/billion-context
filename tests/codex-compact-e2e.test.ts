@@ -172,8 +172,10 @@ async function withHarness(opts: { mode?: string; firstTurnTokens: number; stric
         await fn(h);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         delete process.env.BILI_CODEX_COMPACT;
     }

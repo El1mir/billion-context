@@ -242,8 +242,10 @@ async function startHarness(sessionId: string, modelDecided: boolean): Promise<H
 
 async function closeHarness(h: Harness): Promise<void> {
     h.proxy.close();
+    h.proxy.closeIdleConnections?.();
     await once(h.proxy, "close");
     h.upstream.close();
+    h.upstream.closeIdleConnections?.();
     await once(h.upstream, "close");
 }
 

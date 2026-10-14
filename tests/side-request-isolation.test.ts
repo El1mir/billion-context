@@ -455,8 +455,10 @@ mitm: { enabled: false, domains: [] },
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 
@@ -986,8 +988,10 @@ test("e2e: google-lane dsh side request resolves verbatim — no kernel state, n
         assert.equal(peekSession(fork), undefined, "still no forked session after the main turn");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

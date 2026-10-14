@@ -61,6 +61,7 @@ async function runCoveredRange(protectLatest = false, pairBoundary = false, unkn
     } finally {
         const closed = once(upstream, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         upstream.closeAllConnections();
         await closed;
     }

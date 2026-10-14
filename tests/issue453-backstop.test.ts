@@ -227,8 +227,10 @@ async function drive(o: DriveOpts): Promise<{ turn2Body: Record<string, unknown>
         return { turn2Body, turn2MessageCount: ((turn2Body.messages ?? []) as unknown[]).length };
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }

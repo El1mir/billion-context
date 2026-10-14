@@ -185,8 +185,10 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
         assert.ok(fwd.includes("MARKER_11_"), "recent protected messages remain in the payload");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -238,8 +240,10 @@ test("#568: stream + slow preflight 429 → early-committed 200 carries the erro
         assert.ok(calls.filter((c) => !c.raw.includes('"stream":true')).length >= 1, "the (slow, 429'd) summarization call happened");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -286,8 +290,10 @@ test("#568: Responses protocol + slow preflight 429 → early-committed 200, in-
         assert.equal(calls.filter((c) => !c.raw.includes('"stream":false')).length, 0, "nothing was forwarded");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -363,8 +369,10 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
         assert.ok(forwards[0]!.raw.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

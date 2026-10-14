@@ -542,8 +542,10 @@ async function driveWire(wire: Wire, steps: Step[], opts?: DriveOpts): Promise<C
         }
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;

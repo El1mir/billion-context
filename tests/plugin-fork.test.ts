@@ -112,7 +112,7 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); proxy.closeIdleConnections?.(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("plain proxy panel snapshots do not change raw-history persistence", async () => {

@@ -203,8 +203,10 @@ test("e2e: fork/fresh session (lastInputTokens=0) with dense history that estima
         assert.equal(s?.stats.lastInputTokens, 1000);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -295,8 +297,10 @@ test("e2e: fresh session whose history genuinely fits the window → no prefligh
         assert.equal((s?.state.blocks ?? []).filter((b) => b.active).length, 0, "no blocks created");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

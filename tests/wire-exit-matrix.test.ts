@@ -214,8 +214,10 @@ test("abort x proxy-openai-sse: client abort mid-stream destroys the upstream re
         assert.equal(up.requests(), 1, "exactly one upstream request");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -232,8 +234,10 @@ test("abort x proxy-anthropic-sse: client abort mid-stream destroys the upstream
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -250,8 +254,10 @@ test("abort x proxy-responses-sse: client abort mid-stream destroys the upstream
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -268,8 +274,10 @@ test("abort x proxy-json: client abort while the JSON is buffering destroys the 
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -310,8 +318,10 @@ test("error-delivery x proxy-openai-sse: upstream 429 AFTER the early 200 commit
         assert.ok(!r.body.includes('"choices":[{"index":0,"message"'), "no fabricated model content after the failure");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -345,8 +355,10 @@ test("error-delivery x proxy-openai-sse: preflight failure after the early commi
         assert.equal(up.requests(), 1, "the failed preflight means no forward happened");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });

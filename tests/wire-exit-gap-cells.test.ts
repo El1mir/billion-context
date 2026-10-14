@@ -247,8 +247,10 @@ test("gap 3: non-stream + preflight 429 after early commit → structured JSON e
         assert.equal(up.forwards(), 0, "the over-window payload was NOT forwarded");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -269,8 +271,10 @@ test("gap 4: non-stream + upstream 400 after early commit → verbatim upstream 
         assert.equal(up.forwards(), 1);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -317,8 +321,10 @@ test("gap 5: repeated client aborts on proxy-openai-sse → upstream destroyed, 
         assert.equal(_liveUpstreamTimersForTest(), 0, "no accumulated timers after the storm");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

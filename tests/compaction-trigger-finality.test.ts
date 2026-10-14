@@ -137,8 +137,10 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
         assert.ok(bodies[bodies.length - 1].includes("Context limit reached"), "nudge still injected on a normal request");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

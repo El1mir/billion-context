@@ -22,7 +22,7 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
@@ -44,6 +44,7 @@ export { resolveStorageMode, type StorageMode } from "../knobs.ts";
 
 interface ShadowStats {
     ingests: number;
+    deltaIngests: number;
     /** #3133: sampled read-back verifications RUN (verifyOk + verifyDrift
      *  ≤ this). Sampling, not removal — drift stays observable. */
     verifySamples: number;
@@ -56,7 +57,7 @@ interface ShadowStats {
 
 export class UnifiedShadow {
     readonly mode: StorageMode;
-    readonly stats: ShadowStats = { ingests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
+    readonly stats: ShadowStats = { ingests: 0, deltaIngests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
     private readonly store: UnifiedStore;
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
     private consecutiveFailures = 0;
@@ -133,7 +134,9 @@ export class UnifiedShadow {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
             let legacy = loaded;
+            let hasRawTail = false;
             if (rawTail && rawTail.lastMessages.length > 0) {
+                hasRawTail = true;
                 legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
             }
             // #2960 ③: the live kernel content store when the caller has one
@@ -142,8 +145,18 @@ export class UnifiedShadow {
             // stay empty for every plain compressed session. Both digest legs
             // flow through the same override.
             if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-            const plan = planIngest(legacy);
-            this.store.ingestSession(plan);
+            // #3133 watermark: pay the full O(log) ingest only when the
+            // trusted-prefix probe cannot vouch for the stored prefix —
+            // steady-state saves stringify+hash+INSERT just the NEW tail.
+            // Any doubt (no watermark, foreign edit, tail shorter than the
+            // watermark, snapshot-bearing session) falls back to the exact
+            // full path below; the delta itself re-verifies the boundary
+            // inside the ingest transaction, so a racing writer degrades to
+            // a full ingest, never a corrupt one.
+            if (!this.ingestDelta(legacy, hasRawTail)) {
+                const plan = planIngest(legacy);
+                this.store.ingestSession(plan);
+            }
             this.stats.ingests++;
             // #3133 sampled verification: ingest integrity is already guarded
             // by the SQLite write path; the read-back digest is a migration
@@ -170,7 +183,16 @@ export class UnifiedShadow {
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
-                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — migration parity broken, report this`);
+                    // #3166 review: the backstop must heal, not only report —
+                    // the watermark still vouches for a prefix the digest just
+                    // proved stale (e.g. an envelope re-render or interior
+                    // rewrite below the boundary), and every same-length save
+                    // would re-take the unverified empty delta against it.
+                    // Drop the watermark so the next save re-points every
+                    // tail slot through the exact full path (divergence
+                    // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
+                    this.store.clearIngestWatermark(legacy.id);
+                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
                 }
@@ -183,6 +205,35 @@ export class UnifiedShadow {
                 this.stats.disabled = true;
                 loggerLog("warn", `[storage] unified shadow disabled after ${this.consecutiveFailures} consecutive failures (last: ${String(err)})`);
             }
+        }
+    }
+
+    /** #3133 delta ingest attempt for one record's legacy view — returns
+     *  true when the O(new-messages) fast path committed. Every doubt
+     *  routes to `false` (→ the caller's full ingest); failures here must
+     *  never throw into record(), whose catch counts toward disabling the
+     *  shadow — a watermark hiccup is not a storage health problem. */
+    private ingestDelta(legacy: LegacySessionLike, hasRawTail: boolean): boolean {
+        try {
+            const mark = this.store.ingestWatermark(legacy.id);
+            if (!mark) return false;
+            // The pre-transaction probe is an optimization (skip building a
+            // doomed plan); ingestSession re-verifies the boundary inside
+            // BEGIN IMMEDIATE, which is the authoritative check.
+            const boundary = this.store.probeIngestBoundary(legacy.id, mark.seq);
+            if (!boundary) return false;
+            const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail);
+            if (!plan) return false;
+            const applied = this.store.ingestSession(plan, {
+                trustedSeq: mark.seq,
+                boundaryMsgId: boundary.msgId,
+                boundaryHash: boundary.contentHash,
+                trustedTailSeqs: mark.tailSeqs,
+            });
+            if (applied) this.stats.deltaIngests++;
+            return applied;
+        } catch {
+            return false;
         }
     }
 

@@ -120,7 +120,7 @@ async function harness() {
         const prefix = ordered.slice(0, messageCount);
         return request("/__bili/plugin/fork", { protocolVersion: 1, parentConversationId: parent, childConversationId: child, parentRevision: snapshot.body.parentRevision as string, branchPoint: { messageCount, orderHash: hash(prefix) }, orderedMessages: prefix, idempotencyKey: `fork-${child}` });
     };
-    return { request, seedParent, forkAt, dir, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, seedParent, forkAt, dir, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("mid-history fork seeds the nudge sizing baseline (dsh fork dead-zone repro)", async () => {
