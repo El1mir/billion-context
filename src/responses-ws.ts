@@ -185,7 +185,7 @@ export class ResponsesWsUpstream {
     private history = new ResponsesWsHistory();
     private active?: { fail: (error: Error, reason?: string) => void };
 
-    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = MAX_REQUEST_BYTES, private readonly hopStamp?: string) {}
+    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = MAX_REQUEST_BYTES, private readonly hopStamp?: string, private readonly forwardTransportFields = false) {}
 
     private resetHistory(reason: string): void {
         this.history.clear();
@@ -259,7 +259,20 @@ export class ResponsesWsUpstream {
         if (options.method !== "POST" || !new URL(url).pathname.endsWith("/responses") || bodyText === undefined) throw new Error("Unsupported request in Responses WebSocket transport");
         const parsed: unknown = JSON.parse(bodyText);
         if (!object(parsed) || !Array.isArray(parsed.input)) throw new Error("Invalid Responses WebSocket request");
-        const { stream, stream_options: _streamOptions, background: _background, previous_response_id: _previous, type: _type, ...body } = parsed;
+        const { stream, stream_options: streamOptions, background: _background, previous_response_id: _previous, type: _type, ...body } = parsed;
+        // #3063 wire fidelity (WC-017): the codex lane admits stream/stream_options from
+        // the client and must forward them verbatim — real codex create frames always carry
+        // stream:true (required field), and dropping it made chatgpt.com answer with a
+        // zero-output completed turn. Gated on forwardTransportFields (the codec's
+        // allowStreamFlag) rather than field presence: the session layer injects
+        // stream:true into EVERY frame before fetch(), so presence cannot distinguish a
+        // client-sent field from an internal one. The opencode lane (WC-013) refuses both
+        // fields at admission, so its egress stays byte-identical to before.
+        const egressTransportFields: JsonObject = {};
+        if (this.forwardTransportFields) {
+            if (stream !== undefined) egressTransportFields.stream = stream;
+            if (streamOptions !== undefined) egressTransportFields.stream_options = streamOptions;
+        }
         const socket = await this.connect(url, options);
         if (this.active) throw new Error("Responses WebSocket exchange already active");
         const request = this.history.continuation(body);
@@ -323,7 +336,7 @@ export class ResponsesWsUpstream {
                             retryFull = false;
                             this.resetHistory("continuation-rejected");
                             this.log("debug", "upstream retry reason=continuation-rejected action=resend-full");
-                            socket.send(JSON.stringify({ ...body, type: "response.create" }));
+                            socket.send(JSON.stringify({ ...body, ...egressTransportFields, type: "response.create" }));
                             return;
                         }
                         clean();
@@ -375,7 +388,7 @@ export class ResponsesWsUpstream {
             options.signal?.addEventListener("abort", aborted, { once: true });
             if (options.signal?.aborted) aborted();
             else {
-                try { socket.send(JSON.stringify({ ...request, type: "response.create" })); }
+                try { socket.send(JSON.stringify({ ...request, ...egressTransportFields, type: "response.create" })); }
                 catch (error) { fail(error instanceof Error ? error : new Error("Responses WebSocket send failed"), "send-failed"); }
             }
         });
@@ -481,7 +494,7 @@ class ResponsesWsSession implements WsBridgeSession {
     private busy = false;
 
     constructor(private readonly context: WsBridgeContext) {
-        this.transport = new ResponsesWsUpstream(context.log, undefined, context.instanceId);
+        this.transport = new ResponsesWsUpstream(context.log, undefined, context.instanceId, context.codec.allowStreamFlag === true);
         context.log("info", "Responses socket connected (ACP request pipeline)");
     }
 

@@ -28,7 +28,7 @@ import {
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
 import { ensureRootCA } from "../src/ca.ts";
-import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal, resolveNativeAttachLanePriority } from "../src/config.ts";
+import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl } from "../src/config.ts";
 import { chooseWatchdogParentPid, claudeNativeRoutingCheck, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, procTableExecOptions, readPsProcInfo, recordClaudeRoutingWarning, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
 import { caDir, claudeRoutingWarningFile } from "../src/paths.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -255,6 +255,69 @@ test("resolveNativeAttachLanePriority: ordered unique list; garbage degrades to 
         assert.deepEqual(resolveNativeAttachLanePriority(), [], "non-array degrades to [] — never a lone string");
         fs.writeFileSync(cfgFile, "{ not json");
         assert.deepEqual(resolveNativeAttachLanePriority(), [], "malformed file degrades to [], never throws");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        rmrf(dir);
+    }
+});
+
+// #2877: discovery policy + explicit target — env wins over the config file;
+// default "own-lane" (a LANEd hook rides only its own lane, else spawns);
+// attachUrl unset unless an explicit origin is pinned.
+test("resolveNativeAttachPolicy: default own-lane; env/file select global-fallback", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachpol-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        assert.equal(resolveNativeAttachPolicy({}), "own-lane", "no env, no file → own-lane default");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "global-fallback" }), "global-fallback");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "GLOBAL-FALLBACK" }), "global-fallback", "case-insensitive + trimmed");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "global" }), "global-fallback", "shorthand alias");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "own-lane" }), "own-lane");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "strict" }), "own-lane", "strict == own-lane");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "bogus" }), "own-lane", "junk env falls back to default");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachPolicy: "global-fallback" } }));
+        assert.equal(resolveNativeAttachPolicy({}), "global-fallback", "file selects global-fallback");
+        assert.equal(resolveNativeAttachPolicy({ BILI_NATIVE_ATTACH_POLICY: "strict" }), "own-lane", "env wins over file");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachPolicy: "nonsense" } }));
+        assert.equal(resolveNativeAttachPolicy({}), "own-lane", "junk file value → default own-lane");
+
+        fs.rmSync(cfgFile);
+        assert.equal(resolveNativeAttachPolicy({}), "own-lane", "absent file → default own-lane");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        rmrf(dir);
+    }
+});
+
+test("resolveNativeAttachUrl: env BILI_MCP_PROXY wins over file native.attachUrl; blank → unset", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachurl-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        assert.equal(resolveNativeAttachUrl({}), undefined, "no env, no file → unset (discover)");
+        assert.equal(resolveNativeAttachUrl({ BILI_MCP_PROXY: "http://127.0.0.1:9999" }), "http://127.0.0.1:9999", "env pin");
+        assert.equal(resolveNativeAttachUrl({ BILI_MCP_PROXY: "   " }), undefined, "blank env → unset");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachUrl: "http://remote.example:8787" } }));
+        assert.equal(resolveNativeAttachUrl({}), "http://remote.example:8787", "file value used when env absent");
+        assert.equal(resolveNativeAttachUrl({ BILI_MCP_PROXY: "http://127.0.0.1:18788" }), "http://127.0.0.1:18788", "env wins over file");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachUrl: "   " } }));
+        assert.equal(resolveNativeAttachUrl({}), undefined, "whitespace file value → unset");
+
+        fs.rmSync(cfgFile);
+        assert.equal(resolveNativeAttachUrl({}), undefined, "absent file → unset");
     } finally {
         if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
         else process.env.XDG_CONFIG_HOME = prev;

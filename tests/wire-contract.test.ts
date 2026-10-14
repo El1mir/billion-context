@@ -52,7 +52,7 @@ import {
     retrieveToolsFor,
     IMAGE_FULL_TOOL_GOOGLE,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -174,11 +174,24 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
         ],
     };
     for (const rule of WIRE_RULES) {
+        if (rule.lane) continue; // lane-scoped rules are gated by their own lane's fake — see the lane probe gate below
         const enforced = probes[rule.wire].some((body) =>
             VALIDATORS[rule.wire](body).some((v) => v.startsWith(rule.id)),
         );
         assert.ok(enforced, `rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
     }
+});
+
+test("wire-contract ledger: every lane-scoped rule has a live enforcement clause", () => {
+    // Lane-scoped constraints hold on ONE client's lane only — the shared wire validator
+    // cannot enforce them (WC-013 forbids exactly what WC-017 requires, same frame shape).
+    const laneProbes: Array<{ ruleId: string; validate: (body: unknown) => string[]; body: unknown }> = [
+        { ruleId: "WC-017", validate: validateCodexResponsesWsCreate, body: { type: "response.create", input: [] } },
+    ];
+    for (const { ruleId, validate, body } of laneProbes) {
+        assert.ok(validate(body).some(v => v.startsWith(ruleId)), `lane-scoped rule ${ruleId} has no live enforcement clause in its lane fake`);
+    }
+    for (const rule of WIRE_RULES) if (rule.lane) assert.ok(laneProbes.some(p => p.ruleId === rule.id), `lane-scoped rule ${rule.id} is missing from the lane probe table`);
 });
 
 test("wire-contract ledger: every header rule has a live enforcement clause", () => {

@@ -1247,6 +1247,11 @@ test("ensureProxyRunning: attaches a late-publishing instance after the spawned 
             registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "refused"; },
             attachDiag: () => {},
             scriptPath: FP_SCRIPT,
+            // #2877: this scenario is a lane-less (manual) daemon being ridden by a
+            // LANEd launch — the pre-#2877 cross-zone fallback. Pin it to the
+            // legacy policy so it keeps exercising the post-exit re-discovery
+            // mechanism (its actual subject) rather than the new own-lane default.
+            resolveAttachPolicy: () => "global-fallback",
         },
     );
     assert.equal(handle.attached, true, "attached to the late publisher instead of failing");
@@ -1469,7 +1474,38 @@ test("ensureProxyRunning: unarmed LANE'D listener is not attached by default —
     assert.equal(registered, 0, "no watcher registration is attempted against the refused daemon");
 });
 
-test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is attached by default (#1660)", async () => {
+// #2877 flipped the default: an unarmed USER-ZONE daemon (manual `bili start`,
+// no lane) is no longer ridden by a LANEd launch — every agent converging on one
+// manual proxy was the bug (#2877). The hook now spawns its own session proxy.
+test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is NOT ridden by default — spawns its own (#2877)", async () => {
+    let spawnCalls = 0;
+    let childToken = "";
+    let spawned = false;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawned = true;
+                childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+                spawnCalls++;
+                return makeFakeChild(42505);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
+            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "manual-1" })),
+            registerWatcher: async () => "ok",
+            sleep: () => new Promise((r) => setTimeout(r, 0)),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1, "the manual user-zone daemon is no longer ridden by default (#2877)");
+    assert.ok(handle.child);
+    assert.equal(handle.attached, undefined);
+});
+
+// The pre-#2877 behavior (ride the user-maintained daemon) is preserved behind
+// the explicit legacy policy (#1660).
+test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is attached when attachPolicy=global-fallback (#1660/#2877)", async () => {
     let spawnCalls = 0;
     let registered = 0;
     const handle = await ensureProxyRunning(
@@ -1477,7 +1513,7 @@ test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is atta
         {
             spawnImpl: () => {
                 spawnCalls++;
-                return makeFakeChild(42505);
+                return makeFakeChild(42506);
             },
             fetchImpl: async () => ({ ok: true }),
             fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
@@ -1488,6 +1524,7 @@ test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is atta
             },
             sleep: () => new Promise((r) => setTimeout(r, 0)),
             scriptPath: FP_SCRIPT,
+            resolveAttachPolicy: () => "global-fallback",
         },
     );
     assert.equal(spawnCalls, 0, "the user-maintained daemon is reused, not doubled");
@@ -2067,7 +2104,82 @@ test("runLaunch: explicit ACP_PORT still attaches to a compatible proxy already 
     }
 });
 
-test("runLaunch: omitted ACP_PORT keeps the legacy selection (still attaches a user-zone daemon on any port) (#2177)", async () => {
+// #2877: pickAttachable discovery policy. Default "own-lane" rides only a
+// same-lane daemon and never falls back to a lane-less / user-zone one;
+// "global-fallback" restores the pre-#2877 fallback; an explicit attachUrl
+// targets one origin regardless of policy.
+test("findLiveAttachableInstance: own-lane (default) does NOT fall back to a lane-less user-zone daemon (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "own-lane",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(inst, undefined, "lane-less user-zone daemon is not a same-lane match → no fallback");
+});
+
+test("findLiveAttachableInstance: global-fallback DOES ride a lane-less user-zone daemon (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "global-fallback",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.ok(inst, "global-fallback restores the pre-#2877 ride");
+    assert.equal(inst?.origin, "http://127.0.0.1:8787");
+});
+
+test("findLiveAttachableInstance: same-lane daemon still attaches under default own-lane (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: true } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:18788", port: 18788, lane: "pi" }),
+            resolveAttachPolicy: () => "own-lane",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.ok(inst, "a same-lane armed daemon is always rideable");
+    assert.equal(inst?.origin, "http://127.0.0.1:18788");
+});
+
+test("findLiveAttachableInstance: explicit attachUrl targets one daemon despite own-lane (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "own-lane",
+            // trailing slash exercises normalizeOrigin
+            resolveAttachUrl: () => "http://127.0.0.1:8787/",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.ok(inst, "explicit target bypasses the policy filter");
+    assert.equal(inst?.origin, "http://127.0.0.1:8787");
+});
+
+test("findLiveAttachableInstance: attachUrl pointing elsewhere leaves no candidate (#2877)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8787", port: 8787 }),
+            resolveAttachPolicy: () => "own-lane",
+            resolveAttachUrl: () => "http://127.0.0.1:9999",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(inst, undefined, "target mismatch → nothing to attach to");
+});
+
+test("runLaunch: omitted ACP_PORT rides a lane-less user-zone daemon only when attachPolicy=global-fallback (#2877)", async () => {
     const env = piLaunchEnv();
     const st = isoStateDir();
     const ex = stubProcessExit();
@@ -2089,6 +2201,7 @@ test("runLaunch: omitted ACP_PORT keeps the legacy selection (still attaches a u
                 spawnImpl,
                 sleep: () => Promise.resolve(),
                 scriptPath: FP_SCRIPT,
+                resolveAttachPolicy: () => "global-fallback",
             },
         );
         assert.equal(spawnCalls, 0, "no explicit port → free to attach to the user-zone daemon (pre-existing behavior)");

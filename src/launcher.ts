@@ -66,7 +66,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
+import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -260,6 +260,14 @@ export interface LauncherDeps {
      *  `native.attachLanePriority`). Default [] = own lane → user zone →
      *  spawn, no cross-lane attach. */
     attachLanePriority?: () => readonly string[];
+    /** #2877: resolves the discovery policy ("own-lane" | "global-fallback").
+     *  Default reads env BILI_NATIVE_ATTACH_POLICY > config native.attachPolicy
+     *  > "own-lane". */
+    resolveAttachPolicy?: () => "own-lane" | "global-fallback";
+    /** #2877: resolves an explicit attach target origin (any URL, local or
+     *  remote), or undefined to discover. Default reads env BILI_MCP_PROXY >
+     *  config native.attachUrl. */
+    resolveAttachUrl?: () => string | undefined;
     readInstanceFile?: () => ProxyInstanceFile | { origin: string } | undefined;
     spawnImpl?: SpawnFn;
     now?: () => number;
@@ -3547,16 +3555,28 @@ function attachClass(inst: ProxyInstanceFile, lane: string | undefined, foreignL
     return foreignLanes.length + 1;
 }
 
-/** #1232: choose the attach target among healthy candidates. Must be
+/** #2877: canonicalize an origin for explicit-target comparison — trim, drop
+ *  trailing slashes, lowercase (scheme/host/port are case-insensitive). */
+function normalizeOrigin(o: string): string {
+    return o.trim().replace(/\/+$/, "").toLowerCase();
+}
+
+/** #1232/#2905: choose the attach target among healthy candidates. Must be
  *  compatible (code fingerprint + config shape + lane rules) and, under
  *  strictPort, bound to our exact port. Class ordering per attachClass —
  *  same declared lane first, listed foreign lanes next, user zone last —
- *  newest within class. */
+ *  newest within class. #2877: when attachUrl is set only that exact origin is
+ *  considered (explicit targeting overrides the policy below); otherwise
+ *  "own-lane" restricts a LANEd hook to its own lane's daemon (no fallback to a
+ *  lane-less / user-zone daemon), while "global-fallback" keeps the pre-#2877
+ *  wildcard fallback. */
 function pickAttachable(
     candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
     opts: LaunchOptions,
     codeFingerprint: string | undefined,
     attachExternal: boolean,
+    attachPolicy: "own-lane" | "global-fallback",
+    attachUrl: string | undefined,
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
     foreignLanes: readonly string[] = [],
@@ -3565,9 +3585,31 @@ function pickAttachable(
     let bestClass = Number.MAX_SAFE_INTEGER;
     let bestStartedAt = Number.NEGATIVE_INFINITY;
     for (const c of candidates) {
+        // #2877: explicit target origin wins over discovery — any other origin
+        // is skipped before compat/gate even run (cross-lane state-sharing still
+        // stays blocked by instanceCompatible's lane-mismatch rule below).
+        if (attachUrl && normalizeOrigin(c.inst.origin) !== normalizeOrigin(attachUrl)) {
+            diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): not the explicit attachUrl target`);
+            continue;
+        }
         const incompatible = instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes);
         if (incompatible !== undefined) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): incompatible (${incompatible})`); continue; }
         if (opts.strictPort && c.inst.port !== opts.port) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): port mismatch`); continue; }
+        const sameLane = opts.lane !== undefined && c.inst.lane === opts.lane;
+        // #2877: default "own-lane" — a LANEd hook rides only its own lane's
+        // daemon. Falling back to a lane-less (user-zone) daemon is what made
+        // every agent converge on one manual `bili start` (#2877), so that
+        // fallback is off by default — EXCEPT a deliberately ARMED lane-less
+        // daemon (#1225, managed shared proxy stays shareable). A lane-less
+        // initiator has no own lane to protect and keeps the legacy wildcard
+        // attach. Two things bypass this filter entirely: an explicit attachUrl
+        // target, and attachExternal=true (the pre-existing #1335 permissive
+        // opt-in — keeping it fully permissive means existing users of that
+        // flag see NO change from this flip).
+        if (!attachUrl && !attachExternal && attachPolicy === "own-lane" && opts.lane !== undefined && !sameLane && c.health.watchdog?.armed !== true) {
+            diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): not own lane and not an armed shared daemon (attachPolicy=own-lane)`);
+            continue;
+        }
         // #1335: lifecycle gate — an unarmed (or unverifiable) listener is
         // never an attach target by default; log the refusal once per origin.
         // #1660: a user-zone instance (manual `bili start`) is exempt — the
@@ -3606,13 +3648,15 @@ async function waitForStarterInstance(
     opts: LaunchOptions,
     codeFingerprint: string | undefined,
     attachExternal: boolean,
+    attachPolicy: "own-lane" | "global-fallback",
+    attachUrl: string | undefined,
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
     foreignLanes: readonly string[] = [],
 ): Promise<ProxyInstanceFile | undefined> {
     const deadline = now() + SPAWN_BUDGET_MS;
     const probe = async (): Promise<ProxyInstanceFile | undefined> =>
-        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag), opts, codeFingerprint, attachExternal, refusedLog, diag, foreignLanes);
+        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag), opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, diag, foreignLanes);
     let inst: ProxyInstanceFile | undefined;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -3635,9 +3679,11 @@ export async function findLiveAttachableInstance(
     const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
     const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
     const attachExternal = (deps.resolveAttachExternal ?? resolveNativeAttachExternal)();
+    const attachPolicy = (deps.resolveAttachPolicy ?? resolveNativeAttachPolicy)();
+    const attachUrl = (deps.resolveAttachUrl ?? resolveNativeAttachUrl)();
     const foreignLanes = (deps.attachLanePriority ?? resolveNativeAttachLanePriority)();
     const probed = await probeLiveInstances(readInstance, fetchHealthInfo, deps.attachDiag);
-    return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, new Set(), deps.attachDiag, foreignLanes);
+    return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, attachPolicy, attachUrl, new Set(), deps.attachDiag, foreignLanes);
 }
 
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
@@ -3871,6 +3917,10 @@ export async function ensureProxyRunning(
     // #2905: ordered cross-lane attach fallbacks, resolved once per bring-up
     // (file only; default [] = own lane → user zone → spawn).
     const foreignLanes = (deps.attachLanePriority ?? resolveNativeAttachLanePriority)();
+    // #2877: discovery policy + optional explicit target, resolved once per
+    // bring-up like the gate above.
+    const attachPolicy = (deps.resolveAttachPolicy ?? resolveNativeAttachPolicy)();
+    const attachUrl = (deps.resolveAttachUrl ?? resolveNativeAttachUrl)();
     // Refusal log dedup: pickAttachable runs again on every starter-poll tick,
     // so each refused origin is announced exactly once per bring-up.
     const refusedLog = new Set<string>();
@@ -3905,7 +3955,7 @@ export async function ensureProxyRunning(
     // writer of the single proxy-origin file (that pointer can belong to
     // another client's per-lane proxy).
     const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
-    const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, refusedLog, attachDiag, foreignLanes);
+    const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
     if (existing) {
         // strictPort (#964) is enforced inside pickAttachable: the client
         // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
@@ -3934,7 +3984,7 @@ export async function ensureProxyRunning(
     // (singleFlight, #706); this is the cross-process half.
     const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
         console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, refusedLog, attachDiag, foreignLanes);
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
         if (waited) {
             return attachTo(waited);
         }
@@ -4207,7 +4257,7 @@ export async function ensureProxyRunning(
             while (now() < rediscoveryDeadline) {
                 await sleepImpl(HEALTH_POLL_INTERVAL_MS);
                 const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
-                const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, refusedLog, attachDiag, foreignLanes);
+                const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
                 if (late) {
                     console.error(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
                     return attachTo(late);

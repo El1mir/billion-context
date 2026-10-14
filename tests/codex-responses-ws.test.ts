@@ -14,6 +14,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { peekSession } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
+import { validateCodexResponsesWsCreate } from "./wire-contract-fakes.ts";
 
 type Item = Record<string, unknown>;
 
@@ -42,6 +43,8 @@ async function fixture() {
     const wss = new WebSocketServer({ server: upstream });
     wss.on("connection", (peer, req) => { upstreamConnections.push(req.headers); peer.on("error", e => console.error("[FAKE-UPSTREAM-PEER-ERR]", e.message)); peer.on("message", raw => {
         const request = JSON.parse(raw.toString()) as Item;
+        const violations = validateCodexResponsesWsCreate(request);
+        if (violations.length) { peer.send(JSON.stringify({ type: "error", status: 400, error: { code: "invalid_request", message: violations.join("; ") } })); return; }
         rows.push({ request, headers: req.headers });
         const id = `resp_codex_${++serial}`;
         const send = (type: string, fields: Item): void => peer.send(JSON.stringify({ type, ...fields }));
@@ -141,6 +144,11 @@ test("codex WS: prewarm probe plus full-replay turns ride the prefix lane throug
         assert.equal(f.rows[0].headers.authorization, "Bearer fake-credential");
         assert.equal(f.rows[0].headers["session-id"], f.sid);
         assert.match(String(f.rows[0].headers["user-agent"]), /^codex_exec\//);
+        // #3063: the client's transport fields must ride the upstream frame
+        // verbatim — dropping stream made chatgpt.com answer with a zero-output
+        // completed turn.
+        assert.equal(f.rows[0].request.stream, true);
+        assert.equal(f.rows[1].request.stream, true);
         // The real turn is a full replay the pipeline processed: bili's ACP
         // tools ride alongside codex's own (empty) tool list.
         assert.ok(Array.isArray(f.rows[1].request.tools) && (f.rows[1].request.tools as Item[]).some(t => t.name === "acp_status" || t.name === "compress"), JSON.stringify((f.rows[1].request.tools as Item[] | undefined)?.map?.((t: Item) => t.name)));
@@ -400,6 +408,10 @@ test("codex WS: stream_options delivery hints are admitted (codex 0.160.0 shape,
         // Admitted through the ACP pipeline: probe row + one processed turn row, no error frame.
         assert.equal(f.rows.length, 2);
         assert.ok(JSON.stringify(f.rows[1].request.input).includes("stream-options-turn"));
+        // #3063: admitted is not enough — the hint must also reach upstream verbatim.
+        assert.equal(f.rows[0].request.stream, true);
+        assert.equal(f.rows[1].request.stream, true);
+        assert.deepEqual(f.rows[1].request.stream_options, { reasoning_summary_delivery: "sequential_cutoff" });
     } finally { await f.close(); }
 });
 

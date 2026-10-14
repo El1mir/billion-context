@@ -21,11 +21,23 @@ export type Wire = "anthropic" | "openai-chat" | "responses" | "google";
 interface WireRule {
     readonly id: string;
     readonly wire: Wire;
+    /** Lane scope (e.g. "codex") — the constraint only holds on that client's lane, so its
+     *  enforcement lives in the lane's own fake, not in the wire's shared VALIDATOR. */
+    readonly lane?: string;
     readonly summary: string;
     readonly provenance: string;
 }
 
 export const WIRE_RULES: readonly WireRule[] = [
+    {
+        id: "WC-017",
+        wire: "responses",
+        lane: "codex",
+        summary:
+            "codex CLI Responses WebSocket create frames carry stream:true (required field in the client's WS request struct) plus optional stream_options — bili must forward both verbatim on the upstream egress; dropping them made chatgpt.com answer with a zero-output completed turn",
+        provenance:
+            "bili #3063 production silent failure (codex 0.162.0-alpha.17.2 through /bili/<chatgpt.com> prefix routing on bili 0.1.183+: upstream counted input tokens, produced zero output, turn ended completed; identical via --passthrough). Cross-checked against openai/codex source: codex-rs/codex-api/src/common.rs ResponseCreateWsRequest declares stream: bool as a required serialized field (no skip_serializing_if) and serializes stream_options when present; codex-rs/core/tests/suite/client_websockets.rs asserts body[\"stream\"] == true on the wire. Repair: src/responses-ws.ts re-attaches the client's transport fields at egress (egressTransportFields); supersedes WC-013's over-generalized scope for the codex lane.",
+    },
     {
         id: "WC-016",
         wire: "anthropic",
@@ -44,8 +56,8 @@ export const WIRE_RULES: readonly WireRule[] = [
     {
         id: "WC-013",
         wire: "responses",
-        summary: "Responses WebSocket requests use response.create and omit HTTP-only stream/background/stream_options fields",
-        provenance: "OpenAI WebSocket mode guide https://developers.openai.com/api/docs/guides/websocket-mode/ (transport-specific stream/background fields are not used); OpenCode v2.0.20 open-responses-channel.ts removes these fields; bili #1844 adds a WS transport rather than sending HTTP envelopes verbatim.",
+        summary: "OpenCode V2 Responses WebSocket requests use response.create and omit HTTP-only stream/background/stream_options fields — that client's contract; the codex CLI lane instead REQUIRES stream on create frames (see WC-017)",
+        provenance: "OpenAI WebSocket mode guide https://developers.openai.com/api/docs/guides/websocket-mode/ (transport-specific stream/background fields are not used); OpenCode v2.0.20 open-responses-channel.ts removes these fields; bili #1844 adds a WS transport rather than sending HTTP envelopes verbatim. Scope corrected per #3063 (2026-10-13): the rule was over-generalized from the OpenCode V2 client to all WS lanes — the codex CLI's own create frames carry stream:true as a required field, and chatgpt.com answers stream-less frames with a zero-output completed turn.",
     },
     {
         id: "WC-012",
@@ -430,6 +442,16 @@ export function validateResponsesBody(body: unknown): string[] {
 export function validateResponsesWsCreate(body: unknown): string[] {
     if (!isPlainObject(body) || body.type !== "response.create") return ["WC-013: expected response.create WebSocket event"];
     return ["stream", "stream_options", "background"].filter(key => key in body).map(key => `WC-013: HTTP-only ${key} must not reach WebSocket response.create`);
+}
+
+/** WC-017 on a codex-lane create frame: stream:true is REQUIRED (the client's request
+ *  struct declares it without skip_serializing_if) — the inverse of WC-013's opencode lane. */
+export function validateCodexResponsesWsCreate(body: unknown): string[] {
+    if (!isPlainObject(body) || body.type !== "response.create") return ["WC-017: expected response.create WebSocket event"];
+    const out: string[] = [];
+    if (body.stream !== true) out.push("WC-017: codex response.create must carry stream:true — required field in the codex WS request struct; dropping it made chatgpt.com answer with a zero-output completed turn (#3063)");
+    if (body.background !== undefined) out.push("WC-017: codex response.create must not carry background");
+    return out;
 }
 
 /** WC-006 on a Gemini generateContent/streamGenerateContent body. */
