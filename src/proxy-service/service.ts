@@ -42,7 +42,7 @@ import {
 
 const SERVICE_STATE_FILE = "proxy-service.json";
 
-export interface ProxyServiceConfig {
+interface ProxyServiceConfig {
     taskName?: string;
     nodePath?: string;
     entryPath?: string;
@@ -56,7 +56,7 @@ export interface ProxyServiceConfig {
     unitPath?: string;
 }
 
-export interface ProxyServiceResult {
+interface ProxyServiceResult {
     ok: boolean;
     action:
         | "installed"
@@ -74,7 +74,7 @@ export interface ProxyServiceResult {
     output?: string;
 }
 
-export interface ProxyServiceRecord {
+interface ProxyServiceRecord {
     taskName: string;
     port: number;
     host: string;

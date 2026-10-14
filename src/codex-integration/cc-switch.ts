@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-export type CcSwitchMode = "direct" | "routing" | "aggregation" | "unknown";
+type CcSwitchMode = "direct" | "routing" | "aggregation" | "unknown";
 
 export interface CcSwitchDetection {
     discovered: boolean;

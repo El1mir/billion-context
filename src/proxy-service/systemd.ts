@@ -16,7 +16,7 @@ import path from "node:path";
 /** Unit basename. Fixed, like BILI_TASK_NAME: one service per machine. */
 export const BILI_SYSTEMD_UNIT = "bili-proxy.service";
 
-export interface SystemdUnitOptions {
+interface SystemdUnitOptions {
     nodePath: string;
     entryPath: string;
     port: number;
@@ -95,12 +95,12 @@ export function renderSystemdUnit(options: SystemdUnitOptions): string {
     ].join("\n");
 }
 
-export interface SystemdCommand {
+interface SystemdCommand {
     file: string;
     args: string[];
 }
 
-export interface SystemdQueryOptions {
+interface SystemdQueryOptions {
     unitName?: string;
     unitPath?: string;
 }
@@ -109,7 +109,7 @@ function unitNameOf(options: SystemdQueryOptions): string {
     return options.unitName ?? BILI_SYSTEMD_UNIT;
 }
 
-export function planSystemctl(
+function planSystemctl(
     args: string[],
     options: SystemdQueryOptions = {},
 ): SystemdCommand {
@@ -121,12 +121,6 @@ export function planSystemctl(
 
 export function planDaemonReload(): SystemdCommand {
     return { file: "systemctl", args: ["--user", "daemon-reload"] };
-}
-
-export function planSystemdEnable(
-    options: SystemdQueryOptions = {},
-): SystemdCommand {
-    return planSystemctl(["enable"], options);
 }
 
 export function planSystemdStart(

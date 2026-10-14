@@ -7,7 +7,7 @@ export interface TaskCommand {
     args: string[];
 }
 
-export interface ProxyTaskOptions {
+interface ProxyTaskOptions {
     taskName?: string;
     nodePath: string;
     entryPath: string;

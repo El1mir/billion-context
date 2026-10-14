@@ -7,7 +7,7 @@
 // rewrites the rest of the file.
 
 /** A located top-level scalar. `line` is a 0-based index into `text.split("\n")`. */
-export interface TopLevelScalar {
+interface TopLevelScalar {
     key: string;
     value: string;
     line: number;
@@ -129,7 +129,7 @@ export function removeTopLevelScalar(text: string, key: string): string {
 }
 
 /** A located scalar inside an exact TOML table. */
-export interface TableScalar extends TopLevelScalar {
+interface TableScalar extends TopLevelScalar {
     table: string;
 }
 

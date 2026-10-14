@@ -19,13 +19,13 @@ import path from "node:path";
 import { resolveCodexHome } from "../client-config.js";
 
 /** Directory name under `<CODEX_HOME>/skills`. */
-export const CODEX_SKILL_NAME = "bili";
+const CODEX_SKILL_NAME = "bili";
 
 /** Ownership marker. A skill file carrying this comment is bili's and may be
  *  refreshed in place; a same-named file WITHOUT it belongs to the user (or
  *  another tool) and is never written or deleted — the same content-based rule
  *  the model route and the hook face use. The name alone is not proof. */
-export const CODEX_SKILL_MARKER =
+const CODEX_SKILL_MARKER =
     "<!-- bili-managed: refreshed by `bili plugin install codex`; local edits are overwritten -->";
 
 /** The skill document bili installs. Kept as a constant so `codexSkillStatus`
@@ -92,7 +92,7 @@ export function readSkillName(text: string): string | undefined {
     return name.replace(/^["']|["']$/g, "");
 }
 
-export type CodexSkillState = "installed" | "missing" | "outdated" | "foreign";
+type CodexSkillState = "installed" | "missing" | "outdated" | "foreign";
 
 /** Disk state of the skill face. `outdated` means our marker is present but the
  *  bytes differ (an upgrade is due, or the user edited a bili-managed file);
@@ -110,7 +110,7 @@ export function codexSkillStatus(
     return text.includes(CODEX_SKILL_MARKER) ? "outdated" : "foreign";
 }
 
-export interface CodexSkillInstall {
+interface CodexSkillInstall {
     state: CodexSkillState | "written";
     note: string;
     written: boolean;

@@ -28,11 +28,11 @@ import {
 } from "./toml-field.js";
 
 /** The top-level Codex field this module owns. */
-export const CODEX_ROUTE_KEY = "openai_base_url";
+const CODEX_ROUTE_KEY = "openai_base_url";
 
 /** Codex's built-in OpenAI default (codex-rs model-provider-info), used when
  *  the user has declared no provider and no base URL. */
-export const CODEX_DEFAULT_UPSTREAM = "https://api.openai.com/v1";
+const CODEX_DEFAULT_UPSTREAM = "https://api.openai.com/v1";
 
 /** `<loopback origin>/bili/<real url>` — the shape bili itself writes. Accepts
  *  any loopback port (the lane's zone port drifts with the EADDRINUSE ladder,
@@ -41,13 +41,13 @@ export const CODEX_DEFAULT_UPSTREAM = "https://api.openai.com/v1";
 const BILI_ROUTE_RE =
     /^(http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5})\/bili\/(https?:\/\/.+)$/;
 
-export function isBiliCodexRoute(value: string): boolean {
+function isBiliCodexRoute(value: string): boolean {
     return BILI_ROUTE_RE.test(value.trim());
 }
 
 /** Inverse of `codexRouteValue`: recover the real upstream. undefined for
  *  anything bili did not write. */
-export function unwrapCodexRoute(value: string): string | undefined {
+function unwrapCodexRoute(value: string): string | undefined {
     const m = BILI_ROUTE_RE.exec(value.trim());
     return m ? m[2] : undefined;
 }
@@ -72,7 +72,7 @@ export function codexRouteOrigin(env: NodeJS.ProcessEnv = process.env): string {
  *  route must wrap. Mirrors launcher.ts `codexUpstreamUrl`'s precedence
  *  (`model_provider`'s `base_url` > top-level `openai_base_url` > OpenAI
  *  default) but unwraps bili's own value so re-planning never double-wraps. */
-export function codexRealUpstream(config: CodexConfig | undefined): string {
+function codexRealUpstream(config: CodexConfig | undefined): string {
     const provider =
         config?.modelProvider !== undefined
             ? config?.providers?.[config.modelProvider]?.baseUrl
@@ -87,14 +87,14 @@ export function codexRealUpstream(config: CodexConfig | undefined): string {
 
 /** Why the route cannot be (or is not) the effective one. Both are reported,
  *  never silently "fixed": the spec forbids fighting a provider manager. */
-export type CodexRouteConflict =
+type CodexRouteConflict =
     /** A foreign (non-bili) `openai_base_url` is already set. */
     | { kind: "foreign-openai-base-url"; value: string }
     /** `model_provider` names a provider with its own `base_url`, so Codex
      *  ignores the top-level field entirely — writing it would be a no-op. */
     | { kind: "shadowed-by-provider"; provider: string; value: string };
 
-export interface CodexRoutePlan {
+interface CodexRoutePlan {
     action: "install" | "refresh" | "keep" | "conflict";
     /** The full file text after the action (`keep`/`conflict` return it unchanged). */
     text: string;
@@ -105,7 +105,7 @@ export interface CodexRoutePlan {
     note: string;
 }
 
-export type CodexRouteTarget =
+type CodexRouteTarget =
     | { kind: "top-level" }
     | { kind: "provider"; provider: string };
 
@@ -308,7 +308,7 @@ export function planCodexRoute(
 
 /** What bili currently finds in `text` — the read side of ownership, shared by
  *  status reporting and uninstall. */
-export interface CodexRouteState {
+interface CodexRouteState {
     /** A bili-owned route is present. */
     routed: boolean;
     /** The raw field value, when any. */
@@ -364,18 +364,6 @@ export function readCodexRoute(
  *  drifted one". */
 export function desiredCodexRoute(text: string, origin: string): string {
     return codexRouteValue(origin, codexRealUpstream(parseCodexToml(text)));
-}
-
-export function codexRouteFilePath(codexHome: string): string {
-    return path.join(codexHome, "config.toml");
-}
-
-export function readCodexRouteFile(file: string): string {
-    try {
-        return fs.readFileSync(file, "utf8");
-    } catch {
-        return "";
-    }
 }
 
 /** Remove bili's route field, leaving every other byte alone. Returns the new

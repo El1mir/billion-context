@@ -8,7 +8,7 @@ import {
 import fs from "node:fs";
 import path from "node:path";
 
-export type CodexIntegrationState =
+type CodexIntegrationState =
     | "proxy-ready"
     | "configured"
     | "verified"
@@ -23,7 +23,7 @@ export interface CodexIntegrationReport {
     detail: string;
 }
 
-export interface CodexStatusDeps {
+interface CodexStatusDeps {
     env?: NodeJS.ProcessEnv;
     fetchImpl?: typeof fetch;
     codexConfigText?: string;

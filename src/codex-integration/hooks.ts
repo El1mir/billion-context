@@ -14,7 +14,7 @@
 import { tableRegions } from "./toml-field.js";
 
 /** The TOML table Codex reads hook entries from. */
-export const CODEX_HOOKS_TABLE = "hooks.SessionStart";
+const CODEX_HOOKS_TABLE = "hooks.SessionStart";
 
 /** `[features] hooks = true` — the master switch for the hook system. */
 const FEATURES_TABLE = "features";
@@ -90,7 +90,7 @@ export function codexHooksFeature(
     return undefined;
 }
 
-export type CodexHookPlan =
+type CodexHookPlan =
     | { action: "install" | "refresh"; text: string; note: string }
     | { action: "keep"; text: string; note: string };
 
