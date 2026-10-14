@@ -355,6 +355,7 @@
 | `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | 测试钩子：模型信息查询的重试间隔。 |
 | `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | 测试钩子：dsh 车道操作的重试间隔。 |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | 测试钩子：dsh 车道恢复清扫间隔。 |
+| `BILI_CODEX_HOOK_ORIGIN` | string | unset (route origin, then lane discovery) | — | 测试钩子：Codex SessionStart 引导 hook 探测/上报的显式代理 origin；未设置时回退到 bili 写入 config.toml 的路由，再到粘性车道端口发现。 |
 | `ACP_DUMP_DIR` | string | unset | — | 线路转储输出基础目录覆盖（路径重定位）。 |
 | `BILI_STREAM_STALL_MS` | number | (built-in) | — | 已提交上游流的停滞检测超时（无字节静默多久后中止）。 |
 | `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | 被启动客户端二进制的显式覆盖（在 PATH 上解析）。 |
@@ -1735,6 +1736,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_MODEL_INFO_RETRY_MS` | dsh 原生模型窗口解析失败（或解析结果不带窗口）后的重试冷却（毫秒，#1812/#1836）：匹配的缓存条目没有 context window 时不视为最终结果 —— 不再让整个进程生命周期 latching 成无 header 状态，而是该冷却过期后由下一个请求触发重新解析。默认 `30000`；非数字或负值回退 `30000`。测试钩子 —— dsh-native 单元测试用它缩短冷却、避免真实等待；生产环境保持 unset。 |
 | `BILI_DSH_RETRY_INTERVAL_MS` | dsh 原生插件工具注册重试的退避冷却（毫秒，#2082）：manifest 拉取或工具注册瞬时失败后，下一次重试不早于该冷却发生。默认 `10000`；非数字或非正值回退 `10000`。测试钩子 —— dsh-native 单元测试用它缩短冷却、避免真实等待；生产环境保持 unset。 |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | dsh 原生插件独立恢复定时器的间隔（毫秒，#2082）：工具处于 down 状态时，即使零模型流量也持续驱动注册重试 —— 正是模型已放弃缺失工具、其他路径都不会再触发重试的场景。默认跟随 `BILI_DSH_RETRY_INTERVAL_MS`（`10000`）。测试钩子 —— NODE_TEST_CONTEXT 下除非显式设置本变量，否则定时器永不启动；生产环境保持 unset。 |
+| `BILI_CODEX_HOOK_ORIGIN` | codex SessionStart 引导 hook 健康探测与运行时上报的显式 origin（#3176）。未设置时的回退链：bili 写入 `~/.codex/config.toml` 的路由，再到粘性车道端口发现。attach-only、fail-open —— 探测未在期限内变健康时 hook 静默退出、不阻塞会话。供测试/特殊配置使用；生产环境保持 unset。 |
 | `BILI_ADVISORY_CHECK` | 设为 `0` 禁用严重缺陷公告监视器（#1481）。默认开启 —— 它独立于 `ACP_AUTO_UPDATE` 运行，确保关闭了自动更新的安装也能被强制移出已知缺陷版本范围。fail-open：公告源不可达/格式错误只告警，绝不阻断模型流量。文件配置键：`advisoryCheck`。 |
 | `BILI_ADVISORY_URL` | 公告文档 URL 覆盖。默认：已配置 registry（感知 `BILI_UPDATE_REGISTRY`）上的伴生包 `billion-context-advisories`。文件配置键：`advisoryUrl`。 |
 | `BILI_RELEASE_NOTES_CHECK` | 设为 `0` 禁用发版说明可见性监视器（#1870）。默认开启 —— 纯可见性，且默认静默（#1977）：拉取伴生发版说明文档，仅当待更新跨度内含 `critical` 级条目时，才在 `acp_status` 与 `/acp` 面板提示「CRITICAL 更新已就绪待重启」（磁盘版本新于运行版本）或「存在 critical 更新」；routine/recommended 级发版永不上屏。绝不安装、绝不重启；fail-open。文件配置键：`releaseNotesCheck`。 |
