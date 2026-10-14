@@ -237,7 +237,7 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
             if (t !== undefined) e.input.timeout = t;
         }
         if (!repCfg.enabled) return;
-        const sid = ctx.sessionManager?.getSessionId?.() ?? "";
+        const sid = ctx?.sessionManager?.getSessionId?.() ?? "";
         let tracker = trackers.get(sid);
         if (!tracker) {
             tracker = new RepetitionTracker(repCfg);
@@ -246,9 +246,9 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
         const decision = tracker.note(e.toolName, e.input);
         if (decision.action === "abort") {
             const msg = buildRepetitionAbortNotice(decision.toolName, decision.count);
-            if (ctx.ui?.notify) ctx.ui.notify(`[ACP] ${msg}`, "warning");
+            if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
             try {
-                ctx.abort?.();
+                ctx?.abort?.();
             } catch {
                 // mid-tool abort is best-effort; the block below guarantees the refusal
             }
@@ -285,10 +285,10 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
     pi.on("input", (event, rawCtx) => {
         const ctx = rawCtx as unknown as GuardrailCtx;
         if ((event as unknown as { source?: string }).source === "extension") return;
-        trackers.get(ctx.sessionManager?.getSessionId?.() ?? "")?.reset();
+        trackers.get(ctx?.sessionManager?.getSessionId?.() ?? "")?.reset();
     });
     pi.on("session_shutdown", (_e, rawCtx) => {
         const ctx = rawCtx as unknown as GuardrailCtx;
-        trackers.delete(ctx.sessionManager?.getSessionId?.() ?? "");
+        trackers.delete(ctx?.sessionManager?.getSessionId?.() ?? "");
     });
 }

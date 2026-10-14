@@ -63,7 +63,8 @@ test("forceEnabled parses BILI_TEST_FORCE truthy/opt-out table", () => {
 });
 
 test("resolveLockPath mirrors paths.ts cacheDir() under XDG_CACHE_HOME", () => {
-    const dir = "/tmp/x/cache-home";
+    // #3170 ②: tmpdir()-rooted base is absolute on every OS; a POSIX "/tmp/…" literal resolves onto the cwd drive under path.resolve() on Windows.
+    const dir = join(tmpdir(), "x", "cache-home");
     assert.equal(
         lck.resolveLockPath({ XDG_CACHE_HOME: dir } as NodeJS.ProcessEnv),
         join(dir, "billion-context", "test-suite.lock"),

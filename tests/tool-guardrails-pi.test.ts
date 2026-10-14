@@ -354,3 +354,20 @@ test("repetition guard honors custom warn/abort thresholds", () => {
     const third = w.call(statusCall("t3")) as { block?: boolean };
     assert.equal(third?.block, true, "abort fires at custom abort=3");
 });
+
+test("#3170: all three ctx handlers tolerate a missing ctx (no throw, block still enforced)", () => {
+    const handlers: Record<string, (...a: unknown[]) => unknown> = {};
+    const pi = {
+        on: (name: string, fn: (...a: never[]) => unknown) => {
+            handlers[name] = fn as (...a: unknown[]) => unknown;
+        },
+    } as unknown as ExtensionAPI;
+    wireToolGuardrails(pi);
+    let ret: unknown;
+    for (let i = 1; i <= 5; i++) {
+        ret = handlers["tool_call"]!(statusCall(`u${i}`), undefined);
+    }
+    assert.equal((ret as { block?: boolean })?.block, true, "5th identical call must still be blocked without a ctx");
+    assert.doesNotThrow(() => handlers["input"]!({ source: "interactive" }, undefined));
+    assert.doesNotThrow(() => handlers["session_shutdown"]!({}, undefined));
+});
