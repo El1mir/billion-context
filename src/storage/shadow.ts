@@ -26,9 +26,17 @@ import { planIngest, loadLegacyView, completeBlockContents, type LegacySessionLi
 import { resolveStorageMode, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
+import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
+import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
-const MAX_CONSECUTIVE_FAILURES = 3;
+export const MAX_CONSECUTIVE_FAILURES = 3;
+
+/** #3133: read-back verification cadence — the verify leg (full read-back +
+ *  double shadowDigest) is O(log) per save, while the drift it guards is a
+ *  migration-parity property, not a per-commit one. The FIRST ingest of a
+ *  session always verifies (cold-path full check), then every N-th. */
+export const VERIFY_EVERY_INGESTS = 20;
 
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
 // discipline, #2030); re-exported here for the storage-layer importers.
@@ -36,6 +44,9 @@ export { resolveStorageMode, type StorageMode } from "../knobs.ts";
 
 interface ShadowStats {
     ingests: number;
+    /** #3133: sampled read-back verifications RUN (verifyOk + verifyDrift
+     *  ≤ this). Sampling, not removal — drift stays observable. */
+    verifySamples: number;
     verifyOk: number;
     verifyDrift: number;
     imports: number;
@@ -45,10 +56,13 @@ interface ShadowStats {
 
 export class UnifiedShadow {
     readonly mode: StorageMode;
-    readonly stats: ShadowStats = { ingests: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
+    readonly stats: ShadowStats = { ingests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
     private readonly store: UnifiedStore;
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
     private consecutiveFailures = 0;
+    /** #3133: per-session ingest counters (verify sampling). Per-process
+     *  only — nothing persisted, no schema change. */
+    private readonly ingestCounts = new Map<string, number>();
 
     private constructor(mode: StorageMode, store: UnifiedStore, legacyLoad: (record: unknown) => LegacySessionLike | null) {
         this.mode = mode;
@@ -77,9 +91,11 @@ export class UnifiedShadow {
                 "warn",
                 `[storage] unified sidecar failed to open ${dir}/index.db (${String(err)}) — staying legacy-only; delete the file to reset the index`,
             );
+            recordSidecarOpenFailure(String(err));
             return null;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
+        recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         loggerLog(
             "info",
@@ -93,6 +109,14 @@ export class UnifiedShadow {
     /** True when reads should go unified-first (full mode, sidecar healthy). */
     get readsUnified(): boolean {
         return this.mode === "full" && !this.stats.disabled;
+    }
+
+    get engine(): SqliteEngineName {
+        return this.store.engine;
+    }
+
+    get engineSource(): SqliteEngineSource {
+        return this.store.engineSource;
     }
 
     /** Ingest + verify one committed record. Never throws.
@@ -121,22 +145,35 @@ export class UnifiedShadow {
             const plan = planIngest(legacy);
             this.store.ingestSession(plan);
             this.stats.ingests++;
-            const sessionRow = this.store.getSessionRow(legacy.id);
-            if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-            const rows = {
-                session: sessionRow,
-                messages: this.store.getMessages(legacy.id),
-                blocks: this.store.getBlocks(legacy.id),
-                deadRefs: this.store.getDeadRefs(legacy.id),
-                refs: this.store.getRefs(legacy.id),
-            };
-            const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
-            const got = shadowDigest(loadLegacyView(rows));
-            if (got !== expect) {
-                this.stats.verifyDrift++;
-                loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — migration parity broken, report this`);
-            } else {
-                this.stats.verifyOk++;
+            // #3133 sampled verification: ingest integrity is already guarded
+            // by the SQLite write path; the read-back digest is a migration
+            // parity oracle, so it runs on the first ingest of a session and
+            // then every VERIFY_EVERY_INGESTS-th (drift stays observable via
+            // stats.verifyDrift on the sampled saves).
+            const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
+            this.ingestCounts.set(legacy.id, count);
+            if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
+                this.stats.verifySamples++;
+                const sessionRow = this.store.getSessionRow(legacy.id);
+                if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
+                const rows = {
+                    session: sessionRow,
+                    messages: this.store.getMessages(legacy.id),
+                    blocks: this.store.getBlocks(legacy.id),
+                    deadRefs: this.store.getDeadRefs(legacy.id),
+                    refs: this.store.getRefs(legacy.id),
+                };
+                const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
+                const got = shadowDigest(loadLegacyView(rows));
+                if (got !== expect) {
+                    this.stats.verifyDrift++;
+                    // Panels consume {disabled, lastError} — make the sampled
+                    // degradation visible there, not just in the counter/log.
+                    this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
+                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — migration parity broken, report this`);
+                } else {
+                    this.stats.verifyOk++;
+                }
             }
             this.consecutiveFailures = 0;
         } catch (err) {
@@ -192,6 +229,7 @@ export class UnifiedShadow {
 
     /** GC parity: remove the session's rows when the legacy files are deleted. */
     remove(id: string): void {
+        this.ingestCounts.delete(id);
         if (this.stats.disabled) return;
         try {
             this.store.deleteSession(id);
@@ -282,6 +320,52 @@ export class UnifiedShadow {
     webSummaryRows(): WebSummaryRow[] {
         this.assertLive();
         return this.store.webSummaryRows();
+    }
+
+    // ------------------------------------------------------------------
+    // Extension namespaces (#3069 v4): thin passthroughs. Works in shadow
+    // AND full mode — extension state is side-table substrate (like
+    // checkpoints), not part of the legacy load path.
+    // ------------------------------------------------------------------
+
+    setSessionExt(sessionId: string, key: string, value: unknown): void {
+        this.assertLive();
+        this.store.setSessionExt(sessionId, key, value);
+    }
+
+    getSessionExt(sessionId: string, key: string): unknown {
+        this.assertLive();
+        return this.store.getSessionExt(sessionId, key);
+    }
+
+    listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
+        this.assertLive();
+        return this.store.listSessionExt(sessionId);
+    }
+
+    deleteSessionExt(sessionId: string, key?: string): number {
+        this.assertLive();
+        return this.store.deleteSessionExt(sessionId, key);
+    }
+
+    setKv(namespace: string, key: string, value: unknown): void {
+        this.assertLive();
+        this.store.setKv(namespace, key, value);
+    }
+
+    getKv(namespace: string, key: string): unknown {
+        this.assertLive();
+        return this.store.getKv(namespace, key);
+    }
+
+    listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
+        this.assertLive();
+        return this.store.listKv(namespace, keyPrefix);
+    }
+
+    deleteKv(namespace: string, key?: string): number {
+        this.assertLive();
+        return this.store.deleteKv(namespace, key);
     }
 
     private assertLive(): void {

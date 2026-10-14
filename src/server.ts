@@ -97,7 +97,8 @@ import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isFileLoggingActive, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile } from "./instance.js";
+import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -143,7 +144,7 @@ import {
     streamKeepAliveMs as knobStreamKeepAliveMs,
 } from "./knobs.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
-import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
@@ -153,6 +154,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimat
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
+import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -314,6 +316,33 @@ export function requestWatchdogBudgetMs(): number {
     return knobRequestWatchdogBudgetMs();
 }
 
+// Test seam (#3091, mirrors #1770 in fetch-util): stretch the request
+// watchdog's WALL-CLOCK fire delay without changing its logical budget.
+// Asserting "a healthy stream longer than the idle budget survives" against
+// real-timer scheduling is nondeterministic under host load — the fake
+// upstream's pacing tick, the proxy's forward writes and the expired watchdog
+// timer share ONE event loop, and under CPU starvation (observed on
+// windows/node-24 CI) the timer phase can fire before the next byte reaches
+// the client, cutting a healthy stream no matter how wide the nominal margin.
+// null = production behavior (inert by default).
+let requestWatchdogDelayOverrideMs: number | null = null;
+export function _setRequestWatchdogDelayForTest(ms: number | null): void {
+    requestWatchdogDelayOverrideMs = ms;
+}
+
+// Test seam (#3091): how many times the watchdog has re-armed on a write since
+// the last reset — a deterministic observation of the re-arm-per-write wiring
+// that wall-clock survival assertions cannot pin reliably under load. This is
+// what keeps "idle, not total-time" testable once the wall clock is decoupled.
+let requestWatchdogRearmCount = 0;
+export function _requestWatchdogRearmCountForTest(): number {
+    return requestWatchdogRearmCount;
+}
+export function _resetRequestWatchdogSeamsForTest(): void {
+    requestWatchdogDelayOverrideMs = null;
+    requestWatchdogRearmCount = 0;
+}
+
 function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
     const budgetMs = requestWatchdogBudgetMs();
     if (!Number.isFinite(budgetMs) || budgetMs <= 0) return; // operator opted out
@@ -336,7 +365,7 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     };
     const arm = (): void => {
         if (timer) clearTimeout(timer);
-        timer = setTimeout(fire, budgetMs);
+        timer = setTimeout(fire, requestWatchdogDelayOverrideMs ?? budgetMs);
         timer.unref?.();
     };
     // Re-arm on every byte written toward the client. Bind the original so the
@@ -345,6 +374,7 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     const origWrite = res.write.bind(res);
     res.write = ((...args: Parameters<typeof origWrite>) => {
         arm();
+        requestWatchdogRearmCount += 1;
         return origWrite(...args);
     }) as typeof res.write;
     res.on("close", () => { if (timer) clearTimeout(timer); });
@@ -422,6 +452,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // (the chain check only compares against the other running instance).
     const instanceId = randomUUID();
     const instanceStartedAt = Date.now();
+    // #2941: the bind happens BEFORE announceListening writes this instance's
+    // identity files (pointer + registry entry), and the health route is
+    // stateless — so between bind and registration a probe sees "healthy" for
+    // an instance no discovery pass can find, and a concurrent same-lane
+    // launcher spawns a duplicate instead of attaching or waiting. The health
+    // endpoint reports not-ready until registration completes.
+    let bootReady = false;
     // #7 (shared stable-port proxy): the parent-gone watchdog watches a SET of
     // pids, not one. The spawning hook seeds it via BILI_PARENT_PID; every
     // ATTACHING session (POST /__bili/watcher) adds its claude host, so a
@@ -480,7 +517,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // as the context-window source for zero-config `/p/` routes that have no
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
-    const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid };
+    const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, bootReady: () => bootReady };
 
     const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
@@ -517,7 +554,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
     // phase-2 shell); the Responses codec is the first (and currently only)
     // entry. Unclaimed upgrades still fall through to the 426 contract below.
-    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec], (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined);
+    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec], (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined, instanceId);
     // Unclaimed upgrades retain the immediate HTTP fallback contract.
     // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
@@ -903,19 +940,26 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         return pred !== undefined;
     };
-    const announceListening = (): void => {
-        const actualPort = server.address() === null ? opts.port : (server.address() as { port: number }).port;
+    // Discovery origin local MCP shells dial: collapse wildcard
+    // binds to loopback (localhost may resolve to ::1, where an
+    // IPv4-only listener is absent) and bracket bare IPv6 literals
+    // so the file always holds a valid URL.
+    const boundOrigin = (actualPort: number): string => {
+        const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
+        return `http://${originHost}:${actualPort}`;
+    };
+    const announceListening = async (): Promise<void> => {
+        // #2941: closed between bind and announce (fast exit, test teardown) —
+        // announcing would register a dead listener under the configured port
+        // (port 0 → bogus http://host:0 banners/registry records); skip entirely.
+        if (server.address() === null) return;
+        const actualPort = (server.address() as { port: number }).port;
         const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
         // Honest bind display: a wildcard bind shows as 0.0.0.0 (the user
         // chose to expose the proxy — hiding it behind "localhost" made
         // remote setups look broken in the log, see #240).
         const displayHost = nonLoopbackBind ? opts.host : opts.host === "0.0.0.0" ? "localhost" : opts.host;
-        // Discovery origin local MCP shells dial: collapse wildcard
-        // binds to loopback (localhost may resolve to ::1, where an
-        // IPv4-only listener is absent) and bracket bare IPv6 literals
-        // so the file always holds a valid URL.
-        const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
-        const origin = `http://${originHost}:${actualPort}`;
+        const origin = boundOrigin(actualPort);
         const instanceRecord: ProxyInstanceFile = {
             origin,
             instanceId,
@@ -938,7 +982,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             //  restores the pre-#2265 exact-hash-only resolution (hot kill-switch).
             setSimhashAdoptionEnabled(opts.affinitySimhash ?? true);
             hydratePrefixAffinity();
-            atomicWriteInstanceFile(instanceRecord);
+            // #2941: never clobber a live pointer on this port — a foreign
+            // instance health-verified as serving here keeps it; our registry
+            // entry below still records us for lane-aware discovery.
+            const guard = await mayClobberPointer({
+                candidateOrigin: origin,
+                candidateInstanceId: instanceId,
+                read: readProxyInstanceFile,
+                isAlive: isPidAlive,
+                healthOf: probeOwnerInfo,
+            });
+            if (guard.allow) {
+                atomicWriteInstanceFile(instanceRecord);
+            } else if (guard.holder !== undefined) {
+                log("warn", `[pointer] keeping proxy-origin held by live instance ${guard.holder.instanceId.slice(0, 8)} (pid ${guard.holder.pid}, ${guard.holder.origin}) on this port — refusing to clobber a live pointer (#2941)`);
+            }
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
         }
@@ -1020,6 +1078,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (envKnobs.length > 0) {
             log("info", `[config] env overrides active (win over the config file): ${envKnobs.join(", ")}`);
         }
+        // #3062: rollout state for the registry — the whole block is skipped
+        // while the registry is empty (the mechanism ships gating nothing; each
+        // adopter adds its own entry). The id prefix + bucket numbers let
+        // support tickets answer "why is feature X off for me" from one line.
+        warnRolloutConfigProblems();
+        if (Object.keys(ROLLOUT_FEATURES).length > 0) {
+            const rolloutId = rolloutInstallId();
+            const gated = rolloutDecisions(rolloutId);
+            if (gated.length > 0) {
+                log(
+                    "info",
+                    `[rollout] install ${rolloutId.slice(0, 8)} — ${gated
+                        .map((d) => `${d.feature}=${d.enabled ? "on" : "off"}(${d.source}, ${d.bucket}/${BP_MAX} vs ${d.percentBp}bp${d.base ? `, base ${d.base}` : ""})`)
+                        .join(", ")}`,
+                );
+            }
+        }
         if (nonLoopbackBind) {
             log(
                 "warn",
@@ -1029,10 +1104,60 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (opts.debug) {
             log("info", `[debug] build features: raw-HTTP-capture(${bodyDumpEnabled() ? "on" : "off"}) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
         }
+        // #2941: LAST statement — registration above is done; degraded boots
+        // (best-effort write failed) still flip ready, serving as before.
+        bootReady = true;
+    };
+    // #2941: after a successful bind, verify we are the SOLE owner of the
+    // port before registering. Where socket semantics tolerate a concurrent
+    // bind onto an actively-listening port, a same-lane double spawn would
+    // otherwise serve ONE port from two state machines silently; stock libuv
+    // enforces exclusivity (EADDRINUSE ladder below), so this is a defensive
+    // second layer — see src/port-owner.ts.
+    const claimOrAnnounce = (): void => {
+        void (async () => {
+            const addr = server.address();
+            if (addr !== null && typeof addr === "object") {
+                const outcome = await resolvePortClaim({
+                    origin: boundOrigin(addr.port),
+                    ownPid: process.pid,
+                    canLadder: Boolean(launchToken) && !strictPort,
+                    listenAttempts,
+                    maxListenAttempts: MAX_LISTEN_ATTEMPTS,
+                });
+                if (outcome.kind === "ladder") {
+                    listenAttempts += 1;
+                    log("warn", `port ${lastTriedPort} shared with foreign listener (pid ${outcome.foreign.pid}) — ${outcome.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${outcome.nextPort}`} (#2941)`);
+                    // closeAllConnections: idle keep-alive sockets from early
+                    // probes must not stall the re-listen callback.
+                    server.close(() => attemptListen(outcome.nextPort));
+                    server.closeAllConnections?.();
+                    return;
+                }
+                if (outcome.kind === "die") {
+                    log("error", `listen failed: ${outcome.message}`);
+                    shuttingDown = true;
+                    server.close();
+                    flushConversations();
+                    void flushAllSessions().finally(() => {
+                        closeLogger();
+                        process.exit(1);
+                    });
+                    return;
+                }
+            }
+            await announceListening();
+        })();
     };
     const attemptListen = (port: number): void => {
         lastTriedPort = port;
-        server.listen(port, opts.host, announceListening);
+        // #2941: a failed listen never fires 'listening', so each attempt's
+        // callback stacks on the server and a later successful bind fires ALL
+        // accumulated claimOrAnnounce closures at once (double announce,
+        // double registration, MaxListenersExceededWarning on long waits).
+        // Only our own callbacks ever use this event.
+        server.removeAllListeners("listening");
+        server.listen(port, opts.host, claimOrAnnounce);
     };
     attemptListen(opts.port);
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
@@ -1283,7 +1408,7 @@ export type Prepared = {
     /** Set when a codex native-compaction request was intercepted and a
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
-    codexForge?: { kind: "endpoint" | "trigger"; body: string; contentType: string };
+    codexForge?: { kind: "endpoint" | "trigger" | "prompt"; body: string; contentType: string };
 };
 
 
@@ -2126,20 +2251,9 @@ export function buildForwardTarget(
         if (!(isLoopbackAddress(req.socket.remoteAddress) && destLoopback && destAdminPath)) headers[BILI_TUNNEL_HEADER] = "1";
     }
     headers["host"] = new URL(upstreamUrl).host;
-    // codex advertises its own server-side context compaction via this beta
-    // feature. It conflicts with bili's client-side compress (bili IS the
-    // compression layer) and third-party aggregators reject it with
-    // "invalid range / ref not found". Strip it so bili's compress is the
-    // sole mechanism.
-    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
-    if (betaKey) {
-        const kept = headers[betaKey]
-            .split(",")
-            .map((s) => s.trim())
-            .filter((f) => f && f !== "remote_compaction_v2");
-        if (kept.length > 0) headers[betaKey] = kept.join(",");
-        else delete headers[betaKey];
-    }
+    // #3073: shared with the WS lane's final egress so probe and turn carry
+    // the same beta surface (see stripRemoteCompactionBetaFeature).
+    stripRemoteCompactionBetaFeature(headers);
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
     // #2218/#1931: the plugin-protocol header x-bili-plugin-conversation is

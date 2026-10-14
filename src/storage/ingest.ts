@@ -122,17 +122,22 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const byRawRef = session.state.messageRefs.byRaw;
 
     // Pass 1: ordered union of identities (msg_id + content hash).
-    const log: { msgId: string; content: string; hash: string; ref: string | null }[] = [];
+    // #3133: no cross-save memo — the wire entry points replace the message
+    // array with freshly parsed objects on every request, so an object-
+    // identity WeakMap never hits on the production save path (see the
+    // issue for the content/seq watermark design that actually cuts cost).
+    const log: { msgId: string; content: string; hash: string; role: string; kind: string; ref: string | null }[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
         const content = JSON.stringify(m);
-        const hash = sha256Hex(content);
-        const key = `${m.id}\u0000${hash}`;
+        const parsed = JSON.parse(content) as { role: string; contentType?: string };
+        const entry = { msgId: m.id, content, hash: sha256Hex(content), role: parsed.role, kind: parsed.contentType ?? "message" };
+        const key = `${m.id}\u0000${entry.hash}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ msgId: m.id, content, hash, ref: byRawRef[m.id] ?? null });
+        log.push({ msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null });
         return seq;
     };
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
@@ -152,9 +157,10 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         msgId: e.msgId,
         ref: e.ref,
         refNum: e.ref === null ? null : refToIndex(e.ref),
-        role: (JSON.parse(e.content) as { role: string }).role,
-        kind: (JSON.parse(e.content) as { contentType?: string }).contentType ?? "message",
+        role: e.role,
+        kind: e.kind,
         content: e.content,
+        contentHash: e.hash,
     }));
 
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {

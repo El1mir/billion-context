@@ -94,14 +94,14 @@ entries:
     site_zh: "强制摘要从首次起走流式（SSE）——要求流式的上游现在通过任何非流式 400 上的一次性 SSE 探测自愈（#2494）；保留作为会掐断长非流式调用的网关（如 Cloudflare 524）的逃生通道（自学习无法感知该场景），也可用于省去一次探测往返。"
   - key: compress.preserveRecentMessages
     type: number
-    default: "kernel ≈5"
+    default: "3"
     group: compress
     id: cw.prm
     render: compress-row
     desc_en: "The most recent messages stay soft-protected from folds."
     desc_zh: "最近的消息软保护、免于折叠。"
-    site_en: "Kernel default ≈5: the most recent messages stay soft-protected from folds."
-    site_zh: "内核默认约 5：最近消息软保护、免于折叠。"
+    site_en: "Kernel default 3 (tuned 5 → 3, #3058): the most recent messages stay soft-protected from folds."
+    site_zh: "内核默认 3（5 → 3，#3058）：最近消息软保护、免于折叠。"
   - key: compress.preserveRecentTokens
     type: number
     default: "kernel ≈5000"

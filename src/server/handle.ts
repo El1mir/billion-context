@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
-import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
+import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
@@ -795,9 +795,30 @@ async function handleRequest(
             ? openaiSystemTextForPersona(parsed as OpenAIRequestBody)
             : protocol === "anthropic"
               ? systemTextsForSplit.join("\n\n")
-              : "";
+              : protocol === "google"
+                ? googleSystemText(parsed as GoogleRequestBody)
+                : "";
         const conversation = protocol === "google"
-            ? (googleIdentity?.value ?? googleSignal)
+            // #2730: the google lane is persona-aware too — dsh stamps its one
+            // conversation id on every wire including gemini (`x-bili-plugin: dsh`
+            // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
+            // paths), so a review persona would otherwise merge into the main
+            // session exactly like #1916/#2203 did on the other wires. #3134:
+            // the same v2 order resolver as the other lanes since #3060 (fork
+            // keys are byte-compatible, so persisted fork lanes survive). An
+            // empty systemInstruction is non-anchoring (kernel anchor
+            // semantics): ride the verbatim id — never route empty-tag
+            // traffic through the order resolver.
+            ? (dshPersona && !sideRequestLike
+                ? (personaSystemText === ""
+                      ? (googleIdentity?.value ?? googleSignal)
+                      : personaConversationOrder(
+                          googleIdentity?.value ?? googleSignal,
+                          (parsed as GoogleRequestBody).contents,
+                          personaSystemText,
+                          pluginReportedModel(req.headers),
+                      ))
+                : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
             ? // #970: a subagent's conversation value gets its own
               // `<id>|sub:<agent-id>` namespace so it lands on its own session
@@ -908,13 +929,18 @@ async function handleRequest(
             ? (openaiIdentity?.value ?? openaiSignal)
             : protocol === "anthropic"
               ? (anthropicIdentity?.value ?? anthropicSignal)
-              : protocol === "responses" && dshPersona
-                // #2203: dsh-responses forks record under their suffixed id
-                // (recordPluginSession keys on personaForked); without this
-                // case a fork would record under the raw id and steal the
-                // main session's entry from the single-valued conversations
-                // map (#970). Scoped to dsh: codexTurn keys verbatim and
-                // must keep personaForked false.
+              : protocol === "google" && dshPersona
+                // #2730: the google lane records its fork under the suffixed id
+                // too (same #970 discipline as openai/anthropic/responses above)
+                // so the conversations map keeps the raw key owned by the main
+                // session.
+                ? (googleIdentity?.value ?? googleSignal)
+                : protocol === "responses" && dshPersona
+                // #2203: the responses lane is persona-aware too — dsh's
+                // auto-review rides `instructions` under the same conversation id
+                // as its main turns, and the fork must record itself under its
+                // suffixed id so the single-valued conversations map keeps the raw
+                // key owned by the main session (#970 discipline).
                 ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
                 : undefined;
         const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
@@ -923,10 +949,10 @@ async function handleRequest(
         // fork reviews, codex/claude-over-Responses instructions personas —
         // so the split-session canary can tell a DESIGNED split from the
         // #2165 drift shape (see splitSessionWarnings in src/session.ts).
-        // personaForked covers the anthropic/openai wires plus dsh-over-
-        // Responses (#2203); the explicit responses clause below stays for
-        // the codex/claude instructions personas (codexTurn keys verbatim
-        // and must not count).
+        // personaForked covers the anthropic/openai/google wires plus
+        // dsh-over-Responses (#2203/#2730); the explicit responses clause
+        // below stays for the codex/claude instructions personas (codexTurn
+        // keys verbatim and must not count).
         const designNamespaced = personaForked
             || (protocol === "responses"
                 && codexTurn === undefined
@@ -2053,7 +2079,10 @@ async function handleRequest(
                         degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
                     }, log);
                 }
-                if (!countTokens && !responsesCompact) {
+                // A locally-served codex compaction forge never reaches an
+                // upstream: preflight would burn summarization rounds for a
+                // reply that is already forged (#3008 prompt form).
+                if (!countTokens && !responsesCompact && !prepared.codexForge) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
                         runPrepare,

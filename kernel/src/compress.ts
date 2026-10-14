@@ -1043,8 +1043,12 @@ const filterNode: PipelineNode = {
 
 const hideCompressCallsNode: PipelineNode = {
   name: "hide-compress-calls",
-  run(io) {
-    const hidden = hideConsumedCompressCalls(io.state, io.messages);
+  run(io, ctx) {
+    const hidden = hideConsumedCompressCalls(
+      io.state,
+      io.messages,
+      ctx.config.isCompressTool,
+    );
     return {
       ...io,
       messages: hidden.messages,

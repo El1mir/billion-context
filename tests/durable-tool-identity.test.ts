@@ -29,8 +29,9 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import type { CompressSettings } from "../src/config.ts";
 import { withDurableProtection, durableMessageToolPaths, dshSkillCatalogPath } from "../src/durable-message-guards.ts";
-// #2989: rig hygiene resets the LIVE session-order registry (the retired
-// persona-anchor ladder is no longer on the production path).
+// #2989: rig hygiene resets the LIVE session-order registry (the persona-
+// anchor ladder is off the production path on every lane since #3134 —
+// v2 order resolution everywhere, google included).
 import { resetSessionOrderForTest } from "../src/session-resolve.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";

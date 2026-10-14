@@ -1,7 +1,8 @@
 import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
-import { getStore } from "./persist.js";
+import { getStore, effectiveFileStorageMode } from "./persist.js";
+import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
@@ -659,32 +660,93 @@ const residentWeights = new WeakMap<Session, { revision: number; bytes: number }
 
 /** Estimate retained objects without serializing a second giant copy. Include
  * originals and last-message caches; counting files alone misses both. */
+function deepSizeOf(value: unknown): number {
+    const seen = new WeakSet<object>();
+    const size = (v: unknown): number => {
+        if (typeof v === "string") return 32 + v.length * 2;
+        if (!v || typeof v !== "object") return 8;
+        if (seen.has(v)) return 0;
+        seen.add(v);
+        if (Buffer.isBuffer(v)) return 64 + v.byteLength;
+        let bytes = 64;
+        if (v instanceof Map) {
+            for (const [key, item] of v) bytes += size(key) + size(item) + 32;
+        } else if (v instanceof Set) {
+            for (const item of v) bytes += size(item) + 16;
+        } else if (Array.isArray(v)) {
+            for (const item of v) bytes += size(item) + 8;
+        } else {
+            for (const key of Object.keys(v)) bytes += size(key) + size((v as Record<string, unknown>)[key]) + 16;
+        }
+        return bytes;
+    };
+    return size(value);
+}
+
 function sessionWeight(session: Session): number {
     const revision = session.revisionEpoch ?? 0;
     const cached = residentWeights.get(session);
     if (cached?.revision === revision) return cached.bytes;
-    const seen = new WeakSet<object>();
-    const size = (value: unknown): number => {
-        if (typeof value === "string") return 32 + value.length * 2;
-        if (!value || typeof value !== "object") return 8;
-        if (seen.has(value)) return 0;
-        seen.add(value);
-        if (Buffer.isBuffer(value)) return 64 + value.byteLength;
-        let bytes = 64;
-        if (value instanceof Map) {
-            for (const [key, item] of value) bytes += size(key) + size(item) + 32;
-        } else if (value instanceof Set) {
-            for (const item of value) bytes += size(item) + 16;
-        } else if (Array.isArray(value)) {
-            for (const item of value) bytes += size(item) + 8;
-        } else {
-            for (const key of Object.keys(value)) bytes += size(key) + size((value as Record<string, unknown>)[key]) + 16;
-        }
-        return bytes;
-    };
-    const bytes = size(session);
+    const bytes = deepSizeOf(session);
     residentWeights.set(session, { revision, bytes });
     return bytes;
+}
+
+/** Per-field resident bytes for one session (#R3 diagnostics). The `total` leg
+ * reuses the revision-cached sessionWeight; the per-field legs walk fresh on
+ * every call (diagnostics only — never hot). Shared substructure between
+ * fields may double-count across the fresh walkers; `other` absorbs the
+ * remainder clamped at 0, so columns sum to `total` while fields stay disjoint. */
+export interface ResidentFieldBreakdown {
+    lastMessages: number;
+    pluginSnapshot: number;
+    blockContents: number;
+    contentStore: number;
+    state: number;
+    other: number;
+    total: number;
+}
+
+export function residentBreakdown(session: Session): ResidentFieldBreakdown {
+    const total = sessionWeight(session);
+    const lastMessages = session.lastMessages ? deepSizeOf(session.lastMessages) : 0;
+    const pluginSnapshot = session.pluginSnapshot ? deepSizeOf(session.pluginSnapshot) : 0;
+    const blockContents = deepSizeOf(session.blockContents);
+    const contentStore = session.contentStore ? deepSizeOf(session.contentStore) : 0;
+    const state = deepSizeOf(session.state);
+    const other = Math.max(0, total - lastMessages - pluginSnapshot - blockContents - contentStore - state);
+    return { lastMessages, pluginSnapshot, blockContents, contentStore, state, other, total };
+}
+
+/** Whole-pool memory report for the /__bili/memory diagnostics endpoint:
+ * budget vs resident totals, per-field sums, and the heaviest sessions.
+ * Read-only snapshot — safe to call at any time. */
+export interface MemoryReport {
+    pool: { sessions: number; maxSessions: number; residentBytes: number; budgetBytes: number };
+    breakdown: ResidentFieldBreakdown;
+    sessions: Array<{ id: string; inFlight: number; lastSeen: number; revision: number; fields: ResidentFieldBreakdown }>;
+}
+
+export function memoryReport(): MemoryReport {
+    const rows: MemoryReport["sessions"] = [];
+    const sums: ResidentFieldBreakdown = { lastMessages: 0, pluginSnapshot: 0, blockContents: 0, contentStore: 0, state: 0, other: 0, total: 0 };
+    for (const session of sessions.values()) {
+        const fields = residentBreakdown(session);
+        sums.lastMessages += fields.lastMessages;
+        sums.pluginSnapshot += fields.pluginSnapshot;
+        sums.blockContents += fields.blockContents;
+        sums.contentStore += fields.contentStore;
+        sums.state += fields.state;
+        sums.other += fields.other;
+        sums.total += fields.total;
+        rows.push({ id: session.id, inFlight: session.inFlight, lastSeen: session.lastSeen, revision: session.revisionEpoch ?? 0, fields });
+    }
+    rows.sort((a, b) => b.fields.total - a.fields.total);
+    return {
+        pool: { sessions: sessions.size, maxSessions: MAX_SESSIONS, residentBytes: residentBytes(), budgetBytes: MAX_RESIDENT_BYTES },
+        breakdown: sums,
+        sessions: rows,
+    };
 }
 
 function residentBytes(): number {
@@ -773,7 +835,9 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
         stats: zeroStats(),
-        metadata: {},
+        // #3093: stamp provenance on the LIVE object too — the web detail panel
+        // reads live sessions directly; buildRecord re-stamps the same values on save.
+        metadata: { biliVersion: VERSION, storageMode: effectiveFileStorageMode() },
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),

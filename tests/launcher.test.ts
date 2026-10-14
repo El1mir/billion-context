@@ -9,6 +9,7 @@ type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import {
     claimStartingMarker,
     readStartingMarker,
@@ -3722,7 +3723,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         assert.equal(writeDshClientShimFiles(shimDir, hostBundle, clientBundle, "0.1.169"), true);
         const shimPkg = JSON.parse(fs.readFileSync(path.join(shimDir, "package.json"), "utf8"));
         assert.equal(shimPkg.name, "billion-context");
-        assert.deepEqual(shimPkg.exports, { ".": "./index.js", "./dsh": "./index.js", "./dsh/package.json": "./package.json", "./client": "./bundle.js" });
+        assert.deepEqual(shimPkg.exports, { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" });
         assert.equal(shimPkg.dsh.client.platform, "web");
         // The bundles are SYMLINKS into bili's live dist — an auto-update that
         // moves dist self-heals on the next launch without rewriting the shim.
@@ -3732,6 +3733,14 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         // Resolvable from the home's walk-up chain, and the root import
         // lands on the host module itself ⇒ the bare entry.
         assert.equal(dshPluginEntry(home), "billion-context");
+
+        // #3043: dsh's client scanner locates the package root via
+        // require.resolve("billion-context/package.json") before reading dsh.client.
+        // Node's closed `exports` map throws ERR_PACKAGE_PATH_NOT_EXPORTED for any
+        // unlisted subpath — omit "./package.json" here (as in the published pkg)
+        // and the scanner swallows the throw, so the browser half never registers.
+        const shimRequire = createRequire(path.join(home, "probe.cjs"));
+        assert.equal(shimRequire.resolve("billion-context/package.json"), path.join(shimDir, "package.json"));
 
         // A shim whose root "." export points elsewhere (e.g. a real install
         // whose root is the CLI entry, not the dsh host half) must NOT claim

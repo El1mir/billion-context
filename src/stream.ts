@@ -522,7 +522,18 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
             return "";
         }
         if (!nudge) return "";
-        base = viableRanges(nudge.compressibleRanges).filter(submitGate);
+        // The kernel's own eligibility verdict governs the tail: a decision
+        // struct with shouldInject === false is the kernel saying the leftover
+        // ranges sit below its threshold/floor/cadence (e.g. a 1-message
+        // residue exposed by a smaller preserveRecentMessages window, #3058).
+        // Advertising them anyway re-nags at zero pressure — the exact disease
+        // #1387 (pi #521) fixed. shouldInject=false ⇒ nothing actionable ⇒ fall
+        // through to the stop-signal logic below (never list the ranges).
+        if (nudge.shouldInject) {
+            base = viableRanges(nudge.compressibleRanges).filter(submitGate);
+        } else {
+            base = [];
+        }
         tier = nudge.tier ?? null;
     }
     // Drop the offers this call just folded; everything else stays advertised

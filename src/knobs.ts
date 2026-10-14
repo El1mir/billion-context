@@ -477,6 +477,24 @@ export function fakeBufCapBytes(): number {
     return Number.isFinite(v) && v > 0 ? v : 16 * 1024 * 1024;
 }
 
+/** Config-file tiers of the storage knobs (#3040): single readers so the
+ *  runtime-status surface and the store constructor report exactly what the
+ *  file says (moved out of persist.ts, which used to be the only home). */
+export function fileStorageUnified(): string | undefined {
+    const v = loadConfigFile().storage?.unified;
+    return typeof v === "string" ? v : undefined;
+}
+
+export function fileStorageJsonWriter(): string | undefined {
+    const v = loadConfigFile().storage?.jsonWriter;
+    return typeof v === "string" ? v : undefined;
+}
+
+export function fileStorageAutoDownload(): boolean | undefined {
+    const v = loadConfigFile().storage?.sqliteAutoDownload;
+    return typeof v === "boolean" ? v : undefined;
+}
+
 /** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the

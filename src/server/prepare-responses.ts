@@ -27,7 +27,7 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
+import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
@@ -452,16 +452,24 @@ export async function prepareResponses(
         processedMessages = [];
     }
 
-    // E2 trigger form: codex's native remote-compaction request (final input item
-    // is compaction_trigger). When the kill-switch is on, the client is codex, and
-    // the safety gate passes, forge a success SSE (one compaction item +
-    // response.completed) and skip upstream — a deterministic handoff to the ACP
-    // state instead of a foreign compaction blob.
+    // E2 compaction forms: codex's native remote-compaction request (final
+    // input item is compaction_trigger) — and, since #3008, the LOCAL inline
+    // auto-compact that travels as an ordinary turn opening with codex's
+    // SUMMARIZATION_PROMPT template (prompt form). When the kill-switch is
+    // on, the client is codex, and the safety gate passes, forge a success
+    // reply and skip upstream — a deterministic handoff to the ACP state
+    // instead of a foreign compaction blob (the prompt form alone otherwise
+    // re-caches the full unfolded history, 720k tokens in the #3008 incident).
+    const compactForm: "trigger" | "prompt" | undefined = hasCompactionTrigger(parsed.input)
+        ? "trigger"
+        : hasCompactionPrompt(parsed.input)
+            ? "prompt"
+            : undefined;
     let codexForge: Prepared["codexForge"] | undefined;
     if (transformOk
+        && compactForm !== undefined
         && codexCompactMode() === "intercept"
         && isCodexClient(req.headers)
-        && hasCompactionTrigger(parsed.input)
         && codexCompactGate(session, config.modelContextLimit, transformOk)) {
         const summaries = session.state.blocks.filter((b) => b.active).map((b) => b.summary);
         const prevForged = session.metadata.codexForgedSummaries as string[] | undefined;
@@ -472,16 +480,20 @@ export async function prepareResponses(
         }
         // Codex recomputes its ledger from the next real request, but the
         // usage we mint here must not read as an empty context: fall back to
-        // estimating the trigger payload itself when lastInputTokens is
-        // stale/zero. The reply honors parsed.stream (JSON body when not
-        // streaming).
+        // estimating the payload itself when lastInputTokens is stale/zero.
+        // The reply honors parsed.stream (JSON body when not streaming).
         const est = defaultCountTokens(typeof parsed.input === "string" ? parsed.input : JSON.stringify(parsed.input ?? ""));
         const total = Math.max(session.stats.lastInputTokens, est, 1);
-        codexForge = {
-            kind: "trigger",
-            ...buildTriggerForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
-        };
-        log("info", `[${sessionId}] codex compact intercepted (trigger); forged SSE with ${summaries.length} block summary(s), upstream not contacted`);
+        codexForge = compactForm === "trigger"
+            ? {
+                kind: "trigger",
+                ...buildTriggerForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
+            }
+            : {
+                kind: "prompt",
+                ...buildPromptForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
+            };
+        log("info", `[${sessionId}] codex compact intercepted (${compactForm} form); forged ${stream ? "SSE" : "JSON"} with ${summaries.length} block summary(s), upstream not contacted`);
     }
 
     // #1479: Responses-wire twin of the #762 repair — fold + kernel round-trip

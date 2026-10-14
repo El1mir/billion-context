@@ -249,6 +249,10 @@ interface ProxyHandle {
 export interface LauncherDeps {
     fetchImpl?: (url: string) => Promise<{ ok: boolean }>;
     fetchHealthInfo?: (origin: string) => Promise<HealthInfo | undefined>;
+    /** #3116: classified health probe for FAILURE paths only (slow-start
+     *  notice, early-exit throw, timeout kill). Default performs a real fetch
+     *  with error-class capture. */
+    fetchDetailImpl?: (url: string) => Promise<ProbeOutcome>;
     /** #1335: resolves the attach-gate escape hatch. Default reads env
      *  BILI_NATIVE_ATTACH_EXTERNAL > config `native.attachExternal` > false. */
     resolveAttachExternal?: () => boolean;
@@ -2989,7 +2993,7 @@ export function writeDshClientShimFiles(shimDir: string, hostBundle: string, cli
                 name: "billion-context",
                 version,
                 type: "module",
-                exports: { ".": "./index.js", "./dsh": "./index.js", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
+                exports: { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
                 dsh: { client: { platform: "web" } },
             })}\n`,
         );
@@ -3336,6 +3340,43 @@ async function probeHealth(
         return ok;
     } catch {
         return false;
+    }
+}
+
+/** #3116: classified outcome of a health probe — `detail` carries the failure
+ *  class (ECONNREFUSED / HTTP status / timeout) so a failed bring-up can say
+ *  WHY the probe kept failing instead of pointing at a possibly-empty child
+ *  log. Success carries no detail. */
+export interface ProbeOutcome {
+    ok: boolean;
+    detail?: string;
+}
+
+/** #3116: short human-readable failure class for a rejected health probe.
+ *  undici wraps socket errors in TypeError("fetch failed") with the code on
+ *  `cause` — unwrap it, since the code is the actionable part. */
+export function describeProbeFailure(err: unknown): string {
+    const e = err as { cause?: { code?: unknown }; code?: unknown; name?: string; message?: string } | null;
+    const code = e?.cause?.code ?? e?.code;
+    if (typeof code === "string" && code.length > 0) return code;
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") return `timeout after ${PROBE_TIMEOUT_MS}ms`;
+    if (typeof e?.message === "string" && e.message.length > 0) return e.message.slice(0, 160);
+    return String(err);
+}
+
+/** #3116: defaultFetch with the failure class preserved — same request shape,
+ *  same timeout, same ok semantics (res.ok), plus a `detail` on failure. Used
+ *  ONLY on launcher failure paths; the hot probe path keeps defaultFetch. */
+async function defaultFetchDetail(url: string): Promise<ProbeOutcome> {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+    try {
+        const res = await fetch(url, { signal: ctrl.signal });
+        return res.ok ? { ok: true } : { ok: false, detail: `HTTP ${res.status}` };
+    } catch (err) {
+        return { ok: false, detail: describeProbeFailure(err) };
+    } finally {
+        clearTimeout(t);
     }
 }
 
@@ -3815,6 +3856,7 @@ export async function ensureProxyRunning(
 ): Promise<ProxyHandle> {
     const fetchImpl = deps.fetchImpl ?? defaultFetch;
     const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
+    const fetchDetail = deps.fetchDetailImpl ?? defaultFetchDetail;
     const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
     const listRegistry = deps.listRegistryInstances ?? discoverLiveInstances;
     const spawnImpl = deps.spawnImpl ?? (spawn as SpawnFn);
@@ -4033,6 +4075,57 @@ export async function ensureProxyRunning(
         child.on?.("error", (...rest: unknown[]) => {
             childError = rest[0];
         });
+        // #3116: every failure message below points at logPath, but that file is
+        // structurally able to stay EMPTY — the fd is opened ("a") BEFORE spawn,
+        // and post-#2864 the child mutes its stderr leg into bili.log as soon as
+        // its logger is live, so a child that dies before its first log line
+        // leaves 0 bytes and the pointer leads nowhere. Make the spawner-side
+        // evidence self-contained instead: report the log size, and classify
+        // what the port actually does at decision time (refused connection vs
+        // healthy foreign responder vs non-bili HTTP answer vs hang).
+        const logTail = (): string => {
+            try {
+                const size = fs.statSync(logPath).size;
+                // "0 bytes" alone cannot tell "child wrote nothing" from "output
+                // rotated away" (rotatePortLogIfNeeded renames to .old before
+                // the fd is opened) — say which when the rotated half exists.
+                const rotated = fs.existsSync(`${logPath}.old`) ? `; earlier output rotated to ${logPath}.old` : "";
+                return size === 0 ? `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}` : `, ${size} bytes${rotated}`;
+            } catch {
+                return "";
+            }
+        };
+        const diagnosePort = async (childAlive: boolean): Promise<string> => {
+            const origin = proxyOrigin(opts.host, port);
+            let info: HealthInfo | undefined;
+            let det: ProbeOutcome = { ok: false, detail: "probe error" };
+            try {
+                const [i, d] = await Promise.all([fetchHealthInfo(origin), fetchDetail(healthUrl(origin))]);
+                info = i;
+                det = d;
+            } catch {
+                /* observability only — keep the generic clause */
+            }
+            if (info?.ok) {
+                return info.pid === child.pid
+                    ? `port ${port} finally answers healthy from our child (pid ${info.pid}) but its instance handshake never matched — check the instance-file/registry state dir`
+                    : `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it`;
+            }
+            // A 200 that is not bili's health payload (foreign dev servers
+            // answer ANY path with their index page) must not fall into the
+            // generic "probe failed" clause — the probe SUCCEEDED.
+            if (det.ok) {
+                return `port ${port} answered but not with bili's health payload — a foreign service likely holds it`;
+            }
+            const d = det.detail ?? "unknown error";
+            if (/^(ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE)$/i.test(d)) {
+                return `nothing is listening on port ${port} — the spawned child (${childAlive ? "still alive" : "already exited"}, pid ${child.pid ?? "?"}) never bound it`;
+            }
+            if (/^HTTP \d{3}$/.test(d)) {
+                return `port ${port} answered ${d} — the listener there is not reporting bili health`;
+            }
+            return `last health probe failed with ${d}`;
+        };
 
         const deadline = now() + SPAWN_BUDGET_MS;
         // #2187: announce the phase boundary once — a live child past the
@@ -4044,7 +4137,7 @@ export async function ensureProxyRunning(
             if (!slowStartNoticed && now() >= deadline - SLOW_START_GRACE_MS) {
                 slowStartNoticed = true;
                 console.error(
-                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (log: ${logPath})`,
+                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${await diagnosePort(true)}) (log: ${logPath}${logTail()})`,
                 );
             }
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -4141,18 +4234,22 @@ export async function ensureProxyRunning(
             const detail = childExit.code !== null
                 ? `code ${childExit.code}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${await diagnosePort(false)} (log: ${logPath}${logTail()})`);
         }
         // #2260(A)/#2187: the timeout is the ONE terminal path where the
         // spawned child is STILL ALIVE. Abandoning it leaked a detached proxy
         // per failed bring-up — dsh plan-time retries re-arm every 10s, so a
         // persistently slow host accumulated ~1 zombie per ~70s (each also
         // stranding the lane sticky-port ladder). Hard-kill before failing.
+        // #3116: classify the port WHILE THE CHILD IS STILL ALIVE — probing
+        // after the kill turns "bound but hung" into a misleading
+        // ECONNREFUSED.
+        const diagnosis = await diagnosePort(true);
         killAbandonedChild(child);
         console.error(
-            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — it never became ready and would otherwise outlive this failure (log: ${logPath})`,
+            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis} (log: ${logPath}${logTail()})`,
         );
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms (log: ${logPath})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis} (log: ${logPath}${logTail()})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
@@ -4175,6 +4272,17 @@ function killAbandonedChild(child: SpawnChild | undefined): void {
             process.kill(-child.pid, "SIGKILL");
         } catch {
             /* group already gone */
+        }
+    } else {
+        // #3116: win32 has no process-group kill — TerminateProcess on the direct
+        // child alone leaks its descendants (a detached:true child that spawned
+        // its own helpers, e.g. self-update npm runs, survives the "abandoned"
+        // kill). taskkill /T walks the whole tree; the direct kill below stays
+        // as the fallback if taskkill itself fails.
+        try {
+            spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true, stdio: "ignore" });
+        } catch {
+            /* taskkill unavailable — direct kill below */
         }
     }
     try {

@@ -71,6 +71,10 @@ export interface MessageRow {
     kind: string;
     /** Verbatim serialized message (includes id; exact parsed-file bytes). */
     content: string;
+    /** #3133: sha256(content) as computed by the planner's intern pass —
+     *  lets ingestSession skip re-hashing every message on every save.
+     *  Identical value to sha256Hex(content); optional for direct callers. */
+    contentHash?: string;
 }
 
 export interface BlockRow {
@@ -170,6 +174,41 @@ export interface IngestSessionInput {
     tailSeqs?: number[] | null;
 }
 
+/** Extension-namespace guards (#3069): keys/namespaces are non-empty
+ *  printable ASCII-range strings up to 256 chars — loose by design (callers
+ *  namespace by convention like "r3:" / "web:" / "lane:"), hostile by
+ *  accident is what we guard, not hostile by design. */
+const EXT_KEY_MAX = 256;
+const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
+
+function validateExtKey(value: string, what: string): void {
+    if (typeof value !== "string" || value.length === 0 || value.length > EXT_KEY_MAX) {
+        throw new Error(`[storage] extension ${what} must be a non-empty string of at most ${EXT_KEY_MAX} characters`);
+    }
+    for (let i = 0; i < value.length; i++) {
+        const c = value.charCodeAt(i);
+        if (c < 0x20 || c === 0x7f) {
+            throw new Error(`[storage] extension ${what} must not contain control characters`);
+        }
+    }
+}
+
+function serializeExtValue(value: unknown): string {
+    const json = JSON.stringify(value);
+    if (json === undefined) {
+        throw new Error("[storage] extension values must be JSON-serializable (undefined/functions are not)");
+    }
+    if (json.length > EXT_VALUE_MAX_BYTES) {
+        throw new Error(`[storage] extension value exceeds ${EXT_VALUE_MAX_BYTES} bytes — store large payloads in the content CAS instead`);
+    }
+    return json;
+}
+
+/** Escapes LIKE metacharacters for the ESCAPE '\\' clause used by listKv. */
+function likeEscape(prefix: string): string {
+    return prefix.replace(/[\\%_]/g, (ch) => "\\" + ch);
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
@@ -205,9 +244,11 @@ export class UnifiedStore {
     }
 
     /** Content CAS: insert-if-absent + refcount bump; returns hash. */
-    private putContent(content: string | Buffer): string {
+    private putContent(content: string | Buffer, precomputedHash?: string): string {
         const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : content;
-        const hash = sha256Hex(bytes);
+        // #3133: delta-interned plan rows already carry the digest — skip the
+        // per-message re-hash (same value: sha256 over the same utf8 bytes).
+        const hash = precomputedHash ?? sha256Hex(bytes);
         const existing = this.db.prepare("SELECT refcount FROM content WHERE hash = ?").get(hash) as
             | { refcount: number }
             | undefined;
@@ -250,7 +291,9 @@ export class UnifiedStore {
             }
             const planToAbs = new Map<number, number>();
             const messages = input.messages.map((m) => {
-                const hash = sha256Hex(m.content);
+                // #3133: plan rows carry the intern-pass hash; only direct
+                // callers without a planner pay the sha256 here.
+                const hash = m.contentHash ?? sha256Hex(m.content);
                 const key = `${m.msgId}\u0000${hash}`;
                 let abs = seqByIdentity.get(key);
                 if (abs === undefined) {
@@ -331,7 +374,7 @@ export class UnifiedStore {
                 .run(s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt);
 
             for (const m of messages) {
-                const hash = this.putContent(m.content);
+                const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
                         "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -491,6 +534,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
             // CAS rows at zero refcount are unreferenced garbage — collect.
@@ -529,6 +573,110 @@ export class UnifiedStore {
         return sessionId
             ? (this.db.prepare(`SELECT ${cols} FROM checkpoints WHERE session_id = ? ORDER BY created_at, cp_id`).all(sessionId) as CheckpointRow[])
             : (this.db.prepare(`SELECT ${cols} FROM checkpoints ORDER BY created_at, cp_id`).all() as CheckpointRow[]);
+    }
+
+    // ------------------------------------------------------------------
+    // Extension namespaces (#3069 v4). Host/plugin/UI substrate — never
+    // kernel session state (that lives in kstate_json). Guards: key and
+    // namespace are non-empty printable strings <= 256 chars; the JSON
+    // payload is capped so a runaway caller cannot balloon index.db.
+    // ------------------------------------------------------------------
+
+    setSessionExt(sessionId: string, key: string, value: unknown): void {
+        validateExtKey(sessionId, "session id");
+        validateExtKey(key, "key");
+        const valueJson = serializeExtValue(value);
+        this.db
+            .prepare(
+                "INSERT INTO session_ext (session_id, key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
+                    "ON CONFLICT (session_id, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+            )
+            .run(sessionId, key, valueJson, Date.now());
+    }
+
+    getSessionExt(sessionId: string, key: string): unknown {
+        validateExtKey(sessionId, "session id");
+        validateExtKey(key, "key");
+        const row = this.db
+            .prepare("SELECT value_json FROM session_ext WHERE session_id = ? AND key = ?")
+            .get(sessionId, key) as { value_json: string } | undefined;
+        return row === undefined ? undefined : JSON.parse(row.value_json);
+    }
+
+    listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
+        validateExtKey(sessionId, "session id");
+        return (
+            this.db
+                .prepare("SELECT key, value_json, updated_at FROM session_ext WHERE session_id = ? ORDER BY key")
+                .all(sessionId) as { key: string; value_json: string; updated_at: number }[]
+        ).map((r) => ({ key: r.key, value: JSON.parse(r.value_json), updatedAt: r.updated_at }));
+    }
+
+    /** Deletes one key (or every key of the session when omitted). Returns
+     *  the number of rows removed. The deleteSession sweep calls this table
+     *  too — session-bound state dies with the session. */
+    deleteSessionExt(sessionId: string, key?: string): number {
+        validateExtKey(sessionId, "session id");
+        if (key === undefined) {
+            return Number(this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId).changes);
+        }
+        validateExtKey(key, "key");
+        return Number(this.db.prepare("DELETE FROM session_ext WHERE session_id = ? AND key = ?").run(sessionId, key).changes);
+    }
+
+    setKv(namespace: string, key: string, value: unknown): void {
+        validateExtKey(namespace, "namespace");
+        validateExtKey(key, "key");
+        const valueJson = serializeExtValue(value);
+        this.db
+            .prepare(
+                "INSERT INTO kv_store (namespace, key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
+                    "ON CONFLICT (namespace, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+            )
+            .run(namespace, key, valueJson, Date.now());
+    }
+
+    getKv(namespace: string, key: string): unknown {
+        validateExtKey(namespace, "namespace");
+        validateExtKey(key, "key");
+        const row = this.db
+            .prepare("SELECT value_json FROM kv_store WHERE namespace = ? AND key = ?")
+            .get(namespace, key) as { value_json: string } | undefined;
+        return row === undefined ? undefined : JSON.parse(row.value_json);
+    }
+
+    listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
+        const where: string[] = [];
+        const args: unknown[] = [];
+        if (namespace !== undefined) {
+            validateExtKey(namespace, "namespace");
+            where.push("namespace = ?");
+            args.push(namespace);
+        }
+        if (keyPrefix !== undefined && keyPrefix !== "") {
+            validateExtKey(keyPrefix, "key prefix");
+            where.push("key LIKE ? ESCAPE '\\'");
+            args.push(likeEscape(keyPrefix) + "%");
+        }
+        const sql =
+            "SELECT namespace, key, value_json, updated_at FROM kv_store" +
+            (where.length > 0 ? " WHERE " + where.join(" AND ") : "") +
+            " ORDER BY namespace, key";
+        return (
+            this.db.prepare(sql).all(...(args as never[])) as { namespace: string; key: string; value_json: string; updated_at: number }[]
+        ).map((r) => ({ namespace: r.namespace, key: r.key, value: JSON.parse(r.value_json), updatedAt: r.updated_at }));
+    }
+
+    /** Deletes one key of a namespace, or the whole namespace when the key
+     *  is omitted ("retire a lane" = deleteKv("lane:18835")). Returns the
+     *  number of rows removed. */
+    deleteKv(namespace: string, key?: string): number {
+        validateExtKey(namespace, "namespace");
+        if (key === undefined) {
+            return Number(this.db.prepare("DELETE FROM kv_store WHERE namespace = ?").run(namespace).changes);
+        }
+        validateExtKey(key, "key");
+        return Number(this.db.prepare("DELETE FROM kv_store WHERE namespace = ? AND key = ?").run(namespace, key).changes);
     }
 
     /** Sessions-row updated_at (ms epoch) — the ingest freshness watermark

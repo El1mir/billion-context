@@ -12,9 +12,11 @@ import {
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
     resolveJsonWriterOff as knobResolveJsonWriterOff,
+    fileStorageUnified,
+    fileStorageJsonWriter,
 } from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
-import { loadConfigFile } from "./config.js";
+import { recordRequestedMode } from "./storage/runtime-status.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
@@ -324,6 +326,11 @@ export class SessionStore {
      *  and file writes resume on the very next save (fail-safe: never a
      *  window with no persistent copy at all). */
     private readonly jsonWriterOff: boolean;
+    /** #3133: writerOff pending builds, keyed by session id. markDirty fires
+     *  several times per request and the writerOff branch used to build
+     *  synchronously on EVERY call; a microtask-batched run per turn keeps
+     *  the immediate-ish semantics while coalescing same-tick calls. */
+    private readonly writerOffPending = new Map<string, () => void>();
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -367,6 +374,7 @@ export class SessionStore {
             baseLog("warn", "[storage] unified sidecar DISABLED: BILI_ENCRYPTION_KEY is active and index.db would hold cleartext ingest payloads — staying legacy-only");
         }
         this.storageMode = storageMode;
+        recordRequestedMode(storageMode, unifiedBlockedByEncryption);
         // Phase 3 (#2960): stop writing the legacy JSON envelope while the
         // unified store runs in effective-full mode. Ignored (warned once)
         // under shadow/legacy/encryption — there the JSON file is the sole
@@ -1015,6 +1023,45 @@ export class SessionStore {
             return null;
         }
     }
+
+    // ------------------------------------------------------------------
+    // Extension namespaces (#3069 v4). Available in shadow AND full (like
+    // checkpoints); legacy-only instances fail fast with the same 501-able
+    // message the replica routes use. These are HOST/PLUGIN/UI state — the
+    // kernel session state stays in kstate_json and never flows here.
+    // ------------------------------------------------------------------
+
+    setSessionExt(sessionId: string, key: string, value: unknown): void {
+        this.liveShadow().setSessionExt(sessionId, key, value);
+    }
+
+    getSessionExt(sessionId: string, key: string): unknown {
+        return this.liveShadow().getSessionExt(sessionId, key);
+    }
+
+    listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
+        return this.liveShadow().listSessionExt(sessionId);
+    }
+
+    deleteSessionExt(sessionId: string, key?: string): number {
+        return this.liveShadow().deleteSessionExt(sessionId, key);
+    }
+
+    setKv(namespace: string, key: string, value: unknown): void {
+        this.liveShadow().setKv(namespace, key, value);
+    }
+
+    getKv(namespace: string, key: string): unknown {
+        return this.liveShadow().getKv(namespace, key);
+    }
+
+    listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
+        return this.liveShadow().listKv(namespace, keyPrefix);
+    }
+
+    deleteKv(namespace: string, key?: string): number {
+        return this.liveShadow().deleteKv(namespace, key);
+    }
     private liveShadow(): UnifiedShadow {
         if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
         return this.shadow as UnifiedShadow;
@@ -1311,8 +1358,27 @@ export class SessionStore {
             // Phase 3 (#2960): index-only persistence — the builder closure
             // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
             // guard; no envelope write is armed, so no debounce is needed.
-            this.guardedBuild(session)();
-            this.maybeCutForkBase(session);
+            // #3133: coalesce same-tick markDirty storms into ONE build — the
+            // builder reads session state at run time, so the batched run
+            // persists the freshest view (nothing between now and the
+            // microtask can be lost: it re-arms through this same path).
+            if (this.writerOffPending.has(session.id)) return;
+            const run = (): void => {
+                this.writerOffPending.delete(session.id);
+                try {
+                    this.guardedBuild(session)();
+                    this.maybeCutForkBase(session);
+                } catch (err) {
+                    // Kernel-store never-throw save discipline: an uncaughtException
+                    // escaping this microtask is fatal in embedded/plugin hosts
+                    // without process-level handlers; the next markDirty retries.
+                    this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
+                }
+            };
+            this.writerOffPending.set(session.id, run);
+            queueMicrotask(() => {
+                if (this.writerOffPending.get(session.id) === run) run();
+            });
             return;
         }
         this.store.scheduleSave(session.id, this.guardedBuild(session));
@@ -1324,6 +1390,9 @@ export class SessionStore {
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         if (this.writerOffActive()) {
+            // #3133: drop the armed microtask (token mismatch below) — this
+            // sync build subsumes it; later mutations re-arm on their own.
+            this.writerOffPending.delete(session.id);
             this.guardedBuild(session)();
             this.maybeCutForkBase(session);
             return;
@@ -1340,7 +1409,18 @@ export class SessionStore {
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
         if (this.writerOffActive()) {
-            this.guardedBuild(session)();
+            // #3133: same subsume rule as writeNow.
+            this.writerOffPending.delete(session.id);
+            try {
+                this.guardedBuild(session)();
+            } catch (err) {
+                // Same never-throw flush contract as the kernel-store branch
+                // below: evictOldest (src/session.ts) calls this without an
+                // error boundary and relies on false to keep the session
+                // resident — a throw would escape the sync eviction path.
+                this.log("error", `[persist] writerOff flushSync build failed for ${session.id}: ${String(err)}`);
+                return false;
+            }
             this.maybeCutForkBase(session);
             return true;
         }
@@ -1354,6 +1434,10 @@ export class SessionStore {
      *  kernel StateStore, so retry them from the resident session list before
      *  the kernel drains its pending writes and in-flight chains. */
     async flushAll(sessions: Iterable<Session> = []): Promise<void> {
+        // #3133: run armed writerOff builds BEFORE the sidecar closes below —
+        // a stray microtask would build against a closed store and burn a
+        // 3-strike disable for no reason.
+        this.drainWriterOffPending();
         for (const session of sessions) this.saveContentStore(session);
         await this.store.flushAll();
         this.shadow?.close();
@@ -1371,7 +1455,7 @@ export class SessionStore {
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
-        return this.store.hasPending(id);
+        return this.store.hasPending(id) || this.writerOffPending.has(id);
     }
 
     /** Phase 3 (#2960): the JSON envelope is skipped only while the sidecar
@@ -1384,6 +1468,15 @@ export class SessionStore {
     /** Cancel all pending writes without flushing (e.g. for tests). */
     cancelAll(): void {
         this.store.cancelAll();
+        this.writerOffPending.clear();
+    }
+
+    /** #3133: run and clear armed writerOff builds now (shutdown path). */
+    private drainWriterOffPending(): void {
+        if (this.writerOffPending.size === 0) return;
+        const runs = [...this.writerOffPending.values()];
+        this.writerOffPending.clear();
+        for (const run of runs) run();
     }
 }
 
@@ -1392,8 +1485,11 @@ export class SessionStore {
  *  the unified sidecar, so from the file's perspective there is no db copy
  *  and the stamp is "legacy". Stamped into metadata on every save so the web
  *  UI can show, per session, whether an index.db copy exists — lanes with
- *  different BILI_STORAGE_UNIFIED settings share one sessions dir. */
-function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
+ *  different BILI_STORAGE_UNIFIED settings share one sessions dir. Also the
+ *  stamp source for live (never-persisted) sessions at creation time (#3093)
+ *  so the detail panel never falls back to a bogus legacy dash while a
+ *  session is still running. */
+export function effectiveFileStorageMode(): "legacy" | "shadow" | "full" {
     const mode = resolveStorageModeForProcess();
     if (mode === "legacy") return "legacy";
     const keyEnv = process.env.BILI_ENCRYPTION_KEY;
@@ -1628,22 +1724,6 @@ function viewToRecord(view: LegacySessionLike): PersistedSession {
     if (view.pluginSnapshot !== undefined) record.pluginSnapshot = view.pluginSnapshot;
     if (view.contentStore !== undefined) record.forkContentStore = view.contentStore as unknown as NonNullable<PersistedSession["forkContentStore"]>;
     return record;
-}
-
-/** File-config `storage.unified` value for this lane, when present and
- *  string-shaped (#2671). The config reader caches on file content, so this
- *  is a page-cache-hot read at store construction; mode itself is
- *  boot-decided and does not follow hot reloads. */
-function fileStorageUnified(): string | undefined {
-    const section = (loadConfigFile() as { storage?: { unified?: unknown; jsonWriter?: unknown } }).storage;
-    return typeof section?.unified === "string" ? section.unified : undefined;
-}
-
-/** Config-file tier for the Phase 3 JSON-envelope switch (#2960):
- *  storage.jsonWriter = "on" | "off" (env tier wins; see knobs.ts). */
-function fileStorageJsonWriter(): string | undefined {
-    const section = (loadConfigFile() as { storage?: { jsonWriter?: unknown } }).storage;
-    return typeof section?.jsonWriter === "string" ? section.jsonWriter : undefined;
 }
 
 /** resolveStorageMode guarded for the constructor: env parsing cannot throw
