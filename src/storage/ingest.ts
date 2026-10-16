@@ -47,8 +47,6 @@ const MERGE_STATE_FIELDS = [
     "nextRuleId",
     "absorbed",
     "rules",
-    "imageFullRestored",
-    "imageShrinks",
 ] as const;
 
 /** Fields owned by dedicated tables/columns — never inside kstate_json. */

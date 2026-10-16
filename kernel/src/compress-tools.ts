@@ -22,7 +22,6 @@ export const SEARCH_CONTEXT_TOOL_NAME = "search_context";
 export const ACP_STATUS_TOOL_NAME = "acp_status";
 export const ACP_CACHE_TOOL_NAME = "acp_cache";
 export const ABSORB_TOOL_NAME = "absorb";
-export const IMAGE_FULL_TOOL_NAME = "image_full";
 
 /** Text-protocol trigger tags. The model emits these in its text output to
  *  request compression (used when host client tools cannot coexist with a
@@ -740,24 +739,6 @@ export const ABSORB_TOOL_GOOGLE = {
   parameters: ABSORB_PARAMETERS,
 };
 
-/** Opt-in image_full tool (restore original-resolution images for a previously
- *  downscaled message). Inject/register only when
- *  config.imageCompression.enabled — NOT part of ACP_TOOLS_* arrays. */
-export const IMAGE_FULL_TOOL_DESCRIPTION =
-  'Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref ("mNNNNN") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.';
-
-const IMAGE_FULL_PARAMETERS = {
-  type: "object" as const,
-  properties: {
-    ref: {
-      type: "string",
-      description:
-        "mNNNNN ref of the message whose image(s) should be restored to full resolution",
-    },
-  },
-  required: ["ref"],
-};
-
 /** Opt-in retrieve tool (lossless content-cached retrieval). Inject/register
  *  only when config.ccr.enabled — NOT part of ACP_TOOLS_* arrays (same
  *  opt-in pattern as absorb). */
@@ -775,28 +756,6 @@ const RETRIEVE_PARAMETERS = {
     },
   },
   required: ["ref"],
-};
-
-export const IMAGE_FULL_TOOL = {
-  name: IMAGE_FULL_TOOL_NAME,
-  description: IMAGE_FULL_TOOL_DESCRIPTION,
-  input_schema: IMAGE_FULL_PARAMETERS,
-};
-
-export const IMAGE_FULL_TOOL_OPENAI = {
-  type: "function" as const,
-  function: {
-    name: IMAGE_FULL_TOOL_NAME,
-    description: IMAGE_FULL_TOOL_DESCRIPTION,
-    parameters: IMAGE_FULL_PARAMETERS,
-  },
-};
-
-export const IMAGE_FULL_TOOL_RESPONSES = {
-  type: "function" as const,
-  name: IMAGE_FULL_TOOL_OPENAI.function.name,
-  description: IMAGE_FULL_TOOL_OPENAI.function.description,
-  parameters: IMAGE_FULL_TOOL_OPENAI.function.parameters,
 };
 
 export const RETRIEVE_TOOL = {

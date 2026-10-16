@@ -66,7 +66,7 @@ billion-context/
 │   ├── image-tokens.ts           # Image token cost estimation (pixels/bytes modes, #767)
 │   ├── image-compress.ts         # Image-compression policy stamping per request
 │   ├── image-note.ts             # Image-block placeholder → rich note rendering
-│   ├── absorb.ts                 # absorb tool (kernel ACP_TOOL_NAMES extension)
+│   ├── proxy-tool.ts             # isProxyToolFor — client-named tools routed to the bili proxy
 │   ├── compress-loop-responses.ts # Compress loop for Responses API format
 │   ├── compress-settings.ts      # Three-level compress config merge (global→provider→model)
 │   ├── compress-tool.ts          # ACP tool surface — thin re-export from acp-kernel

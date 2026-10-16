@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { shouldBootstrapNative, nativeProxyScriptPath, singleFlight, isLegacyBcpEntry, legacyBcpEntriesIn, planNativePi, armNativePi, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest } from "../src/agent/pi-native.ts";
+import { INLINE_ORIGIN } from "../src/inline-engine.ts";
 import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
 
 // #1135 wiring tests drive verifyAttachAndRecover against a dead target — cap
@@ -158,6 +159,64 @@ test("planNativePi: explicit BILLION_CONTEXT_ATTACH wins over the env preset", (
         planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_ATTACH: "http://10.0.0.5:9000" }),
         { mode: "attach", attachOrigin: "http://10.0.0.5:9000" },
     );
+});
+
+test("#3278: BILI_PI_INLINE plans the no-server lane and outranks ambient attach envs", () => {
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1" }), { mode: "inline" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "true" }), { mode: "inline" });
+    // explicit opt-in beats a preset proxy / explicit attach — it decides WHERE
+    // compression runs, not which proxy to use
+    assert.deepEqual(
+        planNativePi({ BILI_PI_INLINE: "1", BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }),
+        { mode: "inline" },
+    );
+    assert.deepEqual(
+        planNativePi({ BILI_PI_INLINE: "1", BILLION_CONTEXT_ATTACH: "http://10.0.0.5:9000" }),
+        { mode: "inline" },
+    );
+    // kill switches and /bili/ launches still win over everything
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1", BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1", BILI_NATIVE_PI: "0" }), { mode: "off" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
+    // unset / off values keep today's postures untouched
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "0" }), { mode: "spawn" });
+    assert.deepEqual(planNativePi({}), { mode: "spawn" });
+});
+
+test("#3278: pi.inline (config file) enables the lane; env resolves over it", () => {
+    // file value alone enables; it also outranks ambient attach envs like the env does
+    assert.deepEqual(planNativePi({}, true), { mode: "inline" });
+    assert.deepEqual(
+        planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }, true),
+        { mode: "inline" },
+    );
+    // explicit env off disables over the file
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "0" }, true), { mode: "spawn" });
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "false" }, true), { mode: "spawn" });
+    // explicit env on enables over a false file value
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1" }, false), { mode: "inline" });
+    assert.deepEqual(planNativePi({}, false), { mode: "spawn" });
+    // kill switches and /bili/ launches still win over the file
+    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PLUGIN: "0" }, true), { mode: "off" });
+    assert.deepEqual(planNativePi({ BILI_NATIVE_PI: "0" }, true), { mode: "off" });
+    assert.deepEqual(planNativePi({ BILI_PROVIDER_REWRITES: "{}" }, true), { mode: "off" });
+});
+
+test("#3278: armNativePi(inline) freezes the pseudo-origin synchronously without spawning", () => {
+    const savedProxy = process.env.BILLION_CONTEXT_PROXY;
+    try {
+        _resetNativeStateForTest();
+        armNativePi({ mode: "inline" });
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, INLINE_ORIGIN);
+        assert.equal(process.env.BILLION_CONTEXT_NATIVE, "pi");
+        // armed but LAZY under NODE_TEST_CONTEXT — invoking it here would
+        // bootstrap a real engine against the ambient XDG dirs
+        assert.equal(typeof _stateRespawnForTest(), "function", "respawn seam armed");
+    } finally {
+        _resetNativeStateForTest();
+        if (savedProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = savedProxy;
+    }
 });
 
 test("#1135 wiring: a dead attach target falls back to a spawned proxy", async () => {

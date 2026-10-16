@@ -70,6 +70,13 @@ export interface PruneOptions {
    * provider prefix-cache head (#2733).
    */
   headSummaryAnchors?: boolean;
+  /**
+   * Names that count as a `compress` call for the pending-call exemption in
+   * orphan stripping (same predicate family as Config.isCompressTool). Unset =
+   * bare-name only, byte-identical to before; without it an MCP-form compress
+   * call still awaiting its result is deleted while its bare-name twin survives.
+   */
+  isCompressTool?: (toolName: string) => boolean;
 }
 
 export function prune(
@@ -83,6 +90,8 @@ export function prune(
   for (const id of covered) coveredBases.add(baseIdOf(id));
 
   const inject = options.injectSummaries ?? true;
+  const isCompressTool =
+    options.isCompressTool ?? ((name: string) => name === "compress");
   const firstUserIndex = messages.findIndex(
     (message) => message.role === "user",
   );
@@ -129,6 +138,7 @@ export function prune(
           knownSummaryIds,
           options.headSummaryAnchors === true,
         ),
+        isCompressTool,
       ),
     ),
   );
@@ -389,35 +399,67 @@ function renderSummary(anchor: SummaryAnchor): CoreMessage {
   };
 }
 
+/**
+ * Drop tool-results whose declaring tool-call is not visible *before* them.
+ *
+ * Pairing is by order, not by id-set membership (#3046): a bare set cannot tell
+ * two instances apart when a host re-issues the same tool-call id for different
+ * calls (Agent Teams `name:index` ids). The upstream contract is directional —
+ * a `role: "tool"` message must follow the assistant that declared its
+ * `tool_call_id` — so a result is valid iff some call carrying the same id sits
+ * EARLIER in the view. A result whose own call was folded away used to survive
+ * because a different same-id call was still visible (possibly later); that
+ * shipped an unpaired half and bricked the session with a 400. Walking forward
+ * and remembering which ids a call has opened drops exactly that orphan and
+ * nothing else: unique-id sessions behave identically to the old set lookup,
+ * and one call still answers any number of same-id results (precedence is
+ * checked, not multiplicity).
+ */
 function stripOrphanedToolResults(messages: CoreMessage[]): CoreMessage[] {
-  const knownCallIds = new Set<string>();
-  for (const m of messages) {
-    if (m.contentType === "tool-call" && m.toolCallId) {
-      knownCallIds.add(m.toolCallId);
+  const openCallIds = new Set<string>();
+  const drop = new Set<number>();
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]!;
+    if (m.contentType === "tool-call") {
+      if (m.toolCallId) openCallIds.add(m.toolCallId);
+    } else if (m.contentType === "tool-result" && m.toolCallId) {
+      if (!openCallIds.has(m.toolCallId)) drop.add(i);
     }
   }
-  return messages.filter(
-    (m) =>
-      m.contentType !== "tool-result" ||
-      !m.toolCallId ||
-      knownCallIds.has(m.toolCallId),
-  );
+  return drop.size === 0 ? messages : messages.filter((_, i) => !drop.has(i));
 }
 
-function stripOrphanedToolCalls(messages: CoreMessage[]): CoreMessage[] {
-  const knownResultIds = new Set<string>();
-  for (const m of messages) {
-    if (m.contentType === "tool-result" && m.toolCallId) {
-      knownResultIds.add(m.toolCallId);
+/**
+ * Drop tool-calls that no visible tool-result answers *after* them.
+ *
+ * Mirror of {@link stripOrphanedToolResults} (#3046): the upstream requires an
+ * assistant `tool_calls` entry to be followed by a response for each id, so a
+ * call is valid iff some result carrying the same id sits LATER in the view. A
+ * call whose answering result was folded away used to survive because a
+ * different same-id result was still visible (possibly earlier); that shipped
+ * an unanswered tool_call and bricked the session. Walking backward and
+ * remembering which ids a result has answered keeps precedence-only semantics;
+ * compress calls stay exempt (their result is managed by
+ * hideConsumedCompressCalls, not this guard) — matched through the host's
+ * isCompressTool predicate so MCP-form compress calls are treated like their
+ * bare-name twins (#3222).
+ */
+function stripOrphanedToolCalls(
+  messages: CoreMessage[],
+  isCompressTool: (toolName: string) => boolean,
+): CoreMessage[] {
+  const answeredCallIds = new Set<string>();
+  const drop = new Set<number>();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.contentType === "tool-result") {
+      if (m.toolCallId) answeredCallIds.add(m.toolCallId);
+    } else if (m.contentType === "tool-call" && m.toolCallId) {
+      if (typeof m.toolName === "string" && isCompressTool(m.toolName)) continue;
+      if (!answeredCallIds.has(m.toolCallId)) drop.add(i);
     }
   }
-  return messages.filter(
-    (m) =>
-      m.contentType !== "tool-call" ||
-      !m.toolCallId ||
-      m.toolName === "compress" ||
-      knownResultIds.has(m.toolCallId),
-  );
+  return drop.size === 0 ? messages : messages.filter((_, i) => !drop.has(i));
 }
 
 /**

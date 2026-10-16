@@ -194,14 +194,20 @@ test("deep base chains resolve (C→D shape)", () => {
 });
 
 test("rolloutDecisions: sorted, one per registered feature, real install id", () => {
+    // withFeatures merges into the live registry — version-shipped entries
+    // (#3273: pluginIncrementalTurns) ride along with the throwaway fixtures.
+    const shipped = Object.keys(rollout.ROLLOUT_FEATURES).sort();
     withFeatures({ zeta: { percent: 0 }, alpha: { percent: 100 } }, () => {
         const ds = rollout.rolloutDecisions(ids[0]);
-        assert.deepEqual(ds.map((d) => d.feature), ["alpha", "zeta"]);
-        assert.deepEqual(ds.map((d) => d.enabled), [true, false]);
-        const sources = ds.map((d): RolloutSource => d.source);
+        assert.deepEqual(ds.map((d) => d.feature), [...shipped, "alpha", "zeta"].sort());
+        const alpha = ds.find((d) => d.feature === "alpha");
+        const zeta = ds.find((d) => d.feature === "zeta");
+        assert.ok(alpha && zeta);
+        assert.equal(alpha.enabled, true);
+        assert.equal(zeta.enabled, false);
         // percent-0 still flows through the bucketing tier (bucket < 0bp is
         // never true) — "off" is reserved for features with no percent at all.
-        assert.deepEqual(sources, ["bucket", "bucket"]);
+        for (const d of ds) assert.equal(d.source, "bucket", d.feature);
     });
 });
 

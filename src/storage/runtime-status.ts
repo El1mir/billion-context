@@ -25,7 +25,7 @@
 
 import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
 import { COOLDOWN_MS, readBootstrapFailureMarker } from "./engine-bootstrap.js";
-import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, resolveStorageMode } from "../knobs.js";
+import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
 import { MAX_CONSECUTIVE_FAILURES, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
 
@@ -208,6 +208,7 @@ export function storageDiagnosticsLines(ctx: { sessions: number; storageLogLines
     const fileUnified = fileStorageUnified();
     const fileJsonWriter = fileStorageJsonWriter();
     const fileAutoDownload = fileStorageAutoDownload();
+    const fileWalLimit = fileStorageWalJournalSizeLimit();
     const lines: string[] = [
         "--- storage ---",
         `requested mode: ${st.requested}`,
@@ -222,6 +223,8 @@ export function storageDiagnosticsLines(ctx: { sessions: number; storageLogLines
         `storage.jsonWriter (config file): ${fileJsonWriter ?? "(unset)"}`,
         `BILI_SQLITE_AUTO_DOWNLOAD: ${env.BILI_SQLITE_AUTO_DOWNLOAD ?? "(unset)"}`,
         `storage.sqliteAutoDownload (config file): ${fileAutoDownload ?? "(unset)"}`,
+        `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: ${env.BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES ?? "(unset)"}`,
+        `storage.walJournalSizeLimitBytes (config file): ${fileWalLimit ?? "(unset)"}`,
         `BILI_ENCRYPTION_KEY set: ${env.BILI_ENCRYPTION_KEY !== undefined && env.BILI_ENCRYPTION_KEY !== "" ? "yes" : "no"}`,
         `sessions on disk: ${ctx.sessions}`,
     ];

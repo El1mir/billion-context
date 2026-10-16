@@ -13,6 +13,8 @@ import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./s
 const OUTPUT_CLAMP_MARGIN_PCT = 0.05;
 const OUTPUT_CLAMP_MIN_MARGIN = 2048;
 const OUTPUT_CLAMP_FLOOR = 1024;
+// #3071/#2490: capability floor for the clamped budget — see clampOutputBudget.
+const OUTPUT_CLAMP_MIN_OUTPUT = 4096;
 // #453 mitigation: host-side escalation line. The kernel already force-injects
 // every turn once usage >= nudge.maxContextLimitPct (its pressure branch has no
 // cadence gate), so the only cadence-silent zone is BELOW that line. Force the
@@ -240,7 +242,14 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
  *  checkpoints never land), so no output budget recovers the session; a
  *  sub-floor clamp would only starve a terminal turn. That surrender is
  *  deliberate, not a gap (pinned in
- *  tests/issue2490-ledger-floor-doomed-probe.test.ts). */
+ *  tests/issue2490-ledger-floor-doomed-probe.test.ts).
+ *  #3071: where a clamp DOES fire (cap >= OUTPUT_CLAMP_FLOOR), the 5% margin drags
+ *  cap into the low thousands near the window (observed 1479/2623), starving the
+ *  reply to an empty finish=length turn even though raw headroom still fits a normal
+ *  reply. Floor the reduction target at min(OUTPUT_CLAMP_MIN_OUTPUT, window - input)
+ *  — always <= window - input, so input+output can never exceed the window
+ *  (fail-closed preserved). The sub-floor surrender above (cap < OUTPUT_CLAMP_FLOOR)
+ *  stays byte-identical. */
 export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number): number | undefined {
     const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(inputEstimate * OUTPUT_CLAMP_MARGIN_PCT));
     // #2011: max_tokens / max_completion_tokens / max_output_tokens are integer-typed on every
@@ -253,7 +262,12 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
     // headroom, so input+output <= window still holds).
     const cap = Math.floor(nativeWindow - inputEstimate - margin);
     if (cap < OUTPUT_CLAMP_FLOOR || cap >= requested) return undefined;
-    return cap;
+    // #3071: cap >= OUTPUT_CLAMP_FLOOR here. Never reduce below the capability
+    // floor, bounded by raw headroom so input+output <= window still holds.
+    const floorOut = Math.min(OUTPUT_CLAMP_MIN_OUTPUT, Math.floor(nativeWindow - inputEstimate));
+    const clamped = Math.max(cap, floorOut);
+    if (clamped >= requested) return undefined;
+    return clamped;
 }
 
 /** #2490: translate the refused dsh compaction replay size (recorded on the
@@ -336,10 +350,14 @@ export function clampOutgoingOutput(
      *  planning basis only ever tightens the cap (fail-closed direction). */
     ledgerFloorTokens?: number;
      /** #2122/#1933 F1: per-route estimator calibration — scales the local-est
-      *  side of estimateInputTokens so the clamp judges the payload on the same
-      *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string },
+       *  side of estimateInputTokens so the clamp judges the payload on the same
+       *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string },
     sessionId: string,
     log: (level: string, msg: string) => void,
+    /** #3148: optional visibility hook — invoked with the exact clamp event when
+     *  a cap is applied (callers record it on session.stats for acp_status).
+     *  Never affects the wire decision. */
+    onClamped?: (info: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number }) => void,
 ): void {
     const raw = readOutputBudget(rebuilt, field);
     if (typeof raw !== "number") return;
@@ -365,5 +383,6 @@ export function clampOutgoingOutput(
         // rescue right before the turn dies.
         const overTarget = ctx.headroomWindow !== undefined && ctx.headroomWindow < ctx.nativeWindow && planningInput >= ctx.headroomWindow;
         log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}${ledgerFloor > inputEstimate ? `, planning floor ${ledgerFloor} from the refused dsh compaction replay (#2490)` : ""}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
+        onClamped?.({ raw, capped, window: ctx.nativeWindow, planningInput, ledgerFloor });
     }
 }

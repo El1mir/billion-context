@@ -116,8 +116,5 @@
     "client": {
       "platform": "web"
     }
-  },
-  "optionalDependencies": {
-    "sharp": "^0.35.4"
   }
 }

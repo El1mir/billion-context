@@ -64,7 +64,7 @@ function fold(opts: { ccr: boolean; preStore?: MessageContentStore }): FoldResul
     const config = applyCompressSettings(
         defaultConfig(200_000),
         200_000,
-        { absorb: { enabled: true, minToolTokens: 50 }, ccr: opts.ccr ? { enabled: true, minToolTokens: 50 } : { enabled: false, minToolTokens: 50 } },
+        { ccr: opts.ccr ? { enabled: true, minToolTokens: 50 } : { enabled: false, minToolTokens: 50 } },
     ) as Config;
     const session = getSession(`ccrv2-${Math.random().toString(36).slice(2)}`);
     if (opts.ccr) storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });

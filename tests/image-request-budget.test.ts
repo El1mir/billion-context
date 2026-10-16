@@ -14,6 +14,13 @@ import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { DecodedRequestAdmission, MAX_REQUEST_BYTES } from "../src/request-body-budget.ts";
 
+// #3128: assert the LEGACY byte-budget behavior at the old 100/200/100 MiB caps (receive /
+// decoded / outbound). Pin the knobs to those exact values so every stage below stays
+// independent of the new 5 GiB shipped defaults (covered by knobs-config-precedence).
+process.env.BILI_RECEIVE_BODY_BYTES = "104857600";
+process.env.BILI_DECODED_BODY_BYTES = "209715200";
+process.env.BILI_OUTBOUND_BODY_BYTES = "104857600";
+
 const isolation = mkdtempSync(join(tmpdir(), "bili-request-budget-"));
 process.env.XDG_STATE_HOME = join(isolation, "state");
 process.env.XDG_DATA_HOME = join(isolation, "data");

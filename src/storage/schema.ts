@@ -65,12 +65,32 @@
 //        build upgrades a v4 file with one idempotent ALTER TABLE.
 const STORAGE_SCHEMA_VERSION = 5;
 
-export const STORAGE_PRAGMAS = [
-    "PRAGMA journal_mode = WAL",
-    "PRAGMA synchronous = NORMAL",
-    "PRAGMA busy_timeout = 5000",
-    "PRAGMA foreign_keys = ON",
-] as const;
+/** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
+ *  auto checkpoints move frames into the main db and reset the write offset
+ *  but NEVER shrink the WAL file — without this limit a long-lived process's
+ *  index.db-wal stays at its historical high-water mark forever (field:
+ *  55 MiB flat). With it, every completed checkpoint truncates the file back
+ *  to the cap. 8 MiB sits well above any single-save burst while keeping
+ *  disk use and crash-recovery replay bounded. Per-connection setting: each
+ *  process that opens the shared index applies its own copy (#2671 topology).
+ *  Tunable since #3250 via storage.walJournalSizeLimitBytes /
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts). */
+export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
+
+/** Connection pragmas for every index.db opener. The journal cap is
+ *  per-opener (see WAL_JOURNAL_SIZE_LIMIT); the default list below is what
+ *  short-lived openers (export fast path) and tests apply. */
+export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
+    return [
+        "PRAGMA journal_mode = WAL",
+        "PRAGMA synchronous = NORMAL",
+        "PRAGMA busy_timeout = 5000",
+        "PRAGMA foreign_keys = ON",
+        `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
+    ];
+}
+
+export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
 
 const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,

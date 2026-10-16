@@ -97,9 +97,11 @@ Implementations: `src/agent/pi.ts` (covers pi and omp),
 `src/agent/dsh-native.ts`, `src/kimi/native-mcp.ts` (bootstrap-time report
 only — kimi's provider `custom_headers` are static, so per-request headers
 would go stale on model switch), `hermes-plugin/__init__.py` (Python plugin:
-per-request headers via an `llm_request` middleware, max output captured by a
-`pre_api_request` hook) — other client integrations should follow the same
-protocol.
+per-request headers via an `llm_request` middleware, max output and the host's
+per-model context window — read from hermes' own
+`HERMES_HOME/context_length_cache.yaml`, fail-open on any miss (#3261) —
+captured by a `pre_api_request` hook) — other client integrations should
+follow the same protocol.
 
 **DSH `maxOutput` reporting is declaration-gated — an undeclared custom model empties the whole ceiling chain (#2904).** `src/agent/dsh-native.ts` forwards `maxOutput` **only** when the host's `resolveModelInfo(provider, model)` returns a positive `defaultMaxTokens`, and DSH populates that **only** when the model item explicitly declares `maxTokens` — provider-level output defaults are never reported. For a user-added custom model with no declared `maxTokens`, `defaultMaxTokens` is `undefined`, so BOTH runtime-info channels come back empty. With no models.dev entry and no bili-configured `output` either, the four-source ceiling chain (#1840) resolves to nothing, and `restoreOutputBudget` lifts a client-starved budget to the session high-water mark — which on a long session has decayed through small positives to a poisoned low value. Every turn then runs reasoning-only and stops at `length`/`max-tokens`; switching to a model WITH a known ceiling masks it (the high-water is floored up to the ceiling), so the switch is a trigger, not a cause. The real fix home is **DSH-side**: report its configured provider/model output default instead of `undefined` (the immediate user workaround is setting `maxTokens` on the model item). bili deliberately does not guess a quota floor (#1842); instead #2904 surfaces the degraded state persistently on the `/acp` panel, the Web UI session page (data source `/__bili/sessions/<id>/detail`), and `/__bili/plugin/status?conversationId=` (`outputBudgetDegraded`) — clearing automatically once a healthy value or ceiling arrives — and extends `degenerateTurnWarning` to `length`/max-output terminations so the truncation correlates with its cause in the log.
 
@@ -242,8 +244,10 @@ and the injected prompt state explicitly that markers are proxy-emitted only.
 
 On the Responses lane the two modes also project mid-history `system`/`developer`
 items differently: plugin mode keeps them in place (`__bili_inplace_sysdev`,
-#1638 prefix-cache churn fix), proxy mode hoists them into the head developer
-block (#1085 hoist-and-anchor). A self-heal degrade-to-proxy (#2155) therefore
+#1638 prefix-cache churn fix) — as of #3227 so do Codex clients in native proxy
+mode (UA-detected via `isCodexClient`); other proxy clients keep the hoist into
+the head developer block (#1085 hoist-and-anchor). A self-heal degrade-to-proxy
+(#2155) therefore
 re-projects the SAME incoming history into different forwarded bytes — the
 forwarded-system fingerprint (#2350) flips even though the host changed nothing,
 and a naive ledger would book that under "host rewrote the system prompt".
@@ -341,7 +345,7 @@ bypass and side lanes never earn credit):
   compression reduction. Remedy: **degrade to proxy mode** — the single
   `pluginMode` flip (`pluginAgent !== undefined && !pluginLaneDegraded(session)`)
   re-injects the ACP tools wire-side, re-arms the compress rewriter, CCR
-  stamping and absorb, and **keeps the nudge** (the tools are back). When wire
+  stamping, and **keeps the nudge** (the tools are back). When wire
   injection is unavailable (`compress.injectTool=false` → `degradeAvailable`
   false) the remedy falls back to **suppress-nudge**. Recovery: the live
   plugin header (`pluginLaneRestore`, hoisted BEFORE the `pluginMode` flip so
@@ -399,7 +403,7 @@ functions, exit audits):
    reasoning-echo strip — the thinking channel is no longer cleaned.
 2. **Model prose is manageable.** Render-tag echoes, marker lines,
    bili-internal text, degenerate open/close residue, and (when
-   absorb-instructed) whole tool-call emissions are stripped from the visible
+   instructed) whole tool-call emissions are stripped from the visible
    text channel only.
 3. **Model output bound for files is byte-identical (#1039).** Tool-call
    arguments never enter any filter, whatever bytes they carry.

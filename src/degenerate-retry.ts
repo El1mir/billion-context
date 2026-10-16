@@ -45,6 +45,9 @@ interface ContinuationRetryOpts {
      *  lane only; undefined on unsigned traffic). The retry body carries an
      *  injected continuation nudge, so the previous signature is stale. */
     resign?: (headers: Record<string, string>, body: string | Buffer) => void;
+    /** #3280: v1internal egress re-wrap — `body` above is the INNER request
+     *  (the nudge needs top-level contents), so the retry goes out enveloped. */
+    wrapBody?: (body: string | Buffer) => string | Buffer;
 }
 
 /** Build the re-request used when a turn ends with no visible output. Returns a
@@ -76,14 +79,15 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry skipped: request body carries no turn array`);
             return null;
         }
+        const wireRetryBody = opts.wrapBody ? opts.wrapBody(retryBody) : retryBody;
         try {
-            opts.resign?.(opts.reqHeaders, retryBody);
+            opts.resign?.(opts.reqHeaders, wireRetryBody);
             const r = await fetchWithTimeout(
                 opts.upstreamUrl,
                 {
                     method: "POST",
                     headers: opts.reqHeaders,
-                    body: retryBody,
+                    body: wireRetryBody,
                     ...(opts.dispatcher ? { dispatcher: opts.dispatcher } : opts.proxyUrl ? { dispatcher: proxyDispatcher(opts.proxyUrl) } : {}),
                 },
                 undefined,

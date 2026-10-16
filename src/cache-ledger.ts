@@ -1364,6 +1364,10 @@ export function settleUsageReport(
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
         session.stats.lastInputTokensSource = "usage";
+        // #3148: a real usage report supersedes the failed-round arm — drop the
+        // visibility marker so acp_status stops advertising a stale emergency state.
+        delete session.stats.emergencyShrinkAt;
+        delete session.stats.emergencyShrinkEstimate;
         session.stats.contextTokens = session.stats.lastInputTokens;
         session.stats.contextTokensSource = "usage";
         if (session.metadata) session.metadata.contextTokensAt = Date.now();
@@ -1378,6 +1382,13 @@ export function settleUsageReport(
         // per-origin ring; the factor is published only once ≥2 recent samples
         // agree within ×2, and cleared again when they stop agreeing — until
         // then the raw estimate decides (legacy behavior).
+        // #3211: per-route calibration policy (providers[<key>].calibration),
+        // paired by handle.ts with the SAME latest-wins/origin-gated discipline
+        // as the pending estimate — applied below at PUBLICATION time only, so
+        // the learned ring stays raw and auditable. Origin mismatch (slot set
+        // by a request on another route) voids it for this settle.
+        const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
+        const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
         const pendingEst = session.stats.lastLocalTextEstimate;
         const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
         if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
@@ -1405,12 +1416,23 @@ export function settleUsageReport(
                 const spread = Math.max(...ring.values) / Math.min(...ring.values);
                 if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
                     const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
-                    session.stats.calibratedEstimate = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
-                    session.stats.calibratedEstimateOrigin = settleOrigin;
-                    // Provenance is the ring's model key, not this sample's stamp —
-                    // an unknown-model settle continues a model-keyed ring without
-                    // blanking the established provenance.
-                    session.stats.calibratedEstimateModel = ring.model;
+                    if (calibPolicy?.disabled === true) {
+                        // #3211: route-level opt-out — the learned value stays in
+                        // the ring (auditable) but is never applied on this route.
+                        delete session.stats.calibratedEstimate;
+                        delete session.stats.calibratedEstimateOrigin;
+                        delete session.stats.calibratedEstimateModel;
+                    } else {
+                        const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
+                        session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
+                        session.stats.calibratedEstimateOrigin = settleOrigin;
+                        // Provenance is the ring's model key, not this sample's stamp —
+                        // an unknown-model settle continues a model-keyed ring without
+                        // blanking the established provenance. Stays inside the publish
+                        // branch: the disabled path above clears all three fields and
+                        // must not re-stamp one of them (#3211 review).
+                        session.stats.calibratedEstimateModel = ring.model;
+                    }
                 } else {
                     delete session.stats.calibratedEstimate;
                     delete session.stats.calibratedEstimateOrigin;

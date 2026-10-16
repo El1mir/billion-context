@@ -40,7 +40,12 @@ const ENTRY_FILES = new Set([
     "src/agent/dsh-native-client.ts",
 ]);
 
-const files = execFileSync("git", ["ls-files", "src/", "tests/", "scripts/", "*.ts", "*.mjs", "*.cjs"], {
+// `--others --exclude-standard` pulls in NEW, not-yet-committed files too:
+// a brand-new module is exactly where INTERNAL_ONLY leaks happen, and a
+// tracked-only scan would pass locally right before CI fails on the same
+// tree (hit on #3273: the fresh src/agent/incremental-client.ts was
+// untracked at the local gate run).
+const files = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "src/", "tests/", "scripts/", "*.ts", "*.mjs", "*.cjs"], {
     cwd: root,
     encoding: "utf8",
 }).split("\n").filter(f => f && !f.startsWith("kernel/") && !f.startsWith("pi-subagents/") && f !== "scripts/check-unused-exports.mjs");

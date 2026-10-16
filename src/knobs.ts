@@ -25,6 +25,7 @@ import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
+import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
 
 /** Tiered raw number: the env var wins when SET (even empty/garbage — the
  *  caller applies the historical validation), else a finite number from the
@@ -169,6 +170,36 @@ export function mitmHandshakeTimeoutMs(): number {
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT;
 }
 
+// --- request-body byte budgets (#3128) ---
+
+const DEFAULT_LIMITS_RECEIVE_BYTES = 5 * 1024 * 1024 * 1024;
+const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
+const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
+
+/** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
+ *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
+ *  HTTP path now resolves them here with a 5 GiB default so multi-gigabyte single
+ *  requests are accepted instead of reset. They bound SINGLE-REQUEST in-RAM buffering
+ *  (~2x peak while a body is read+decoded); cross-turn history lives in SQLite and is
+ *  unaffected. The WebSocket lanes keep the fixed 100 MiB surface (MAX_REQUEST_BYTES). */
+export function limitsReceiveBytes(): number {
+    const v = tInt("BILI_RECEIVE_BODY_BYTES", loadConfigFile().network?.receiveBodyBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_RECEIVE_BYTES;
+}
+
+/** BILI_DECODED_BODY_BYTES > network.decodedBodyBytes > 10 GiB. Max DECODED bytes after
+ *  content-encoding expansion (2x the receive default, mirroring the legacy decode cap). */
+export function limitsDecodedBytes(): number {
+    const v = tInt("BILI_DECODED_BODY_BYTES", loadConfigFile().network?.decodedBodyBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_DECODED_BYTES;
+}
+
+/** BILI_OUTBOUND_BODY_BYTES > network.outboundBodyBytes > 5 GiB. Max rebuilt bytes forwarded upstream. */
+export function limitsOutboundBytes(): number {
+    const v = tInt("BILI_OUTBOUND_BODY_BYTES", loadConfigFile().network?.outboundBodyBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_OUTBOUND_BYTES;
+}
+
 // --- session persistence (was BILI_PERSIST_* env-only) ---
 
 function filePersist() {
@@ -180,6 +211,17 @@ export function persistEnabled(): boolean {
     const envRaw = process.env.BILI_PERSIST;
     if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
     return filePersist().enabled !== false;
+}
+
+// --- auto-mode classifier forge (#2740) ---
+
+/** BILI_AUTO_MODE_FORGE > autoModeForge.enabled > true (#2740 owner decision:
+ *  local forge ON by default — zero egress/billing for the lane; "0"/"false"
+ *  restores pure passthrough for users who pay for real verdicts). */
+export function autoModeForgeEnabled(): boolean {
+    const envRaw = process.env.BILI_AUTO_MODE_FORGE;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return loadConfigFile().autoModeForge?.enabled !== false;
 }
 
 /** BILI_PERSIST_ZSTD > persist.zstd > false (#1080 owner decision: plain JSON default). */
@@ -227,11 +269,14 @@ export function maxSessions(): number {
     return Math.max(1, v || 256);
 }
 
-/** BILI_SESSION_WARM_MAX > sessions.warmMax > 8 (#2803 bounded startup: how many
- *  most-recently-saved sessions boot hydrates before listening; 0 warms none). */
+/** BILI_SESSION_WARM_MAX > sessions.warmMax > 0 (#2803 bounded startup, #3050 R3 ②-0:
+ *  how many most-recently-saved sessions boot hydrates before listening; 0 warms none.
+ *  Default 0 — measured -151 MB RSS at boot with no traffic-facing cost: an un-warmed
+ *  session pays one on-demand load (file read or unified lookup) on first touch
+ *  instead. Set 8 to restore the #2803 eager warm set.) */
 export function sessionWarmMax(): number {
     const v = tInt("BILI_SESSION_WARM_MAX", loadConfigFile().sessions?.warmMax);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 8;
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
 }
 
 /** BILI_SESSION_WARM_MAX_BYTES > sessions.warmMaxBytes > 64 MiB (#2803 decoded-byte
@@ -495,6 +540,11 @@ export function fileStorageAutoDownload(): boolean | undefined {
     return typeof v === "boolean" ? v : undefined;
 }
 
+export function fileStorageWalJournalSizeLimit(): number | undefined {
+    const v = loadConfigFile().storage?.walJournalSizeLimitBytes;
+    return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
+}
+
 /** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
@@ -547,4 +597,20 @@ export function resolveSqliteAutoDownload(env: NodeJS.ProcessEnv = process.env, 
     if (raw === "1" || raw === "true") return true;
     if (raw === "0" || raw === "false") return false;
     return typeof fileValue === "boolean" ? fileValue : true;
+}
+
+/** #3250 WAL reclamation cap in bytes. Env
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (positive integer) wins over the
+ *  config-file `storage.walJournalSizeLimitBytes`; a garbage/non-positive env
+ *  value falls through to the file/default tier (same discipline as
+ *  resolveSqliteAutoDownload — never crash boot on a typo'd knob). Pure:
+ *  env + file value in, bytes out (never throws). */
+export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = process.env, fileValue?: number): number {
+    const raw = env.BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES?.trim();
+    if (raw) {
+        const n = Number(raw);
+        if (Number.isInteger(n) && n > 0) return n;
+    }
+    if (typeof fileValue === "number" && Number.isInteger(fileValue) && fileValue > 0) return fileValue;
+    return WAL_JOURNAL_SIZE_LIMIT;
 }

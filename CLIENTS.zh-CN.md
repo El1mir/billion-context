@@ -87,7 +87,7 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 
 - **安装:** `bili plugin install hermes` 把 `plugin.yaml` + `__init__.py` 拷进 `~/.hermes/plugins/billion-context/`,写一个机器自管的 `bili.json` sidecar(指向全局 bili 安装的 `dist/index.js` + node 路径),并经 hermes 自己的通道启用插件(`hermes plugins enable billion-context` —— CLI 不在 PATH 上时改为打印同一条命令)。新开一个 hermes 会话生效。卸载:`bili plugin remove hermes`;全局更新后刷新:`bili plugin update hermes`。
 - **生命周期:** 加载时插件先附着到健康的运行中代理 —— #2905 起按泳道:本 hermes lane 的实例第一,其他已声明 lane 的实例绝不 attach(要搭车需在 `native.attachLanePriority` 里列出),8787 用户区守护是最后兜底 —— 否则在临时端口自拉起(声明 `lane: hermes`,别的泳道骑不上来;父进程 pid 看门狗在 hermes 退出时收掉它;并发启动走与启动器相同的 starting-marker 仲裁协议)。只有代理确认健康后,才用 `HTTPS_PROXY` / `https_proxy` + `SSL_CERT_FILE`(bili 组合 CA bundle —— 当前 hermes 经此解析环境信任;`HERMES_CA_BUNDLE` 保留给旧版本)把 hermes 的 httpx 栈指向它 —— **从不改动** `~/.hermes/config.yaml`。provider 的 https 域名从 hermes 配置读出并加入 MITM 白名单;其余域名与启动器模式一样盲隧道。拉不出健康代理时插件静默退场,流量直连(不压缩、无死端口)。
-- **Plugin 模式盖章:** `llm_request` 中间件打 `x-bili-plugin: hermes` + 会话 id(= hermes session id,gateway 多会话安全)+ 模型,已知后再加 `x-bili-plugin-max-output` —— 且只在 ACP 工具已对着存活代理清单注册完之后;第一轮走 wire 模式。`pre_api_request` hook 捕获生效的 `max_tokens`,把 runtime-info(模型 + 最大输出)推给代理。`compress` / `decompress` / `acp_status` 注册为真正的 hermes 工具,由代理既有的插件端点提供。
+- **Plugin 模式盖章:** `llm_request` 中间件打 `x-bili-plugin: hermes` + 会话 id(= hermes session id,gateway 多会话安全)+ 模型,已知后再加 `x-bili-plugin-max-output`,宿主 per-model 窗口已知时再加 `x-bili-plugin-context-window`(读自 `HERMES_HOME/context_length_cache.yaml`,键为 `<model>@<base_url>`;同模型多上游窗口不一致时宁缺毋猜,#3261)—— 且只在 ACP 工具已对着存活代理清单注册完之后;第一轮走 wire 模式。`pre_api_request` hook 捕获生效的 `max_tokens`,把 runtime-info(模型 + 最大输出 + 上下文窗口)推给代理。`compress` / `decompress` / `acp_status` 注册为真正的 hermes 工具,由代理既有的插件端点提供。
 - **已知局限:** 走 hermes Codex-wire 传输发出的请求可能丢掉逐请求头面,这类配置在该传输暴露头之前停留在 wire 模式。`BILLION_CONTEXT_PROXY` 已设置(启动器管着代理)或定义了 `BILI_PROVIDER_REWRITES` 时插件整体退场。退出开关:`BILI_NATIVE_HERMES=0`。
 
 ## ZCode（Z.ai / bigmodel coding plan）
@@ -129,7 +129,7 @@ Codex 现在有四个彼此独立的集成面。`bili plugin install codex` 会�
 
 安装器拒绝写入任何一种已知会失败的形状，并会把发现的旧扁平条目**就地升级**。`[features] hooks = true` 是 Codex 的 hook 总开关：没有开启时 bili 会写入 hook 条目并明确提示需要打开，不会替你改写既有的开关值。卸载时 bili 只删自己的条目/文件；技能目录里另有用户文件时目录保留。
 
-`bili service install` 会注册 Windows 当前用户的 Task Scheduler 登录任务以持久运行代理。可用 `bili service status|restart|enable|disable|remove` 管理；不支持的平台与注册失败会明确报告。代理关闭时，Codex 配置的 URL 仍是 loopback，请求会在本地端点失败，不会静默回退到上游直连。`bili doctor` 会报告 `proxy-ready`、`configured`、`verified`、`bypassed` 或 `unknown`；只有观测到真实 Codex 模型请求才会标记 `verified`，健康代理或已写配置本身都不能证明已验证。
+`bili service install` 会注册当前用户级的常驻代理服务——Windows 上是 Task Scheduler 登录任务，Linux 上是 systemd 用户单元；其他平台会明确报告服务不受支持，手动方式仍然可用。可用 `bili service status|restart|enable|disable|remove` 管理；注册失败会明确报告。代理关闭时，Codex 配置的 URL 仍是 loopback，请求会在本地端点失败，不会静默回退到上游直连。`bili doctor` 会报告 `proxy-ready`、`configured`、`verified`、`bypassed` 或 `unknown`；只有观测到真实 Codex 模型请求才会标记 `verified`，健康代理或已写配置本身都不能证明已验证。
 
 CC Switch Direct 仅在当前 Codex provider 的 `config.toml` 路由层受支持：这是可撤销的配置写入，不代表 bili 与 CC Switch 的 provider 数据库或同步机制已集成。Routing/Aggregation 仍只检测并报告，不自动改写；发现模式不代表 API 级兼容。bili 不修改 CC Switch 数据库，也不会安装 watcher。ChatGPT 订阅/Desktop 集成仍标为 `待完成/可实现`：实现不会读取、复制、持久化或注入 `auth.json`、cookies 或 session token；Desktop MCP 与模型路由分开，官方登录渠道保持不变。
 
@@ -271,7 +271,7 @@ bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_cha
 
 HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC 注释照单接受,合并方式与 opencode 自身一致;相对本地插件路径在副本里重新锚定为绝对路径 —— opencode 按声明所在配置文件目录解析,#826)。宿主代次用 `--version` 探测(探测失败默认按 1.x):**2.x** 宿主注入内置 V2 插件(`dist/agent/opencode.js`),以临时包装目录形式给出(目录入口 `index.js` 再 re-export 插件文件 —— 2.x 拒绝配置 `plugin` 数组里的裸文件路径);**1.x** 宿主直接给裸文件路径。
 
-插件在两代宿主上做的事相同:在宿主内原生注册 bili 工具 —— compress / decompress / search_context / acp_status(另加 absorb)—— 并在每个 provider 请求上盖章代理头,含从宿主自身模型目录(`ctx.catalog.model.list()`,每 60s 刷新)读取的 context-window / max-output,并以 runtime-info 上报给代理(#955)—— 压缩走插件模式,**不做** wire 级工具注入;原生 auto-compaction 自动关闭(`compaction.auto: false`)。所有注册都是防御式的(可选链):任一 2.x build 上接缝缺失或未触发时,插件保持惰性,会话透明回退纯代理模式而不是报错 —— 在相邻的 `dev` build 上观察到过 API 面互不相同(#754 评审探针)。
+插件在两代宿主上做的事相同:在宿主内原生注册 bili 工具 —— compress / decompress / search_context / acp_status—— 并在每个 provider 请求上盖章代理头,含从宿主自身模型目录(`ctx.catalog.model.list()`,每 60s 刷新)读取的 context-window / max-output,并以 runtime-info 上报给代理(#955)—— 压缩走插件模式,**不做** wire 级工具注入;原生 auto-compaction 自动关闭(`compaction.auto: false`)。所有注册都是防御式的(可选链):任一 2.x build 上接缝缺失或未触发时,插件保持惰性,会话透明回退纯代理模式而不是报错 —— 在相邻的 `dev` build 上观察到过 API 面互不相同(#754 评审探针)。
 
 1.x 细节(1.14.46 + 1.18.31 验证):V1 `.server()` 钩子在进程内把每个 provider 的 `options.baseURL` 改写为 `<proxy>/bili/…` 并设 `compaction.auto: false`;`chat.headers` 每次请求盖章插件头;`tool` 用真实 zod 形状注册 bili 工具(zod 是运行时依赖 —— 解析不到时降级为只改写)。没有显式 `baseURL` 的 provider(SDK 默认值,如裸 `@ai-sdk/openai` → api.openai.com)由全局 `fetch` 补丁兜住(日志:`v1: fetch patch installed`)—— 幂等,`/bili/` 包装过的 URL 原样直通;含 OpenAI Responses 端点端到端验证。
 

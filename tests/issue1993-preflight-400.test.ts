@@ -10,8 +10,11 @@ process.env.NODE_ENV = "test";
 // Fail fast on 4xx retries so rejections surface immediately.
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
-// Short dead-end cooldown so the expiry leg stays fast.
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
+// #3274: keep the dead-end marker warm across the r1->r2 retry gap even on slow
+// CI runners — a 400ms window expired under load and the "immediate" retry
+// re-walked preflight instead of replaying the cached diagnosis, drifting the
+// local token estimate and re-spending upstream calls (#3279 windows node22).
+process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "60000";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";

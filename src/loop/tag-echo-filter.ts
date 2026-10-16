@@ -114,6 +114,11 @@ const REF_TOKEN = "m\\d{4,}";
 const REFS_RUN = REF_TOKEN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*" + REF_TOKEN + ")*";
 // Whole string is a refs run (optionally padded): tag content, not prose.
 const REFS_ONLY = new RegExp("^\\s*" + REFS_RUN + "\\s*$");
+// Superset: the run may also END on an incomplete ref prefix (m / m0 / m00…)
+// or a dangling joiner — refs-shaped so far, verdict pending the next delta.
+// The swallow cap defers its release-vs-drop decision while this holds, or
+// the verdict flips with the chunk boundary (chunk-split determinism).
+const PENDING_REF_SPAN = new RegExp("^\\s*" + REFS_RUN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*(?:m\\d{0,3})?)?\\s*$");
 // Body of a paired render tag: refs-only or empty (#1720/#2023). Anything
 // else is prose wearing tags — PAIRED must not match it.
 const PAIRED_BODY = "\\s*(?:" + REFS_RUN + ")?\\s*";
@@ -127,10 +132,10 @@ const PAIRED = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>(" + PAIRED_BODY + ")"
 // Streaming: consulted only when no opening is live (the swallowing state
 // owns paired closes, #1720). Whole-text: applied to UNMATCHED closes only
 // (see orphanCloseSpans) so a ref cited inside a prose-wearing pair survives.
-const ORPHAN_REF_CLOSE = new RegExp("(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
+const ORPHAN_REF_CLOSE = new RegExp("(?<![\\w>])" + REFS_RUN + "\\s*\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // Same unit anchored to the END of a string: the refs run immediately
 // preceding an unmatched close (whole-text orphan pass).
-const ORPHAN_RUN_BEFORE = new RegExp("(?<![\\w>])\\s*" + REFS_RUN + "\\s*$");
+const ORPHAN_RUN_BEFORE = new RegExp("(?<![\\w>])" + REFS_RUN + "\\s*$");
 const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>");
 const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // #2190: a ref body closed by a DEGENERATE close name (any short word — the
@@ -170,8 +175,17 @@ const SELF_CLOSE = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?\\/>");
 // Refs right after a tag terminator (\x3e) are NOT held: they belong to tag
 // structure (over-cap-dropped openings, #644) and stay lossless. Held on the
 // small cap so a split unit can be stripped whole; a lone trailing ref with
-// no tag context is released at EOF, prose-safe.
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "|(?<![\\w>])m\\d{0,3})$");
+// no tag context is released at EOF, prose-safe. The bare-run alternative
+// tolerates the unit's growing tail — trailing whitespace, a dangling range
+// joiner, and an incomplete next ref (m / m0 / m00): ORPHAN_REF_CLOSE matches
+// run+\s*+joiner+\s*+ref+close, so a chunk boundary anywhere inside that tail
+// must hold the run too, or the close arrives as its own unit and the refs
+// leak as residue (chunk-split determinism — same input, any chunking, same
+// output). Trailing whitespace is held too (and allowed to lead the partial
+// ref): a dead unit NEVER consumes the whitespace around it (it is content),
+// in either mode, so chunk-split parity needs no cross-push whitespace
+// memory.
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3})$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 // The mangled \x3c<name>=… form counts too: once the `=` is there the tail is
@@ -1049,15 +1063,34 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     }
                 }
                 if (combined.length > swallowLimit) {
-                    swallowed = "";
                     if (swallowReleases) {
-                        // A refs-only tail past the #644 budget is an imitated
-                        // marker list, not prose — discard it. Mixed tails are
-                        // content and still release losslessly.
-                        if (REFS_ONLY.test(combined)) {
+                        // A span that is refs-shaped so far (a run, optionally
+                        // ending on an incomplete ref / dangling joiner) is an
+                        // imitated marker list in the making, and its verdict
+                        // is content-determined only at resolution — the
+                        // close (drop whole, matching the whole-text PAIRED
+                        // strip) or the first non-ref char (mixed content,
+                        // release). Deciding at the budget boundary instead
+                        // flips the verdict with the chunk boundary and leaks
+                        // the post-budget remainder as residue (chunk-split
+                        // determinism). Bounded by the imitation cap: past it
+                        // the span is decisively a marker list — drop and
+                        // keep discarding until the close (attested
+                        // semantics). Mixed tails keep the #644 release
+                        // semantics (existing contract: prose flows, and the
+                        // EOF flush of a never-closed attrs-bearing span is
+                        // tag content, not prose).
+                        if (PENDING_REF_SPAN.test(combined)) {
+                            if (combined.length <= IMITATION_SWALLOW_CAP) {
+                                swallowed = combined;
+                                return out;
+                            }
+                            swallowed = "";
+                            swallowReleases = false;
                             dropSwallowSpan(combined);
                             return out;
                         }
+                        swallowed = "";
                         swallowUntilClose = false;
                         buf = combined;
                         if (onResidueWarn && containsEchoResidue(combined)) onResidueWarn(combined);
@@ -1065,6 +1098,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     }
                     // The span is an attested imitation's payload: discard it and
                     // keep swallowing, so no part of it reaches the client.
+                    swallowed = "";
                     dropSwallowSpan(combined);
                     return out;
                 }
@@ -1128,9 +1162,16 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     // A definite \x3c<name> opening is never prose — hold it far
                     // past HOLD_LIMIT (drop it past TAG_OPEN_CAP); a short
                     // ambiguous prefix stays on the small hold cap so prose
-                    // is never delayed or lost.
+                    // is never delayed or lost. A refs-run tail (bare run, or
+                    // run + open/close head) is tag content in the making
+                    // (#2023/#644): it can be arbitrarily long (a 13-ref
+                    // citation list), and releasing it at the small cap just
+                    // because the chunk boundary landed mid-run leaks the run
+                    // as residue (chunk-split determinism) — hold it on the
+                    // imitation cap instead.
                     const definite = DEFINITE_TAIL.test(t[0]);
-                    const cap = definite ? TAG_OPEN_CAP : HOLD_LIMIT;
+                    const refsShaped = /^\s*m/.test(t[0]);
+                    const cap = definite ? TAG_OPEN_CAP : refsShaped ? IMITATION_SWALLOW_CAP : HOLD_LIMIT;
                     // The settled prefix may already hold a dead unit while
                     // only the trailing head stays held — clean it on release.
                     const pre = stripDeadRefCloses(buf.slice(0, buf.length - t[0].length));

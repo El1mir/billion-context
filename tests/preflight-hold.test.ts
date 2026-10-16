@@ -47,9 +47,14 @@ function okSse(inputTokens: number): string {
 
 function bigConversation(): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
+    // #3298: repeat(250) sat ~16 est-tokens under the 10k window after the
+    // preflight fold on old system-prompt sizes — any growth of the injected
+    // prompt (e.g. the project-attribution line) flipped the #330 soft-zone
+    // relaxation gate and ate the protected tail. repeat(235) restores ~700
+    // tokens of margin so the guard pins behavior, not a knife-edge.
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        const filler = `MARKER_${i}_content_`.repeat(250);
+        const filler = `MARKER_${i}_content_`.repeat(235);
         msgs.push({ role, content: `Message ${i} of the long conversation. ${filler}` });
     }
     return msgs;
@@ -155,7 +160,7 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        // Fresh session, ~13k-token history vs 10k window → preflight fires
+        // Fresh session, ~12k-token history vs 10k window → preflight fires
         // and its summarization call takes 1.5s ≫ the 300ms grace.
         const r = await timedPost(
             `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,

@@ -1,14 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
-import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
-import { handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
+import { activeBlockSpans, collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
+import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
-import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput, type ParsedRange } from "./compress-tool.js";
+import { isProxyToolFor } from "./proxy-tool.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
-import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
+import { recordThreadTail } from "./server/thread-tracking.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -65,10 +65,6 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session);
     }
-    const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
-    if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
-        return executeAbsorb(args, undefined, absorb, ctx);
-    }
     if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
         // Non-stream rewrite has no re-request to ride, so the full text rides
         // inline right after the ack inside the converted text block.
@@ -76,11 +72,6 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         const injections = drainPendingRetrievals(ctx.session);
         if (injections.length === 0) return ack;
         return { ...ack, text: injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack.text) };
-    }
-    if (imageCompressionEnabled(ctx.session) && toolName === IMAGE_FULL_TOOL_NAME) {
-        // Restore is passive egress behavior (the next forward re-emits the
-        // cached original), so there is nothing to drain inline.
-        return executeImageFull(args, ctx.session, ctx.config);
     }
     return toolFail(`[Unknown proxy tool: ${toolName}]`);
 }
@@ -250,7 +241,7 @@ function substrateDestructionPauseParagraph(n: number): string {
  *  (clearCompressLoopStreak). The pause paragraph branches on the failure
  *  cause (#2432): substrate-destruction gets the single-recovery-step
  *  wording, everything else keeps the verbatim loop-noise paragraph. */
-function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: string): string {
+function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: string, forcedCause?: string): string {
     const now = Date.now();
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
@@ -259,8 +250,10 @@ function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: stri
     // receipt (acp_status) can react to a substrate/stale-ref verdict at n=1
     // instead of waiting for the third failure to arm the breaker. A cause
     // only ever moves forward: an unknown-cause failure keeps the last known
-    // verdict rather than erasing it.
-    const freshCause = errs !== undefined ? compressFailureCause(errs, ctx.session) : "";
+    // verdict rather than erasing it. #3126: host-side gates that know their
+    // own verdict before the kernel runs pass it as forcedCause — deriving it
+    // from kernel error text would misattribute a gate refusal to content.
+    const freshCause = forcedCause ?? (errs !== undefined ? compressFailureCause(errs, ctx.session) : "");
     const cause = freshCause !== "" ? freshCause : streak?.cause;
     writeCompressLoopStreak(ctx.session, { n, lastAt: now, ...(cause !== undefined ? { cause } : {}) });
     if (n < COMPRESS_LOOP_THRESHOLD) return "";
@@ -270,7 +263,7 @@ function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: stri
     } else {
         ctx.log(`[warn: compress-loop] failure ${n} in armed streak (last spec: ${label})`);
     }
-    if (errs !== undefined && compressFailureCause(errs, ctx.session).startsWith("substrate-destruction")) {
+    if (freshCause.startsWith("substrate-destruction")) {
         return substrateDestructionPauseParagraph(n);
     }
     return loopNoisePauseParagraph(n);
@@ -501,7 +494,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     if (ctx.lastNudge) {
         // Baseline = this request's prepare-time offer (already viable-filtered
         // by the prepare step), NOT a post-fold recompute (#2404).
-        base = viableRanges(ctx.lastNudge.compressibleRanges).filter(submitGate);
+        base = excludeDeadRefRanges(viableRanges(ctx.lastNudge.compressibleRanges).filter(submitGate), ctx.session.state.deadRefs);
         tier = ctx.lastNudge.tier ?? null;
     } else {
         // Internal lanes (preflight overflow-compress) capture no prepare-time
@@ -516,6 +509,8 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
                 tokenCount: statusInputBaseline(ctx.session),
                 renderTags: "none",
                 contentStore: contentStoreOf(ctx.session),
+                // #3236: screen advertised tail ranges on the apply class.
+                applyView: ctx.compressMessages,
             });
             nudge = turn.nudge;
         } catch {
@@ -530,7 +525,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         // #1387 (pi #521) fixed. shouldInject=false ⇒ nothing actionable ⇒ fall
         // through to the stop-signal logic below (never list the ranges).
         if (nudge.shouldInject) {
-            base = viableRanges(nudge.compressibleRanges).filter(submitGate);
+            base = excludeDeadRefRanges(viableRanges(nudge.compressibleRanges).filter(submitGate), ctx.session.state.deadRefs);
         } else {
             base = [];
         }
@@ -573,6 +568,106 @@ function applyErrorNote(r: { errors: string[] }): string {
 // restarting from scratch. Hardcoded by design (config-surface discipline);
 // hosts that want to penalize this shape grep the warn marker below.
 const DEGENERATE_FOLD_COVERAGE = 0.8;
+
+/** #3126: refuse up front when the proxy holds NO message view of this
+ *  conversation while its ref table says refs exist. The plugin tool endpoint
+ *  serves compress from a volatile in-memory view (session.transient.pluginMessages,
+ *  with the fork-only pluginSnapshot as fallback) that is legitimately empty
+ *  between model requests once the session object left the resident pool
+ *  (512 MiB byte budget, evictOldest) or the process restarted — state (every
+ *  ref mapping) survives on disk, the message bytes do not (transient is never
+ *  persisted; pluginSnapshot persists only for fork sessions, #2077). Feeding
+ *  an empty view to the kernel dangles EVERY requested ref, records them all
+ *  DEAD (the host commits applyCompression's cloned state even when zero blocks
+ *  were created), and the receipt blames "content-changed" — none of which is
+ *  true: the refs are intact and the view self-heals on the next model request
+ *  (rememberPluginMessages after forward). Null = no refusal, proceed. */
+export function noVisibleContextRefusal(
+    ctx: RewriteCtx,
+    ranges: ParsedRange[],
+    opts?: { loopTracking?: boolean },
+): ProxyToolResult | null {
+    const view = ctx.compressMessages ?? ctx.messages;
+    const mappedRefs = Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length;
+    if (view.length > 0 || mappedRefs === 0) return null;
+    // #398/#403 in-place refold works FROM state alone: after an inline
+    // decompress the originals leave the wire view (proxy mode) yet a
+    // re-compress of the restored span must still land on its block. The
+    // refusal therefore applies only when NO active block touches ANY
+    // requested ref — then nothing in the call can be served without live
+    // messages and every retry fails identically. Any overlap hands the
+    // decision back to the kernel, which keeps its own honest diagnostics
+    // for those shapes (refold / already-compressed / no-net-shrink).
+    const spans = activeBlockSpans(ctx.session.state);
+    const touchable = ranges.some((r) => {
+        const lo = refNum(r.startRef);
+        const hi = refNum(r.endRef);
+        if (lo === 0 || hi === 0) return true;
+        const a = Math.min(lo, hi), b = Math.max(lo, hi);
+        return spans.some((s) => refNum(s.startRef) <= b && refNum(s.endRef) >= a);
+    });
+    if (touchable) return null;
+    const detail = ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ");
+    ctx.log(`[acp-proxy: compress REFUSED ${detail} — no visible context (view=0 message(s), ${mappedRefs} ref(s) mapped); refs left untouched and nothing recorded as dead — the view self-heals on the next model request (#3126)]`);
+    const specKey = normalizedSpecKey(ranges);
+    const repeatGuard = recordCompressFailure(ctx.session, specKey, "This failure is the proxy's missing in-memory message view, not your refs — it clears on the next model request. Wait for that turn instead of re-issuing.");
+    const loopGuard = opts?.loopTracking === false ? "" : noteCompressLoopFailure(ctx, specKey, undefined, "no-visible-context");
+    const receipt = `[Compression FAILED: no visible context — the proxy holds no live message view of this conversation right now (its in-memory copy was dropped between model requests, e.g. by memory eviction or a restart). Your refs are intact and NOTHING was marked dead: ${mappedRefs} ref(s) remain mapped, and this is NOT a ref problem. Do NOT retry now — every retry fails identically until the next model request re-sends the conversation and restores the view. Continue your task; after the next turn you can compress the same ranges again. [cause: no-visible-context]${repeatGuard}${loopGuard}]`;
+    return compressResult(receipt, "refused", 0, "gate:no-visible-context");
+}
+
+// #2749: display-stub re-submission guard. In plugin mode the model's only
+// persistent record of a folded block's summary is the ~200-char display stub
+// that hideConsumedCompressCalls writes into the re-sent call args
+// (kernel/src/hide-consumed.ts SUMMARY_STUB_CHARS=200 — applied on both the
+// live-range rewrite path and the orphan-compact path); the full-text
+// acp_summary anchor is stripped there in plugin mode (#1316). Asked to
+// summarize again — tier distillation, refold — a model can "recall" only that
+// fragment and submit it as if it were the full summary. minSummaryLength (50)
+// accepts it and a large range then folds under the truncated record (worst
+// variant: re-folding the same block silently SHRINKS its canonical summary).
+// The stub set is harvested from the kernel's OWN outbound rewrite of the
+// current messages rather than mirrored from constants: whatever fragments the
+// model can actually see right now are exactly what gets rejected. Exact match
+// only — legitimate prose (summaries containing an ellipsis, short summaries,
+// ±1-char transcription drift) can never trip it.
+export function visibleSummaryStubs(messages: CoreMessage[], state: CompressionState): Set<string> {
+    let hidden: { messages: CoreMessage[] };
+    try {
+        hidden = hideConsumedCompressCalls(state, messages);
+    } catch {
+        return new Set();
+    }
+    const stubs = new Set<string>();
+    for (const m of hidden.messages) {
+        if (m.contentType !== "tool-call" || m.toolName !== COMPRESS_TOOL_NAME || typeof m.text !== "string") continue;
+        let parsed: ReturnType<typeof parseCompressInput>;
+        try {
+            parsed = parseCompressInput(m.text);
+        } catch {
+            continue;
+        }
+        for (const r of parsed.ranges) {
+            const s = r.summary;
+            // Structural band of a kernel-emitted stub: safePrefix(·, 199) +
+            // U+2026 ⇒ length 199 or 200 ending in the ellipsis. A legitimate
+            // summary never targets an exact 200-char cut mid-word, so this
+            // band cannot false-positive on real prose.
+            if ((s.length === 199 || s.length === 200) && s.endsWith("\u2026")) stubs.add(s);
+        }
+    }
+    return stubs;
+}
+
+export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRange[]): Array<{ startRef: string; endRef: string }> {
+    const stubs = visibleSummaryStubs(ctx.compressMessages ?? ctx.messages, ctx.session.state);
+    if (stubs.size === 0) return [];
+    const hits: Array<{ startRef: string; endRef: string }> = [];
+    for (const r of ranges) {
+        if (typeof r.summary === "string" && stubs.has(r.summary)) hits.push({ startRef: r.startRef, endRef: r.endRef });
+    }
+    return hits;
+}
 
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
@@ -646,6 +741,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);
+    }
+    const noView = noVisibleContextRefusal(ctx, ranges, { loopTracking: trackLoop });
+    if (noView) return noView;
+    // #2749: reject summaries that are byte-identical to a display stub the
+    // model can currently see (the fragments it can "recall" after the
+    // full-text anchor was stripped in plugin mode). Log carries refs only —
+    // never the fragment itself (business content, #1454 pattern).
+    const stubHits = findVisibleStubResubmissions(ctx, ranges);
+    if (stubHits.length > 0) {
+        const detail = stubHits.map((h) => `${h.startRef}–${h.endRef}`).join(", ");
+        ctx.log(`[acp-proxy: compress rejected — ${stubHits.length} submitted summary fragment(s) byte-identical to a currently-visible display stub (#2749): ${detail}]`);
+        const specKey = `stub:${detail}`;
+        const guard = recordCompressFailure(ctx.session, specKey, "Restore the content first — decompress the block(s) whose stub you copied, or search_context — then re-issue with a fresh, complete summary.");
+        const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
+        return compressResult(`[Compression FAILED: the summary for ${detail} is byte-identical to a display stub currently visible in your history — a ~200-char truncated preview of an already-stored summary, NOT a complete summary. Accepting it would fold those ranges under a fragment and lose everything after the cut (when re-folding the same block, silently shrink its stored summary). Nothing was compressed. Do NOT re-issue the fragment: first restore what you need to summarize (decompress the source block(s), or search_context), then re-issue the compress call with a fresh, complete summary covering the range's key information.${guard}${loopGuard}]`, "refused", 0, "stub-resubmission");
     }
     try {
         const res = ctx.core.applyCompression({
@@ -1040,7 +1150,7 @@ function* rewriteJsonSteps(body: unknown, ctx: RewriteCtx): Generator<JsonToolCa
     // Absorb signature in whole text (m00885): drop only when the request
     // actually instructed the model about absorb — the shape check alone
     // cannot tell an emission from a user-quoted fragment.
-    const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
+    const absorbArmed = false;
     const requestText = JSON.stringify(ctx.messages);
     for (const blk of newContent) {
         const t = (blk as { type?: string; text?: string }).text;

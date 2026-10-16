@@ -17,7 +17,8 @@ on:
   # the path filter below (schedule ignores paths; ZCODE_VERSION falls back
   # to its '3.14.4' default when no dispatch input is present).
   schedule:
-    - cron: '30 16 * * *'
+    - cron: '14/30 * * * *'
+    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
   workflow_dispatch:
     inputs:
       zcode_version:
@@ -25,20 +26,13 @@ on:
         required: false
         default: "3.14.4"
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - .github/workflows/ci-zcode-real.yml
       - src/zcode/**
       - tests/zcode-*.test.ts
       - src/mcp.ts
-  push:
-    branches:
-      - master
-    paths:
-      - .github/workflows/ci-zcode-real.yml
-      - src/zcode/**
-      - tests/zcode-*.test.ts
-      - src/mcp.ts
-
+  # three-layer CI: master signal comes from ci.yml core runs + gated scheduled full runs
 concurrency:
   # #2637 plan #3: 'nightly' keeps scheduled runs out of the per-ref cancel scope.
   group: zcode-real-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
@@ -52,7 +46,39 @@ env:
   ZCODE_SHA256: 4b4631987172fd975aa1f85fa0dc1f55ac1c756b26bd8ab18d68592ed9391182
 
 jobs:
+  # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
+  # or on the 30-min cron when master moved since the last green scheduled run.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          LABEL_EVENT: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$EVENT" = "pull_request" ]; then
+            # only the ci:full label itself may trigger; other label events skip
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
+          elif [ "$EVENT" = "schedule" ]; then
+            LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-zcode-real.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+            echo "last green scheduled head: ${LAST:-none}; current: $HEAD_SHA"
+            if [ "$LAST" = "$HEAD_SHA" ]; then run=false; fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
   zcode-real:
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

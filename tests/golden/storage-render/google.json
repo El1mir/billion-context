@@ -3,95 +3,95 @@
  "turns": [
   {
    "i": 0,
-   "sha": "687e32d9cb85f44a1cb05ad59365bd44b822a8ed1620b35da2dfa4f6ef0b0c33",
-   "bytes": 20439
+   "sha": "f5dc4cf53560506a6512df6705e8a19b0ceb083d498e0238c6fdbfac2d7fc557",
+   "bytes": 20757
   },
   {
    "i": 1,
-   "sha": "f2304ead1cb1ba6a45d9a9fe3ee1adf428bd2da6c9b6c0868b057f5de88e5448",
-   "bytes": 28994
+   "sha": "6d09d7c16d2da11d69830e37c7b686544ac9303705890f19878a3ac30326cded",
+   "bytes": 29312
   },
   {
    "i": 2,
-   "sha": "f3caead28fe9f5463298037010de4a6da7e193893c394350ee856f88604fe10e",
-   "bytes": 34820
+   "sha": "73176e2f6f0cd153757fd7b7aa53e1264ec906d5327fd766e8575efa1ed4b3d1",
+   "bytes": 35138
   },
   {
    "i": 3,
-   "sha": "8f1bb1090a0f451375e0842dd2cf6c098e27981b395d06d508095b49a076da5b",
-   "bytes": 43375
+   "sha": "f402f8cb7a82f1f18778bcad90c92df1aef605ff36c89f4a676ab978d8f50831",
+   "bytes": 43693
   },
   {
    "i": 4,
-   "sha": "994526737d0e88ac920d46083bec343fcd6df1d3dab9389db578c5d05dbff902",
-   "bytes": 49201
+   "sha": "ec4e7603429b589ca4159d603b2d7170abdca50a2daff76b9e937eedc7769a39",
+   "bytes": 49519
   },
   {
    "i": 5,
-   "sha": "63da90071ec92f7ba2d3311a213ceb89d2b71fedb4c6bf36e46e72c672ea3bfd",
-   "bytes": 57756
+   "sha": "575b63163cdbf0a891e4b9fe0bfe701ad7420d357fff22d2f93af17cd2e5ee23",
+   "bytes": 58074
   },
   {
    "i": 6,
-   "sha": "7973c51f87afe5c86f1db405fb35bc08adf0bb12260ebe55573d0aa47df4f385",
-   "bytes": 63582
+   "sha": "939c1376f6be5f13c039332459ed815bdc067d80776ead20cbc1ce67bb75bf86",
+   "bytes": 63900
   },
   {
    "i": 7,
-   "sha": "a5052cf869a79bc59ff45e54b9cd54128792815c0e6e8252fcb587ffaf2d3b92",
-   "bytes": 72137
+   "sha": "2345e668666b71cae9eb1c19a6689df16e1df1c1976cc885c821edcfd2f561f5",
+   "bytes": 72455
   },
   {
    "i": 8,
-   "sha": "6f0f9a6e59865a099e40deae587d3d33955561a5f8e8e3a2218f8117b7c75fd9",
-   "bytes": 77963
+   "sha": "a50b8a3b217fb6bbf88305838d160f5d460c77bd2a3946a3b4d996780500a858",
+   "bytes": 78281
   },
   {
    "i": 9,
-   "sha": "48796aeee1714ad38248edbf25b78cb61a4ca3eb82fb8afeca79fb42e53260dc",
-   "bytes": 50549
+   "sha": "e38ba572fc6a78edd320383f084bba8ed93b8c687a0fda490eff3083af87e8ca",
+   "bytes": 50867
   },
   {
    "i": 10,
-   "sha": "884a2721898db188264dc89f82e8396cdb01d0f15c7e7cbe1f15a6ec7f15d9f7",
-   "bytes": 57952
+   "sha": "8a05cf4b7f1faba876e0aca26af58d4d2d826d3edfcd3fc3b61ba6ce29cb53ff",
+   "bytes": 58270
   },
   {
    "i": 11,
-   "sha": "fca8f37555a5cc691f1ababdde584af0a132d29ff2bdca435c231e763751a50a",
-   "bytes": 63701
+   "sha": "6ddc8da9e5c8a3ea1f8b97ba7e18f8c20d2d43b2568266778aa3e4b5fa9c011f",
+   "bytes": 64019
   },
   {
    "i": 12,
-   "sha": "540646448d404876a083e4073aab59e1e14ede8aea31d0a563fb4c38cfc848fe",
-   "bytes": 77706
+   "sha": "6473158a0c3f366bde820cf1a09670ca87fe7904edf62b38213f04a727e89274",
+   "bytes": 78024
   },
   {
    "i": 13,
-   "sha": "447cdfbb1e875a06d8f20bdcedb79434095614e207a014ed113196673b6a7705",
-   "bytes": 83455
+   "sha": "33707b02a77dbbffe32bda03406fcd826e6c65c16530d0d577fd0dc2d0d4495f",
+   "bytes": 83773
   },
   {
    "i": 14,
-   "sha": "f418b52a98a55c5dd7c328fcbc256928887667e2dc46f51b14d9eaf16e358edd",
-   "bytes": 91985
+   "sha": "d37fa868f12bde6c04a3b8383a2a935443b5c82ef5262e36a5ce2827afd177ea",
+   "bytes": 92303
   }
  ],
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "a0ad11b7ba567ea6d182847f2a9a17c9700b1793f241c6e08adfe73c5172a112",
+ "stateDigest": "3144c27caf4bafa2dcebb7509175f1998a17db4334951572f4dc59d398be39ec",
  "sectionDigests": {
-  "state": "6d2f312d7bc924d7",
+  "state": "2a2af1c92fcb4f88",
   "blockContents": "473264d9df8ba338",
-  "stats": "5702a6493cdfe768",
-  "metadata": "fe714004e9ae3104"
+  "stats": "660f1797bf2044c4",
+  "metadata": "208a3c79d1adeebb"
  },
  "stateKeyDigests": {
   "blocks": "8e14f0879bf7ebd7",
   "messageRefs": "19bfd6646b3f6f78",
-  "nudge": "fad7619e233c76ab",
-  "stats": "21963a0036a8e7c0",
+  "nudge": "1aafe7b2e5e10a1f",
+  "stats": "e4ee14ae39539ff8",
   "nextBlockId": "d4735e3a265e16ee",
   "nextRunId": "d4735e3a265e16ee",
   "tokenSnapshot": "5080181ee1a25a8c",
@@ -101,9 +101,7 @@
   "terminalStreak": "5feceb66ffc86f38",
   "nextRuleId": "6b86b273ff34fce1",
   "absorbed": "4f53cda18c2baa0c",
-  "rules": "4f53cda18c2baa0c",
-  "imageFullRestored": "4f53cda18c2baa0c",
-  "imageShrinks": "4f53cda18c2baa0c"
+  "rules": "4f53cda18c2baa0c"
  },
  "stateShape": {
   "refs": 42,

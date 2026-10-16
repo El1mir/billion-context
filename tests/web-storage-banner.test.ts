@@ -334,3 +334,33 @@ test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reaso
         restoreEnv(snap);
     }
 });
+
+// #3235: the compression-conflict banner rides the same generic #3040 facility
+// ("以后错误都这样") — the conflict-banner topic must serve the ledger summary
+// in the copyable blob with a prefilled GitHub issues/new URL, so a user hit by
+// the banner can report the exact evidence in two clicks without pasting logs.
+test("#3235 conflict-banner diagnostics topic serves the ledger summary + prefilled issue URL", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "web-conflict-topic-"));
+    const snap = saveEnv();
+    let proxy: http.Server | undefined;
+    try {
+        isolate(base);
+        const upstreamPort = await freePort();
+        proxy = await startServer(makeOpts(upstreamPort));
+        await once(proxy, "listening");
+        const port = (proxy.address() as { port: number }).port;
+
+        const d = await fetchJson<DiagnosticsWire>(port, "/__bili/diagnostics?topic=conflict-banner");
+        assert.ok(d.title.startsWith("Compression conflict banner"), "title names the topic");
+        assert.ok(d.blob.includes("--- compression conflict ledger ---"), "blob carries the ledger section");
+        assert.ok(d.blob.includes("banner policy (#3235)"), "blob documents the alarm rule for reporters");
+        assert.ok(d.url.startsWith("https://github.com/ranxianglei/billion-context/issues/new?title="), "url targets issues/new");
+        const u = new URL(d.url);
+        assert.equal(u.searchParams.get("body"), d.blob, "issue body decodes back to the exact blob");
+        assert.ok((u.searchParams.get("title") ?? "").includes(VERSION), "issue title encodes the version");
+    } finally {
+        if (proxy) await close(proxy);
+        restoreEnv(snap);
+        rmrf(base);
+    }
+});

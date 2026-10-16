@@ -675,7 +675,7 @@ test("HTTP fork revision and originals survive a new proxy process", async () =>
         parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
         parent.contentStoreDirty = true;
         assert(h.store.flushSync(parent));
-        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), JSON.parse(JSON.stringify({ ...parent.state, imageFullRestored: parent.state.imageFullRestored ?? [], imageShrinks: parent.state.imageShrinks ?? [] })));
+        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), JSON.parse(JSON.stringify(parent.state)));
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
         const fork = await h.request("/__bili/plugin/fork", req);
@@ -1033,7 +1033,12 @@ test("HTTP nested summaries expand crossing ancestors and retain independent ori
         assert.equal(exact.body.inheritedBlocks.length, 2);
         const restored = h.store.loadSync("nested")!;
         assert.deepEqual(restored.state.blocks, JSON.parse(JSON.stringify(resolveConversation("nested").session!.state.blocks)));
-        assert.deepEqual(restored.blockContents, resolveConversation("nested").session!.blockContents);
+        // #3050 R3 ②b: idle saves swap the resident map to the lazy shell —
+        // compare CONTENT (materialized) instead of the map constructor.
+        assert.deepEqual(
+            Object.fromEntries(restored.blockContents),
+            Object.fromEntries(resolveConversation("nested").session!.blockContents),
+        );
         const expanded = await h.request("/__bili/plugin/fork", forkRequest(snapshot, "nested-prefix", 2));
         assert.equal(expanded.status, 201, JSON.stringify(expanded.body));
         assert.equal(expanded.body.status, "expanded");

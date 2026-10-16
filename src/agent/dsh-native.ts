@@ -51,6 +51,7 @@ import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScr
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, markIncrementalDead, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
 export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
@@ -1304,6 +1305,13 @@ export function apply(ctx: PluginContext): void {
         const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
         refreshModelInfo(register.base, target);
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        // #3248: declare the divert intent for the request that was just
+        // converted by beforeSend (sequential dispatch — the flag is set by
+        // the conversion and consumed here, exactly once).
+        if (incMarkerArmed) {
+            headers[INCREMENTAL_TURN_MARKER_HEADER] = "1";
+            incMarkerArmed = false;
+        }
         if (target !== undefined) {
             const cached = modelInfo.byKey.get(modelInfoKey(target.provider, target.model));
             if (cached !== undefined) {
@@ -1319,7 +1327,73 @@ export function apply(ctx: PluginContext): void {
     // #2399: fork-child adoption runs before headersFor stamps the child's
     // first plugin request — the proxy then binds the replayed prefix to the
     // adopted parent state on that very request instead of starting fresh.
-    state.beforeSend = (_url, init) => maybeForkAdoptBeforeSend(ctx, init);
+    // #3248: the same awaited pre-send slot converts the outgoing anthropic
+    // body to its incremental form when the lane advertises the feature —
+    // init.body mutation propagates through withHeaders/send untouched.
+    state.beforeSend = async (url, init) => {
+        await maybeForkAdoptBeforeSend(ctx, init);
+        await maybeIncrementalNative(url, init);
+    };
+
+    // #3248 incremental turns (#3248 marker divert, reference wiring for the
+    // native fetch lanes; opencode/omp-native follow the same recipe):
+    //   beforeSend  — parse the anthropic body, plan (probe-gated), replace
+    //                  init.body with the delta payload, arm the marker flag
+    //                  + stash the ack context keyed by URL;
+    //   headersFor  — stamp the marker on the armed request;
+    //   onResponse  — read x-bili-applied-seq and record the ack (or fall
+    //                  back to full resend on 409/503).
+    // The lane shape-tests the body, so a marker'd but unconverted request
+    // (probe raced off, dead conversation, non-string body) rides the normal
+    // pipeline — behavior equals the pre-incremental world.
+    let incMarkerArmed = false;
+    const incPendingAcks = new Map<string, { sid: string; messages: IncrementalWireMessage[]; system: unknown; base: string }>();
+    async function maybeIncrementalNative(url: string, init: RequestInit | undefined): Promise<void> {
+        if (!register.toolsReady || init === undefined) return;
+        const attr = attributionOf(ctx);
+        if (attr.state !== "ok") return;
+        const body = init.body;
+        if (typeof body !== "string" || body.length === 0) return; // stream/Request bodies ride full resend
+        let parsed: { messages?: unknown; system?: unknown; model?: unknown };
+        try {
+            parsed = JSON.parse(body) as typeof parsed;
+        } catch {
+            return;
+        }
+        if (!Array.isArray(parsed.messages) || typeof parsed.model !== "string") return; // anthropic wire only
+        const base = register.base ?? state.origin;
+        if (base === undefined) return;
+        if (!(await probeIncrementalTurns(base))) return;
+        const sid = attr.sid;
+        const plan = planIncrementalTurn({
+            conversationId: sid,
+            path: "/v1/messages", // placeholder — the marker divert uses the ORIGINAL routed URL
+            messages: parsed.messages as IncrementalWireMessage[],
+            system: "system" in parsed ? parsed.system : undefined,
+            request: parsed as Record<string, unknown>,
+        });
+        if (plan.mode === "skip") return;
+        init.body = (plan as { body: string }).body;
+        incMarkerArmed = true;
+        incPendingAcks.set(url, { sid, messages: parsed.messages as IncrementalWireMessage[], system: "system" in parsed ? parsed.system : undefined, base });
+    }
+    state.onResponse = (url, response) => {
+        const pending = incPendingAcks.get(url);
+        if (pending === undefined) return;
+        incPendingAcks.delete(url);
+        if (response.status === 200) {
+            const seq = response.headers.get("x-bili-applied-seq");
+            if (seq !== null && /^\d+$/.test(seq)) {
+                noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
+            }
+            return;
+        }
+        if (response.status === 409 || response.status === 503) {
+            markIncrementalDead(pending.sid);
+            clearIncrementalProbe(pending.base);
+            logHostEvent("warn", "[native-client]", `bili-native-dsh: incremental turn rejected (${response.status}) for ${pending.sid} — falling back to full resend for this conversation`);
+        }
+    };
 
     // #1268: arm the interceptor's toolsReady gate — the first model request
     // holds until this resolves, so it stamps into plugin mode instead of

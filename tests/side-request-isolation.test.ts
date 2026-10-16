@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
-import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest } from "../src/server.ts";
+import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
 import { estimateRawBodyTokens } from "../src/preflight.ts";
@@ -93,28 +93,32 @@ test("restoreOutputBudget: high-water learning + starved-budget restore (#546)",
     const starved = { max_tokens: 16, tools: [{ name: "compress" }] } as { max_tokens: number; tools: unknown[] };
     restoreOutputBudget(starved, s, noopLog);
     assert.equal(starved.max_tokens, 32768, "starved budget restored to high-water");
-    // No high-water yet + starved + tools → nothing to restore to, untouched.
+    // No high-water yet + starved + tools + NO ceiling → #3071 absolute floor: a
+    // born-starved / fork-inherited rattle is never forwarded verbatim.
     const fresh = metaSession("fresh");
     const noWater = { max_tokens: 16, tools: [{ name: "compress" }] };
     restoreOutputBudget(noWater, fresh, noopLog);
-    assert.equal(noWater.max_tokens, 16);
+    assert.equal(noWater.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "born-starved floored to the absolute minimum (#3071)");
     // Side request (tiny budget, NO tools) → never touched, stays a side req.
     const side = { max_tokens: 100 };
     restoreOutputBudget(side, s, noopLog);
     assert.equal(side.max_tokens, 100, "side request budget must not be restored");
     assert.equal(isSideRequest(side), true);
-    // High-water re-learns downward on a new healthy budget (config change).
+    // A non-starved value is always trusted and recorded verbatim as the
+    // high-water (even below the absolute floor) — only a STARVE consults it.
     restoreOutputBudget({ max_tokens: 8000 }, s, noopLog);
-    assert.equal(s.metadata.outputBudgetHighWater, 8000, "last non-starved value wins");
+    assert.equal(s.metadata.outputBudgetHighWater, 8000, "non-starved value recorded verbatim as high-water");
     const starved2 = { max_tokens: 200, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(starved2, s, noopLog);
-    assert.equal(starved2.max_tokens, 8000, "boundary 200 restored too (isSideRequest would misfire without tools)");
+    assert.equal(starved2.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "boundary 200 starve floored to the absolute minimum (#3071)");
+    restoreOutputBudget({ max_tokens: 32768 }, s, noopLog);
+    assert.equal(s.metadata.outputBudgetHighWater, 32768, "a later healthy value wins as high-water");
     // Field-name fidelity: restore writes the SAME field the client used.
     const s2 = metaSession("hw2");
-    restoreOutputBudget({ max_output_tokens: 32689 }, s2, noopLog);
+    restoreOutputBudget({ max_output_tokens: 49152 }, s2, noopLog);
     const responsesStarved = { max_output_tokens: 1, tools: [{ type: "function" }] } as { max_output_tokens: number };
     restoreOutputBudget(responsesStarved, s2, noopLog);
-    assert.equal(responsesStarved.max_output_tokens, 32689, "responses field restored on the same field");
+    assert.equal(responsesStarved.max_output_tokens, 49152, "responses field restored on the same field");
 });
 
 test("restoreOutputBudget: configured-output-limit floor for poisoned or missing high-water (#1665)", () => {
@@ -124,7 +128,7 @@ test("restoreOutputBudget: configured-output-limit floor for poisoned or missing
     restoreOutputBudget({ max_tokens: 384000 }, s, noopLog);
     restoreOutputBudget({ max_tokens: 680 }, s, noopLog);
     restoreOutputBudget({ max_tokens: 234 }, s, noopLog);
-    assert.equal(s.metadata.outputBudgetHighWater, 234, "last non-starved value wins (decay tracked)");
+    assert.equal(s.metadata.outputBudgetHighWater, 234, "last non-starved value wins (decay tracked verbatim)");
     const starved = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(starved, s, noopLog, 384000);
     assert.equal(starved.max_tokens, 384000, "death-rattle water mark floored by the configured output limit");
@@ -139,55 +143,61 @@ test("restoreOutputBudget: configured-output-limit floor for poisoned or missing
     const bornDead = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(bornDead, s3, noopLog, 32768);
     assert.equal(bornDead.max_tokens, 32768, "missing water mark falls back to the configured limit");
-    // No configured limit → old behavior: nothing to restore to.
+    // No configured limit → no ceiling → the #3071 absolute floor applies (the
+    // starved budget is never forwarded verbatim).
     const s4 = metaSession("nofloor");
     const noFloor = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(noFloor, s4, noopLog);
-    assert.equal(noFloor.max_tokens, 1, "undefined configured limit leaves the request untouched");
-    // A limit at/below the side threshold is not a usable floor.
+    assert.equal(noFloor.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "no ceiling → absolute floor, not verbatim (#3071)");
+    // A limit at/below the side threshold is not a usable ceiling — the absolute
+    // floor still applies.
     const s5 = metaSession("tinyfloor");
     restoreOutputBudget({ max_tokens: 234 }, s5, noopLog);
     const tinyFloor = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(tinyFloor, s5, noopLog, 200);
-    assert.equal(tinyFloor.max_tokens, 234, "limit <= 200 cannot floor");
+    assert.equal(tinyFloor.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "limit <= 200 is not a usable ceiling — absolute floor applies");
     // Side requests (no tools) never receive the floor.
     const side = { max_tokens: 100 } as { max_tokens: number };
     restoreOutputBudget(side, s3, noopLog, 32768);
     assert.equal(side.max_tokens, 100, "side request untouched even with a floor available");
 });
 
-test("restoreOutputBudget: warns once per model when no output ceiling backs the restore (#1840)", () => {
+test("restoreOutputBudget: warns once per SESSION+model when no output ceiling backs the restore (#1840/#3071)", () => {
     _resetNoOutputCeilingWarningsForTest();
     const lines: string[] = [];
     const log = (_lvl: string, msg: string): void => { lines.push(msg); };
     const tools = [{ name: "t" }];
     const A = "stepfun/step-5-preview";
-    // Poisoned water mark seeded by a decaying client; NO ceiling from any source.
+    // Decaying client, NO ceiling from any source. The non-starved value is
+    // trusted verbatim (recorded as high-water, silently); the STARVE is what
+    // gets floored to the absolute minimum — and that is where the warn fires.
     const s = metaSession("nocap");
     restoreOutputBudget({ max_tokens: 583, model: A }, s, log);
-    assert.equal(lines.length, 0, "healthy-value learning is silent");
+    assert.equal(s.metadata.outputBudgetHighWater, 583, "non-starved learning is silent and tracked verbatim");
     const starved = { max_tokens: 1, tools, model: A } as { max_tokens: number };
     restoreOutputBudget(starved, s, log);
-    assert.equal(starved.max_tokens, 583, "without a ceiling the (poisoned) water mark still wins");
+    assert.equal(starved.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "ceiling-less starve floored to the absolute minimum (#3071)");
     let warns = lines.filter((l) => l.includes("NO known output ceiling"));
-    assert.equal(warns.length, 1, "warns once for the ceiling-less restore");
+    assert.equal(warns.length, 1, "one warn per session+model (on the starve, not the silent learning)");
     assert.match(warns[0] ?? "", /model=stepfun\/step-5-preview/, "names the model");
-    assert.match(warns[0] ?? "", /restored 1 -> 583/, "states what was actually restored");
+    assert.match(warns[0] ?? "", /raised 1 -> 32768/, "states what was actually raised");
     assert.match(warns[0] ?? "", /providers\.<url>\.models/, "points at the config escape hatch");
-    // Same model again → deduped (no second warn).
+    // Same session + model again → deduped (no second warn).
     restoreOutputBudget({ max_tokens: 1, tools, model: A }, s, log);
-    assert.equal(lines.filter((l) => l.includes("NO known output ceiling")).length, 1, "deduped per model");
-    // A different ceiling-less model warns once on its own.
-    restoreOutputBudget({ max_tokens: 1, tools, model: "other/model" }, metaSession("other"), log);
+    assert.equal(lines.filter((l) => l.includes("NO known output ceiling")).length, 1, "deduped per session+model");
+    // A DIFFERENT session on the SAME ceiling-less model gets its OWN warn
+    // (#3071 path 2a: the old once-per-model dedup left the second session silent).
+    const sOther = metaSession("other");
+    restoreOutputBudget({ max_tokens: 1, tools, model: A }, sOther, log);
     warns = lines.filter((l) => l.includes("NO known output ceiling"));
-    assert.equal(warns.length, 2, "per-model, not global");
-    assert.match(warns[1] ?? "", /forwarded verbatim/, "born-starved (no water yet) says so");
-    assert.equal((metaSession("other").metadata as Record<string, unknown>).outputBudgetHighWater, undefined);
+    assert.equal(warns.length, 2, "per-session, not per-model (#3071)");
+    assert.match(warns[1] ?? "", /\[other\]/, "names the affected session");
+    assert.equal(sOther.metadata.outputBudgetHighWater, undefined, "the starved branch does not seed a high-water");
     // With a usable ceiling → no warn at all (the floor note rides on the info line).
     _resetNoOutputCeilingWarningsForTest();
     lines.length = 0;
     const s2 = metaSession("capped");
-    restoreOutputBudget({ max_tokens: 583, model: "capped/model" }, s2, log);
+    restoreOutputBudget({ max_tokens: 583, model: "capped/model" }, s2, log, 32768);
     const capped = { max_tokens: 1, tools, model: "capped/model" } as { max_tokens: number };
     restoreOutputBudget(capped, s2, log, 32768);
     assert.equal(capped.max_tokens, 32768, "ceiling lifts the death rattle");
@@ -195,19 +205,21 @@ test("restoreOutputBudget: warns once per model when no output ceiling backs the
     assert.ok(lines.some((l) => l.includes("high-water 583 below known output ceiling — floored (#1665/#1840)")), "floored info note present");
 });
 
-test("restoreOutputBudget: tracks the no-ceiling degraded state for the user-visible surfaces (#2904)", () => {
+test("restoreOutputBudget: tracks the no-ceiling degraded state for the user-visible surfaces (#2904/#3071)", () => {
     const tools = [{ name: "t" }];
-    // Ceiling-less starved restore SEEDS the marker; healthy learning does not.
+    // A non-starved value is trusted verbatim and sets NO marker; a STARVE is
+    // what records the no-ceiling degraded state (floored to the absolute minimum).
     const s = metaSession("deg");
     restoreOutputBudget({ max_tokens: 249, model: "prov/deepseek-flash" }, s, noopLog);
-    assert.equal(s.metadata.outputBudgetDegraded, undefined, "healthy-value learning (249>200) sets no marker");
+    assert.equal(s.metadata.outputBudgetHighWater, 249, "non-starved learning tracked verbatim");
+    assert.equal(s.metadata.outputBudgetDegraded, undefined, "healthy-value learning sets no marker");
     const starved = { max_tokens: 16, tools, model: "prov/deepseek-flash" } as { max_tokens: number };
     restoreOutputBudget(starved, s, noopLog);
-    assert.equal(starved.max_tokens, 249, "starved 16 restored to the 249 water mark (#2904 repro)");
+    assert.equal(starved.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "starved 16 restored to the absolute floor (#3071)");
     const deg = s.metadata.outputBudgetDegraded as { model: string; value: number; ts: number } | undefined;
     assert.ok(deg !== undefined, "ceiling-less starved restore records the degraded state");
     assert.equal(deg!.model, "prov/deepseek-flash");
-    assert.equal(deg!.value, 249, "records what was actually forwarded (the restored target)");
+    assert.equal(deg!.value, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "records what was actually forwarded (the restored target)");
     assert.equal(typeof deg!.ts, "number");
     // A usable ceiling appearing CLEARS the marker (the pin is resolved).
     const capped = { max_tokens: 1, tools, model: "prov/deepseek-flash" } as { max_tokens: number };
@@ -225,10 +237,71 @@ test("restoreOutputBudget: tracks the no-ceiling degraded state for the user-vis
     restoreOutputBudget({ max_tokens: 10, tools, model: "prov/model-a" }, sB, noopLog);
     restoreOutputBudget({ max_tokens: 10, tools, model: "prov/model-b" }, sB, noopLog);
     assert.equal((sB.metadata.outputBudgetDegraded as { model?: string })?.model, "prov/model-b", "last starved model wins the single slot");
-    // Born-starved (no high-water yet): value is the raw verbatim-forwarded budget.
+    // Born-starved (no high-water yet, no ceiling): floored to the absolute minimum —
+    // never recorded as a verbatim-forwarded rattle (#3071 path 2b).
     const sC = metaSession("bornDead");
     restoreOutputBudget({ max_tokens: 16, tools, model: "prov/cold" }, sC, noopLog);
-    assert.equal((sC.metadata.outputBudgetDegraded as { value?: number })?.value, 16, "no high-water → records the verbatim-forwarded value");
+    assert.equal((sC.metadata.outputBudgetDegraded as { value?: number })?.value, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "no high-water + no ceiling → records the floored value");
+});
+
+test("restoreOutputBudget: #3071 absolute floor stops the ceiling-less death spiral end-to-end", () => {
+    const tools = [{ name: "t" }];
+    const s = metaSession("spiral");
+    // The observed decay (v0.1.195, model ark-code-latest, no declared output
+    // ceiling): each NON-starved turn the client's raw-history estimate shrinks
+    // further. Those are trusted verbatim and drive the high-water down to a
+    // death rattle — exactly the poisoned state the old restore target pinned on.
+    for (const v of [41753, 3071, 2061, 252]) {
+        const body = { max_tokens: v, tools, model: "ark-code-latest" };
+        restoreOutputBudget(body, s, noopLog);
+        assert.equal(body.max_tokens, v, `non-starved ${v} is trusted verbatim`);
+    }
+    assert.equal(s.metadata.outputBudgetHighWater, 252, "high-water decayed to the poison (last non-starved wins)");
+    // Once fully starved (<=200), every restore must hit the absolute minimum —
+    // NOT the poisoned high-water of 252 that pinned the old behavior.
+    for (let i = 0; i < 8; i += 1) {
+        const body = { max_tokens: 1, tools, model: "ark-code-latest" };
+        restoreOutputBudget(body, s, noopLog);
+        assert.equal(body.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, `starved turn ${i} floored to the absolute minimum, not 252`);
+    }
+});
+
+test("restoreOutputBudget: #3071 fork-inherited rattle is floored; a healthy value still wins", () => {
+    const tools = [{ name: "t" }];
+    // Path 2b: a fresh fork child inherits the parent's starved budget with no
+    // high-water of its own and no known ceiling — the old code forwarded it
+    // verbatim (max_tokens=1 out the door). It is now always floored.
+    const child = metaSession("fork-child");
+    const inherited = { max_tokens: 1, tools, model: "ark-code-latest" };
+    restoreOutputBudget(inherited, child, noopLog);
+    assert.equal(inherited.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "fork-inherited starved budget is floored, not forwarded verbatim (#3071 path 2b)");
+    // The floor is a LOWER bound only — a genuinely-healthy value above it is not
+    // over-floored and sets no degraded marker.
+    const healthy = metaSession("healthy");
+    const big = { max_tokens: 32768, model: "ark-code-latest" };
+    restoreOutputBudget(big, healthy, noopLog);
+    assert.equal(big.max_tokens, 32768, "a value above the floor passes through untouched");
+    assert.equal(healthy.metadata.outputBudgetDegraded, undefined, "a healthy value sets no degraded marker");
+});
+
+test("restoreOutputBudget: #3071 leaves the ceiling-known behavior unchanged (regression guard)", () => {
+    const tools = [{ name: "t" }];
+    // With a usable ceiling the client's small NON-starved value is trusted (not
+    // raised by the absolute minimum) — only the starved branch consults it.
+    const s = metaSession("ceiling-guard");
+    const small = { max_tokens: 252, model: "capped/model" };
+    restoreOutputBudget(small, s, noopLog, 131072);
+    assert.equal(small.max_tokens, 252, "ceiling-known: a small non-starved value is trusted, not floored (#3071 scope)");
+    assert.equal(s.metadata.outputBudgetHighWater, 252, "high-water tracks the client's own value when a ceiling exists");
+    const starved = { max_tokens: 1, tools, model: "capped/model" };
+    restoreOutputBudget(starved, s, noopLog, 131072);
+    assert.equal(starved.max_tokens, 131072, "ceiling-known starve still restores to the ceiling");
+    // A known ceiling BELOW the absolute minimum must win un-raised — the floor
+    // bounds only a CEILING-LESS restore, never overrides a smaller declared cap.
+    const sCap = metaSession("small-cap");
+    const cappedSmall = { max_tokens: 1, tools, model: "small/cap" };
+    restoreOutputBudget(cappedSmall, sCap, noopLog, 4096);
+    assert.equal(cappedSmall.max_tokens, 4096, "known ceiling below the absolute floor is honored, not over-floored (#3071 scope)");
 });
 
 test("resolveKnownOutputCeiling: runtime-info > launcher > declared > registry rank order (#1840)", () => {
@@ -593,12 +666,14 @@ test("e2e: starved tool-carrying main request re-enters pipeline at restored bud
         const tools = [{ name: "compress", description: "compress", input_schema: { type: "object", properties: {} } }];
 
         // Healthy main turn WITH tools: teaches the session its output budget.
-        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 1024, stream: true, tools, messages: mainConversation(8) }) });
+        // Above OUTPUT_RESTORE_ABSOLUTE_FLOOR so this exercises the high-water
+        // path, not the #3071 ceiling-less floor.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 49152, stream: true, tools, messages: mainConversation(8) }) });
         assert.equal(r1.status, 200);
         await r1.text();
         const s1 = getSession(SESSION);
         const requestsAfterMain1 = s1.stats.requests;
-        assert.equal(s1.metadata.outputBudgetHighWater, 1024, "high-water learned from the healthy main turn");
+        assert.equal(s1.metadata.outputBudgetHighWater, 49152, "high-water learned from the healthy main turn");
 
         // Death-spiral turn: the client shrank the budget to 16 tokens off its
         // raw-history estimate. The request still carries tools → it is a MAIN
@@ -609,7 +684,7 @@ test("e2e: starved tool-carrying main request re-enters pipeline at restored bud
         await r2.text();
         const s2 = getSession(SESSION);
         assert.ok(s2.stats.requests > requestsAfterMain1, "starved main turn must go through the pipeline, not side passthrough");
-        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 1024, "upstream received the restored budget (#546)");
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 49152, "upstream received the restored budget (#546)");
 
         // A real side request (no tools, tiny budget) on the same session stays
         // a pure passthrough: budget NOT restored, kernel untouched.

@@ -47,13 +47,6 @@ export function defaultConfig(
       enabled: false,
       minReduction: 0.1,
     },
-    imageCompression: {
-      enabled: false,
-      minTokens: 512,
-      maxDimension: 1280,
-      quality: 80,
-      format: "webp",
-    },
     ccr: {
       enabled: false,
       toolName: "acp_retrieve",
@@ -73,9 +66,6 @@ export function defaultConfig(
       ? { ...base.absorb, ...overrides.absorb }
       : base.absorb,
     crush: overrides.crush ? { ...base.crush, ...overrides.crush } : base.crush,
-    imageCompression: overrides.imageCompression
-      ? { ...base.imageCompression, ...overrides.imageCompression }
-      : base.imageCompression,
     ccr: overrides.ccr ? { ...base.ccr, ...overrides.ccr } : base.ccr,
   };
 }
@@ -204,35 +194,6 @@ export function validateConfig(config: Config): string[] {
           );
         }
       }
-    }
-  }
-  if (config.imageCompression) {
-    const ic = config.imageCompression;
-    if (
-      ic.minTokens !== undefined &&
-      (!Number.isFinite(ic.minTokens) || ic.minTokens < 0)
-    ) {
-      errors.push("imageCompression.minTokens must be finite and >= 0");
-    }
-    if (
-      ic.maxDimension !== undefined &&
-      (!Number.isInteger(ic.maxDimension) || ic.maxDimension < 16)
-    ) {
-      errors.push("imageCompression.maxDimension must be an integer >= 16");
-    }
-    if (
-      ic.quality !== undefined &&
-      (!Number.isFinite(ic.quality) || ic.quality < 1 || ic.quality > 100)
-    ) {
-      errors.push("imageCompression.quality must be in [1, 100]");
-    }
-    if (
-      ic.format !== undefined &&
-      ic.format !== "webp" &&
-      ic.format !== "jpeg" &&
-      ic.format !== "png"
-    ) {
-      errors.push('imageCompression.format must be "webp", "jpeg", or "png"');
     }
   }
   if (config.ccr) {

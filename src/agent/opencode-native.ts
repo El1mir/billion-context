@@ -28,10 +28,16 @@
 // and re-probe only after HEALTH_PROBE_TTL_MS, so a healthy proxy costs no
 // per-request RTT and a dead one is found within at most one TTL. If no origin
 // can be made healthy the request goes DIRECT (uncompressed) and a one-time
-// stderr warning fires — recovery is automatic once a proxy is healthy again
-// (no permanent latch; re-checked at least every TTL). Bootstrap retries are
-// rate-limited to one attempt per RESPAWN_COOLDOWN_MS so a persistently
-// failing spawn does not become a per-request spawn storm.
+// diagnostic lands in bili.log — EXCEPT when the body provably exceeds the
+// model's context window: per the #2924 ruling (always compress OR always
+// refuse) such a request is refused locally with a host-visible retryable
+// error instead of riding the direct fallback into a guaranteed upstream 400
+// (#3308 — on an over-window session history that 400 then repeats on every
+// later turn until restart). Unknown window/body keeps the fail-open.
+// Recovery is automatic once a proxy is healthy again (no permanent latch;
+// re-checked at least every TTL). Bootstrap retries are rate-limited to one
+// attempt per RESPAWN_COOLDOWN_MS so a persistently failing spawn does not
+// become a per-request spawn storm.
 //
 // Skipped when opted out (BILI_NATIVE_OPENCODE=0 / BILLION_CONTEXT_PLUGIN=0)
 // or when a `bili` /bili/ launch owns routing (BILI_PROVIDER_REWRITES). A
@@ -70,7 +76,8 @@ import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
+import { INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalAck, markIncrementalDead, planIncrementalTurn, probeIncrementalTurns, clearIncrementalProbe, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
@@ -101,6 +108,35 @@ export function planNativeOpencode(env: NodeJS.ProcessEnv): { mode: "off" | "att
 
 export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 
+/** #3308: client-side mirror of #2924's refuse-oversized arm for this lane
+ *  (the V2 route has no takeover gate to carry it). Returns a host-visible
+ *  refusal when the proxy is unavailable AND the body provably cannot fit the
+ *  model's context window — the FLOOR estimate (bytes/4) already exceeds the
+ *  window, and #2924's ledger evidence says real bodies run ABOVE the floor
+ *  (calibratedEstimate ~1.14), so the comparison cannot false-refuse. Unknown
+ *  model, unknown window, unreadable or absent body all return undefined and
+ *  keep the documented fail-open direct send. The size is measured through a
+ *  CLONE — the original Request must stay sendable (#2496 discipline). */
+async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State): Promise<Error | undefined> {
+    const model = e.model;
+    if (model === undefined || typeof model.providerID !== "string" || typeof model.id !== "string") return undefined;
+    const window = s.windows?.get(`${model.providerID}/${model.id}`);
+    if (window === undefined || !Number.isFinite(window) || window <= 0) return undefined;
+    const req = e.request as Request | undefined;
+    if (req === null || typeof req !== "object" || typeof req.clone !== "function") return undefined;
+    let bytes: number;
+    try {
+        bytes = (await req.clone().arrayBuffer()).byteLength;
+    } catch {
+        return undefined;
+    }
+    const floorTokens = Math.ceil(bytes / 4);
+    if (floorTokens <= window) return undefined;
+    return new Error(
+        `bili: proxy unavailable and this request cannot be sent uncompressed — body ~${floorTokens} tok (floor estimate ${bytes}B/4) exceeds the ${model.providerID}/${model.id} context window (${window}); upstream would reject it. Recovery is automatic (#3308); retry shortly, or start a fresh session if the local history has outgrown the window.`,
+    );
+}
+
 /** Build the native-mode route callback consumed by createOpencodeV2Setup.
  *  #1135: spawn and attach share ONE liveness gate — attach arms
  *  state.respawn (verifyAttachAndRecover), so a dead external proxy is
@@ -109,6 +145,7 @@ export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNativeRouteDeps = {}): (e: V2HttpRequestEvent, s: V2State) => Promise<void> {
     const resolveLive = createLiveOriginResolver(state, deps);
     let warned = false;
+    let refusedNoticed = false;
     // #1958: conflicting pre-routed config is exposed once per (session, origin).
     const conflictWarned = new Set<string>();
     return async (e, s) => {
@@ -150,6 +187,18 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
 
         const target = await resolveLive();
         if (target === undefined) {
+            // #3308: a direct send that provably cannot fit the window is not
+            // "availability" — refuse it locally (#2924 ruling) instead of
+            // handing upstream a request that can only 400.
+            const refusal = await oversizeDirectRefusal(e, s);
+            if (refusal !== undefined) {
+                if (!refusedNoticed) {
+                    refusedNoticed = true;
+                    logHostEvent("error", "[native-client]", `bili-native-opencode: proxy unavailable — model request refused locally instead of going direct into a guaranteed upstream 400 (#3308): ${refusal.message}`);
+                }
+                s.proxyBase = undefined;
+                throw refusal;
+            }
             if (!warned) {
                 warned = true;
                 logHostEvent("error", "[native-client]", "bili-native-opencode: proxy unavailable — model requests go direct (uncompressed)");
@@ -777,4 +826,84 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     return createV1ServerHooks(() => state.origin, ctx, { z, legacy });
 };
 
-export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state) }), server };
+export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode }), server };
+
+/** #3248 phase 2: incremental-turn divert for opencode. Runs LAST in the
+ *  http.request hook (routing + header stamping already happened, so the
+ *  stamped plugin headers ride the SAME request object we replace). The
+ *  conversation id is opencode's own session id (x-bili-plugin-conversation
+ *  was just stamped with it — identity upgrades, never forks). One planned
+ *  in-flight request per URL: concurrent sessions on the same provider fall
+ *  back to full resend (ack attribution must stay unambiguous — onResponse
+ *  is keyed by URL). Exported for the native suites; wired above. */
+export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State): Promise<void> {
+    try {
+        const sid = typeof e.sessionID === "string" ? e.sessionID : "";
+        const base = s.proxyBase;
+        const req = e.request as Request | undefined;
+        if (!sid || !base || req === undefined || typeof req.clone !== "function") return;
+        const url = req.url;
+        const stale = incPendingOpencode.get(url);
+        if (stale !== undefined && Date.now() - stale.at < INC_PENDING_TTL_MS) return; // single in-flight per URL
+        incPendingOpencode.delete(url);
+        const body: unknown = await req.clone().json().catch(() => null);
+        if (body === null || typeof body !== "object") return;
+        const b = body as { messages?: unknown; model?: unknown; system?: unknown };
+        if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
+        if (!(await probeIncrementalTurns(base))) return;
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
+        if (plan.mode === "skip") return;
+        replaceRequestPayload(e, plan.body, { [INCREMENTAL_TURN_MARKER_HEADER]: "1" });
+        incPendingOpencode.set(url, { sid, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
+    } catch {
+        // never break the host's request on adapter failure
+    }
+}
+
+interface IncrementalPendingTurn {
+    sid: string;
+    messages: IncrementalWireMessage[];
+    system: unknown;
+    base: string;
+    at: number;
+}
+
+/** Planned turns age out: onResponse only fires on a SUCCESSFUL send, so a
+ *  request that died network-level would otherwise block incremental for its
+ *  URL forever (single in-flight guard). 30s covers any sane model round-trip
+ *  while keeping concurrent-request attribution unambiguous. */
+const INC_PENDING_TTL_MS = 30_000;
+
+const incPendingOpencode = new Map<string, IncrementalPendingTurn>();
+
+/** Test hook: drop all planned turns (the map is module state across suites). */
+export function __resetOpencodeIncrementalForTests(): void {
+    incPendingOpencode.clear();
+}
+
+/** Ack collector registered on the module's NativeInterceptState: the
+ *  model-API and routed branches both fire onResponse(url, resp) after a
+ *  successful send. Exported for the native suites; wired below. */
+export function opencodeIncrementalOnResponse(url: string, response: Response): void {
+    const pending = incPendingOpencode.get(url);
+    if (pending === undefined) return; // non-incremental responses just clear nothing
+    incPendingOpencode.delete(url);
+    try {
+        const seq = response.headers.get("x-bili-applied-seq");
+        if (response.status === 200 && seq !== null && Number.isFinite(Number(seq))) {
+            noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
+            return;
+        }
+        if (response.status === 409 || response.status === 503) {
+            // Lane rejected the plan (seq mismatch / disabled): this conversation
+            // falls back to full resend until the state machine revives it.
+            markIncrementalDead(pending.sid);
+            if (response.status === 503) clearIncrementalProbe(pending.base);
+            logHostEvent("warn", "[native-client]", `[opencode] incremental turn rejected (${response.status}) — conversation ${pending.sid} falls back to full resend (#3248)`);
+        }
+    } catch {
+        // observability only
+    }
+}
+
+state.onResponse = opencodeIncrementalOnResponse;

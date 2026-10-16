@@ -245,11 +245,14 @@ pure-stdlib Python module shipped inside the npm package:
 - **Plugin-mode stamping:** an `llm_request` middleware stamps
   `x-bili-plugin: hermes` + conversation id (= the hermes session id, so
   gateway multi-session stays safe) + model, and `x-bili-plugin-max-output`
-  once known — ONLY after the ACP tools are registered against the live proxy
-  manifest; round 1 rides wire mode. A `pre_api_request` hook captures the
-  effective `max_tokens` and pushes runtime-info (model + max output) to the
-  proxy. `compress` / `decompress` / `acp_status` are registered as real
-  hermes tools served by the proxy's existing plugin endpoints.
+  once known — plus `x-bili-plugin-context-window` when the host's own
+  per-model window is known (read from `HERMES_HOME/context_length_cache.yaml`,
+  keyed `<model>@<base_url>`; ambiguous entries are never guessed, #3261) —
+  ONLY after the ACP tools are registered against the live proxy manifest;
+  round 1 rides wire mode. A `pre_api_request` hook captures the effective
+  `max_tokens` and pushes runtime-info (model + max output + context window)
+  to the proxy. `compress` / `decompress` / `acp_status` are registered as
+  real hermes tools served by the proxy's existing plugin endpoints.
 - **Known limitations:** requests going out hermes' Codex-wire transport may
   drop the per-request header surface, so such setups stay in wire mode until
   that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set
@@ -453,9 +456,11 @@ says so rather than editing a switch value the user set. Uninstall deletes only
 bili's own entry and file, and keeps the skill directory when the user has other
 files in it.
 
-`bili service install` registers a per-user Windows Task Scheduler logon task
-for a persistent proxy. `bili service status|restart|enable|disable|remove`
-manage it; unsupported platforms and failed registration are reported explicitly.
+`bili service install` registers a persistent per-user proxy service — a Task
+Scheduler logon task on Windows, a systemd user unit on Linux; other platforms
+report that the service is unsupported and the manual postures still work.
+`bili service status|restart|enable|disable|remove` manage it; failed
+registration is reported explicitly.
 When the proxy is down, Codex's configured URL remains loopback and requests
 fail at the local endpoint; there is no direct-upstream fallback. `bili doctor`
 reports `proxy-ready`, `configured`, `verified`, `bypassed`, or `unknown`.
@@ -840,7 +845,7 @@ file (2.x rejects bare file paths in the config `plugin` array); **1.x**
 hosts get the bare file path.
 
 What the plugin does (both generations): registers the bili tools natively
-in-host — compress / decompress / search_context / acp_status (+ absorb) —
+in-host — compress / decompress / search_context / acp_status —
 and stamps the proxy headers on every outgoing provider request, including
 context-window / max-output read from the host's own model catalog
 (`ctx.catalog.model.list()`, refreshed every 60s) and reported to the proxy

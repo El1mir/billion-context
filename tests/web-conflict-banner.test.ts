@@ -19,16 +19,16 @@ type LatestEntry = { kind: string; detail?: string; at?: number; sessionId?: str
 type BannerInput = { events?: number; sessions?: number; active?: number; historical?: number; kinds?: Record<string, number>; latest?: LatestEntry[] };
 // #2545: displayOnly/activeConfirmed are additive payload fields from summarizeConflicts.
 type SeverityInput = BannerInput & { sibling?: number; suspected?: number; displayOnly?: number; activeConfirmed?: number };
-interface Severity { onKey: string; riskKey: string; hasConfirmed: boolean; siblingOnly?: boolean; neutralOnly?: boolean; showHints?: boolean; what: string; active: number; activeConfirmed: number }
+interface Severity { onKey: string; riskKey: string; hasConfirmed: boolean; siblingOnly?: boolean; neutralOnly?: boolean; landed?: boolean; signalN?: number; showHints?: boolean; what: string; active: number; activeConfirmed: number }
 
 // Both helpers share the same extracted slice (they sit together in WEB_CLIENT);
 // the slice ends at the first window.* export so no `window` reference runs under Node.
-function _extract(): { line: (c: BannerInput) => string; severity: (c: SeverityInput) => Severity } {
+function _extract(): { line: (c: BannerInput) => string; severity: (c: SeverityInput) => Severity; dismissed: (c: { events: number; lastAt?: number | null }, stored: unknown) => boolean } {
     const s = WEB_CLIENT.indexOf(START_MARK);
     const e = WEB_CLIENT.indexOf(END_MARK);
     assert.ok(s >= 0 && e > s, "conflict-banner helpers missing from WEB_CLIENT");
-    const src = WEB_CLIENT.slice(s, e) + "\nreturn { line: bili_conflictLine, severity: bili_conflictSeverity };";
-    return new Function(src)() as { line: (c: BannerInput) => string; severity: (c: SeverityInput) => Severity };
+    const src = WEB_CLIENT.slice(s, e) + "\nreturn { line: bili_conflictLine, severity: bili_conflictSeverity, dismissed: bili_conflictDismissed };";
+    return new Function(src)() as { line: (c: BannerInput) => string; severity: (c: SeverityInput) => Severity; dismissed: (c: { events: number; lastAt?: number | null }, stored: unknown) => boolean };
 }
 function bannerLine(): (c: BannerInput) => string { return _extract().line; }
 function bannerSeverity(): (c: SeverityInput) => Severity { return _extract().severity; }
@@ -307,4 +307,60 @@ test("#2969 confirmed and unconfirmed-signal ledgers keep the per-client hints (
     assert.strictEqual(mixed.showHints, true, "a single signal event keeps the hints alongside suspected names");
     const oldPayload = sev({ events: 96, kinds: { "third-party-plugin": 96 }, active: 96 });
     assert.strictEqual(oldPayload.showHints, true, "pre-#2324 payloads degrade to the all-confirmed view WITH hints");
+});
+
+// ---------------------------------------------------------------------------
+// #3235: the banner is an ALARM for interception failure — only LANDED-
+// UNRECOVERED evidence pops. Suspected-tier stock stays recorded but quiet,
+// and a persisted dismissal quiets the banner until a newer event re-arms it.
+
+test("#3235 landed tier: suspected-only stock never alarms (landed=false, banner hidden)", () => {
+    const sev = bannerSeverity();
+    const r = sev({ events: 96, sessions: 96, kinds: { "third-party-plugin": 96 }, sibling: 0, suspected: 96, active: 96, historical: 0 });
+    assert.strictEqual(r.hasConfirmed, false);
+    assert.strictEqual(r.landed, false, "co-residence alone is not interception failure");
+    assert.strictEqual(r.signalN, 0);
+});
+
+test("#3235 landed tier: confirmed third-party and inferred-native landings alarm (landed=true)", () => {
+    const sev = bannerSeverity();
+    const tp = sev({ events: 10, kinds: { "third-party-plugin": 10 }, suspected: 0, active: 5 });
+    assert.strictEqual(tp.landed, true);
+    const inferred = sev({ events: 4, kinds: { "native-compaction-inferred": 4 }, active: 4 });
+    assert.strictEqual(inferred.hasConfirmed, true, "inferred native landing is confirmed-class evidence");
+    assert.strictEqual(inferred.landed, true);
+});
+
+test("#3235 landed tier: recovered-only ledger stays quiet; a rewrite signal alone alarms", () => {
+    const sev = bannerSeverity();
+    const recovered = sev({ events: 7, kinds: { "native-compaction": 7 }, active: 7 });
+    assert.strictEqual(recovered.landed, false, "intercepted+rebased is interception SUCCESS — no alarm");
+    const rewrite = sev({ events: 1, kinds: { "unannounced-rewrite": 1 }, active: 1 });
+    assert.strictEqual(rewrite.signalN, 1);
+    assert.strictEqual(rewrite.landed, true, "an observed history rewrite is a landed event by definition");
+});
+
+test("#3235 banner gate + dismiss + report buttons wired in the client source", () => {
+    assert.ok(WEB_CLIENT.includes("sev0.landed && !dismissed"), "gate requires landed-unrecovered evidence and no live dismissal");
+    assert.ok(WEB_CLIENT.includes('id="conflicts-dismiss-btn"'), "dismiss button rendered on the banner");
+    assert.ok(WEB_CLIENT.includes('t("conflict.dismiss")'), "dismiss button localized");
+    assert.ok(WEB_CLIENT.includes('attachReportButtons("conflict-banner", cb)'), "banner rides the #3040 report wiring");
+    assert.ok(WEB_CLIENT.includes("biliConflictDismiss"), "dismissal watermark persisted in localStorage");
+});
+
+test("#3235 dismissal watermark: hides only while no newer event exists", () => {
+    const d = _extract().dismissed;
+    // nothing stored -> banner shows
+    assert.strictEqual(d({ events: 4, lastAt: 200 }, null), false);
+    assert.strictEqual(d({ events: 4, lastAt: 200 }, "garbage"), false);
+    assert.strictEqual(d({ events: 4, lastAt: 200 }, { lastAt: "x", events: 4 }), false);
+    // same watermark -> dismissed
+    assert.strictEqual(d({ events: 4, lastAt: 200 }, { lastAt: 200, events: 4 }), true);
+    // fewer events now (ledger cleared) -> stays dismissed
+    assert.strictEqual(d({ events: 0, lastAt: 0 }, { lastAt: 200, events: 4 }), true);
+    // NEW event (newer timestamp, more events) -> re-arms the alarm
+    assert.strictEqual(d({ events: 5, lastAt: 900 }, { lastAt: 200, events: 4 }), false);
+    // lastAt missing on the wire -> fall back to the event count only
+    assert.strictEqual(d({ events: 4 }, { lastAt: 200, events: 4 }), true);
+    assert.strictEqual(d({ events: 5 }, { lastAt: 200, events: 4 }), false);
 });

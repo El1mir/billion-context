@@ -4,9 +4,13 @@ import { BLOCKED_REF, orderedRefPair, refForRaw } from "./refs.js";
 import { countMessageTokens } from "./tokenize.js";
 import { segmentGroups } from "./segment.js";
 import { isLiveCheckpointCarrier } from "./state.js";
+import { computeProtectedRefs } from "./recommend.js";
+import { collectCoverage, projectUnit } from "./unit-projection.js";
+import type { UnitProjection } from "./unit-projection.js";
 import type {
   CompressionBlock,
   CompressionState,
+  Config,
   CoreMessage,
 } from "./types.js";
 
@@ -171,6 +175,15 @@ export interface StatusReportOptions {
   sort?: "size" | "time" | "tool" | "age";
   limit?: number;
   meta?: StatusReportMeta;
+  /** #3236: when both this and `originalMessages` are given, the
+   * uncompressed range rows are screened through the SAME projection
+   * applySingleRange executes and doomed rows get a ⚠ flag (diagnostic view —
+   * rows are flagged, never dropped). Omit both for legacy output. */
+  config?: Config;
+  /** #3236: the exact array class applyCompression runs on (see
+   * ProcessTurnInput.applyView). Screening is skipped without it — projecting
+   * on the render view would judge a different array class than execute. */
+  originalMessages?: CoreMessage[];
 }
 
 export function buildStatusReport(
@@ -210,7 +223,15 @@ export function buildStatusReport(
     if (view === "messages") {
       return renderMessageDrilldown(visible, toolFilter, sort, limit);
     }
-    return renderUncompressedRanges(visible, sort, limit);
+    return renderUncompressedRanges(
+      visible,
+      sort,
+      limit,
+      state,
+      countTokens,
+      options.config,
+      options.originalMessages,
+    );
   }
 
   return renderOverview(
@@ -333,6 +354,10 @@ function renderUncompressedRanges(
   visible: VisibleMessageInfo[],
   sort: string,
   limit: number,
+  state: CompressionState,
+  countTokens: (t: string) => number,
+  config?: Config,
+  original?: CoreMessage[],
 ): string {
   const lines: string[] = [];
   const totalTokens = visible.reduce((s, m) => s + m.tokens, 0);
@@ -391,6 +416,52 @@ function renderUncompressedRanges(
   // ordering would mis-sort equal-size ranges.
   if (sort !== "time")
     merged.sort((a, b) => b.tokens - a.tokens || a.startIndex - b.startIndex);
+  // #3236: screen displayed rows through the SAME projection applySingleRange
+  // executes so a row that would be rejected wholesale carries a ⚠ flag. The
+  // diagnostic view flags rather than drops — it must keep showing what is
+  // visible even when it is not foldable as-is. Requires the exact array class
+  // apply runs on (`original`); without it projection would judge a different
+  // array class than execute, which is the #3236 bug itself.
+  let flagFor: ((r: Merged) => string | null) | null = null;
+  if (config && original) {
+    const coverage = collectCoverage(state);
+    const protectedRefs = computeProtectedRefs(
+      original,
+      state,
+      config,
+      countTokens,
+    );
+    const splitDescOf = (p: UnitProjection): string => {
+      const parts: string[] = [];
+      if (p.splitTurnCount > 0) parts.push(`${p.splitTurnCount} turn(s)`);
+      if (p.splitPairCount > 0)
+        parts.push(`${p.splitPairCount} tool call/result pair(s)`);
+      return parts.join(" and ") || "turn structure";
+    };
+    flagFor = (r): string | null => {
+      let proj: UnitProjection;
+      try {
+        proj = projectUnit({
+          messages: original!,
+          state,
+          config,
+          startRef: r.startRef,
+          endRef: r.endRef,
+          preExistingCoverage: coverage,
+          protectedMessageIds: protectedRefs,
+        });
+      } catch {
+        return "\u26a0 not foldable: refs unresolvable";
+      }
+      if (proj.fatal?.kind === "zone")
+        return "\u26a0 not foldable: protected zone only";
+      if (proj.fatal?.kind === "split")
+        return `\u26a0 not foldable: would split ${splitDescOf(proj)}`;
+      if (proj.filteredIds.length === 0 && proj.consumedBlockIds.length === 0)
+        return "\u26a0 not foldable: nothing new to fold";
+      return null;
+    };
+  }
   lines.push(`Sorted by ${sort === "time" ? "time" : "size"}`);
   lines.push("");
   for (const r of merged.slice(0, limit)) {
@@ -400,8 +471,9 @@ function renderUncompressedRanges(
       r.count === 1
         ? r.startRef
         : orderedRefPair(r.startRef, r.endRef).join("–");
+    const flag = flagFor ? flagFor(r) : null;
     lines.push(
-      `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}`,
+      `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${flag ? `  ${flag}` : ""}`,
     );
   }
   if (merged.length > limit) {

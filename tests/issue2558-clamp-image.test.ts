@@ -83,6 +83,9 @@ test("#2558: the pre-fix formula DID clamp the same inputs (regression teeth)", 
     const oldInputEstimate = Math.max(usage, 0) + imageTokens; // 226_651, matches the report's input~226655
     const capped = clampOutputBudget(requested, oldInputEstimate, window);
     assert.ok(capped !== undefined && capped < requested, `old formula clamps (${capped} < ${requested})`);
-    // margin = ceil(226651*0.05)=11333; cap = floor(240000-226651-11333)=2016
-    assert.equal(capped, 2_016);
+    // margin = ceil(226651*0.05)=11333; naive cap = floor(240000-226651-11333)=2016.
+    // #3071 floors the emitted budget at min(4096, headroom 13349) = 4096 — the tooth
+    // still bites (the double-counted estimate still starves the clamp), just no
+    // longer below the 4096 capability minimum.
+    assert.equal(capped, 4_096);
 });

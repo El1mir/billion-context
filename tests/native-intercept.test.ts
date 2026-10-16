@@ -369,6 +369,7 @@ test("install: proxy-origin URLs are never re-proxied (self guard)", async () =>
 
 test("install: TypeError triggers one respawn + retry", async () => {
     const calls: string[] = [];
+    const responses: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
     let failNext = true;
@@ -381,7 +382,7 @@ test("install: TypeError triggers one respawn + retry", async () => {
         }
         return new Response("{}", { status: 200 });
     }) as typeof fetch;
-    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), respawn: undefined };
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"), respawn: undefined, onResponse: (u) => responses.push(u) };
     try {
         assert.equal(installNativeFetchIntercept(state), true);
         state.respawn = () => {
@@ -395,6 +396,11 @@ test("install: TypeError triggers one respawn + retry", async () => {
             "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
             "http://127.0.0.1:40009/bili/http://127.0.0.1:8199/v1/messages",
         ]);
+        // #3248: the ack channel must fire on the RECOVERED retry too, keyed
+        // by the host-requested URL — without it the incremental plan's ack
+        // is lost and the conversation degrades to full resend after one
+        // proxy blip.
+        assert.deepEqual(responses, ["http://127.0.0.1:8199/v1/messages"]);
         assert.equal(state.origin, "http://127.0.0.1:40009");
     } finally {
         globalThis.fetch = saved;
@@ -818,6 +824,7 @@ test("#1117 takeoverGate: round-1 wire mode is preserved (attributed, no headers
 test("install: routed /bili/ request against a dead attach origin recovers and reroutes (#1130)", async () => {
     const calls: string[] = [];
     const dispatches: string[] = [];
+    const responses: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
     globalThis.fetch = (async (input: string | URL | Request) => {
@@ -838,6 +845,7 @@ test("install: routed /bili/ request against a dead attach origin recovers and r
             return Promise.resolve("http://127.0.0.1:40009");
         },
         onDispatch: (_url, action) => dispatches.push(action),
+        onResponse: (u) => responses.push(u),
     };
     try {
         assert.equal(installNativeFetchIntercept(state), true);
@@ -857,6 +865,13 @@ test("install: routed /bili/ request against a dead attach origin recovers and r
         assert.equal(calls[2], "http://127.0.0.1:40009/bili/http://127.0.0.1:8199/v1/messages");
         assert.deepEqual(dispatches, ["self", "retry", "retry"]);
         assert.equal(respawns, 1);
+        // #3248: the ack channel reports the host-REQUESTED url even when the
+        // send was pre-emptively rerouted to a fresh origin — consumers key
+        // their in-flight plans by the url they saw at plan time.
+        assert.deepEqual(responses, [
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+            "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+        ]);
     } finally {
         globalThis.fetch = saved;
         _resetForTest();

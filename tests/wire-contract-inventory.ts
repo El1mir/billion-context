@@ -10,7 +10,6 @@ import * as K from "acp-kernel";
 import { defaultConfig } from "acp-kernel";
 import { handlePluginManifest } from "../src/plugin.ts";
 import {
-    ABSORB_TOOL_RESPONSES,
     BILI_ACP_READONLY_TOOLS_RESPONSES,
     BILI_ACP_TOOLS_ANTHROPIC,
     BILI_ACP_TOOLS_GOOGLE,
@@ -24,7 +23,6 @@ import {
     BILI_SEARCH_CONTEXT_TOOL_GOOGLE,
     BILI_SEARCH_CONTEXT_TOOL_OPENAI,
     BILI_SEARCH_CONTEXT_TOOL_RESPONSES,
-    IMAGE_FULL_TOOL_GOOGLE,
     RULE_TOOL,
     RULE_TOOL_GOOGLE,
     RULE_TOOL_OPENAI,
@@ -76,9 +74,6 @@ function buildKernelGolden(): Record<string, unknown> {
             ABSORB_TOOL: K.ABSORB_TOOL,
             ABSORB_TOOL_OPENAI: K.ABSORB_TOOL_OPENAI,
             ABSORB_TOOL_GOOGLE: K.ABSORB_TOOL_GOOGLE,
-            IMAGE_FULL_TOOL: K.IMAGE_FULL_TOOL,
-            IMAGE_FULL_TOOL_OPENAI: K.IMAGE_FULL_TOOL_OPENAI,
-            IMAGE_FULL_TOOL_RESPONSES: K.IMAGE_FULL_TOOL_RESPONSES,
             RETRIEVE_TOOL: K.RETRIEVE_TOOL,
             RETRIEVE_TOOL_OPENAI: K.RETRIEVE_TOOL_OPENAI,
             RETRIEVE_TOOL_RESPONSES: K.RETRIEVE_TOOL_RESPONSES,
@@ -98,7 +93,6 @@ function buildKernelGolden(): Record<string, unknown> {
                 ABSORB_TOOL_NAME: K.ABSORB_TOOL_NAME,
                 RETRIEVE_TOOL_NAME: K.RETRIEVE_TOOL_NAME,
                 RULE_TOOL_NAME: K.RULE_TOOL_NAME,
-                IMAGE_FULL_TOOL_NAME: K.IMAGE_FULL_TOOL_NAME,
             },
             markers: {
                 ACP_TEXT_OPEN: K.ACP_TEXT_OPEN,
@@ -130,13 +124,11 @@ function buildBiliGolden(): Record<string, unknown> {
             decompressGoogle: BILI_DECOMPRESS_TOOL_GOOGLE,
         },
         synthesized: {
-            absorbResponses: ABSORB_TOOL_RESPONSES,
             ruleAnthropic: RULE_TOOL,
             ruleOpenAi: RULE_TOOL_OPENAI,
             ruleResponses: RULE_TOOL_RESPONSES,
             ruleGoogle: RULE_TOOL_GOOGLE,
             retrieveAcpRetrieve: retrieveToolsFor("acp_retrieve"),
-            imageFullGoogle: IMAGE_FULL_TOOL_GOOGLE,
         },
     };
 }
@@ -162,6 +154,6 @@ export function buildGoldens(): GoldenSpec[] {
         { name: "kernel.json", layer: "acp-kernel exports (pinned)", build: buildKernelGolden },
         { name: "bili.json", layer: "bili-built surfaces (compress-tool.ts)", build: buildBiliGolden },
         { name: "manifest-default.json", layer: "plugin manifest, default config", build: () => captureManifest(defaultConfig(100_000)) },
-        { name: "manifest-optin.json", layer: "plugin manifest, absorb+rules+ccr enabled", build: () => captureManifest({ ...defaultConfig(100_000), absorb: { ...K.DEFAULT_ABSORB_CONFIG, enabled: true }, rules: { enabled: true }, ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } }) },
+        { name: "manifest-optin.json", layer: "plugin manifest, rules+ccr enabled", build: () => captureManifest({ ...defaultConfig(100_000), rules: { enabled: true }, ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } }) },
     ];
 }

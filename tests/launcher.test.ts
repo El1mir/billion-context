@@ -7207,6 +7207,136 @@ test("attach diagnostics record a lifecycle-gate refusal (#1623)", async () => {
     assert.ok(diag.some((m) => m.includes("refusing to attach")), `diag was: ${JSON.stringify(diag)}`);
 });
 
+// #3200: normal candidate filtering is NOT user-actionable — it must land in
+// the durable log file only, never on the interactive terminal. Host
+// processes (pi/omp/… native lanes) never call configureLogger, so the old
+// teeLog default was terminal-only with NO file record at all. Explicit
+// debug adds exactly one controlled stderr copy for CLI contexts.
+test("default attach diagnostics go to the log file, never the terminal (#3200)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3200-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    const stderrWrites: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+        stderrWrites.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    try {
+        const inst = await findLiveAttachableInstance(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+            {
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance({ codeFingerprint: "deadbeef" }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(inst, undefined, "incompatible candidate stays skipped");
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const logFile = path.join(process.env.XDG_STATE_HOME!, "billion-context", "bili.log");
+        const content = fs.readFileSync(logFile, "utf8");
+        assert.ok(content.includes("native-attach: skip"), `log was: ${content}`);
+        assert.ok(content.includes("code-fingerprint-mismatch"), `log was: ${content}`);
+
+        // explicit debug: one controlled stderr copy, same head format as the
+        // legacy teeLog line, file record still written
+        const dbg = await findLiveAttachableInstance(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: true },
+            {
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance({ codeFingerprint: "deadbeef" }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(dbg, undefined);
+        assert.equal(stderrWrites.length, 1, `debug stderr was: ${JSON.stringify(stderrWrites)}`);
+        assert.ok(stderrWrites[0]!.includes("code-fingerprint-mismatch"), stderrWrites[0]);
+        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[info\] \[v=\d+\.\d+\.\d+\] native-attach: skip /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
+        const content2 = fs.readFileSync(logFile, "utf8");
+        assert.equal(content2.split("code-fingerprint-mismatch").length - 1, 2, "one file line per run");
+    } finally {
+        process.stderr.write = origStderrWrite;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        rmrf(home);
+    }
+});
+
+test("ensureProxyRunning non-debug: incompatible candidate skipped silently, reason in file, spawn proceeds (#3200)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3200-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgState = process.env.XDG_STATE_HOME;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+    process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.XDG_STATE_HOME = path.join(home, ".local", "state");
+    const stderrWrites: string[] = [];
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+        stderrWrites.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    // alive during pre-spawn discovery (a live incompatible candidate — the
+    // reported field case), dead once the spawn-wait loop re-reads it (so the
+    // #1753 pid-match fallback can settle on our own child)
+    let instPid = process.pid;
+    let spawned = 0;
+    try {
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42434, watchdog: { armed: true } }),
+                readInstanceFile: () => recordedInstance({ lane: "opencode", codeFingerprint: "deadbeef", pid: instPid }),
+                spawnImpl: () => {
+                    spawned++;
+                    instPid = 99999999;
+                    return makeFakeChild(42434);
+                },
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawned, 1, "no attach target → fresh proxy spawned");
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(handle.origin), `origin: ${handle.origin}`);
+        assert.equal(stderrWrites.length, 0, `terminal got bytes: ${JSON.stringify(stderrWrites)}`);
+        const content = fs.readFileSync(path.join(process.env.XDG_STATE_HOME!, "billion-context", "bili.log"), "utf8");
+        assert.ok(content.includes("native-attach: skip"), `log was: ${content}`);
+        assert.ok(content.includes("code-fingerprint-mismatch"), `log was: ${content}`);
+    } finally {
+        process.stderr.write = origStderrWrite;
+        process.env.HOME = prevHome;
+        if (prevUserProfile !== undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+        if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgData;
+        if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdgState;
+        rmrf(home);
+    }
+});
+
 // #1753: the spawn-wait fallback must verify the healthy responder on the
 // preferred port is the child WE spawned. A foreign proxy squats the preferred
 // port (that is exactly why our child laddered away); trusting "healthy" alone

@@ -603,3 +603,75 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
         rmBestEffort(dir);
     }
 });
+
+test("watermark: restart handoff — the previous writer's rows and watermark do not survive (#3285)", () => {
+    const dir = tmpdir("bili-wm-handoff-");
+    try {
+        // Live saves carry the raw tail (persist.ts guardedBuild) — that is
+        // what makes a plan the complete log. Both processes save through
+        // that production shape.
+        const withRaw = (id: string, lastMessages: CoreMessage[]): [LegacySessionLike, { lastMessages: CoreMessage[] }] =>
+            [mkLegacy(id, lastMessages), { lastMessages }];
+        // Process A: ingests 10 messages, then exits mid-drain (a host
+        // restart while the old instance still flushes — the #3285 shape).
+        const a = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
+        assert.ok(a, "first process must open");
+        try {
+            const msgsA = Array.from({ length: 10 }, (_, i) => msg(i));
+            a.record(...withRaw("handoff", msgsA));
+        } finally {
+            a.close();
+        }
+        // Process B boots on the same directory. Its view is what the host
+        // resent AFTER the restart: two tail turns are gone (the desktop
+        // rebuilt history from its own store), so B's truth is shorter than
+        // what A ingested.
+        const b = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
+        assert.ok(b, "second process must open");
+        const storeB = UnifiedStore.open(path.join(dir, "index.db"));
+        try {
+            assert.equal(storeB.ingestWatermark("handoff"), null, "a foreign writer's watermark must not be inherited");
+            const view = [msg(0), msg(1), msg(2)];
+            b.record(...withRaw("handoff", view));
+            const s = stats(b);
+            assert.equal(s.deltaIngests, 0, "first save after the handoff takes the full path");
+            assert.equal(s.verifyDrift, 0, "no DIGEST DRIFT: the full path replaced A's rows");
+            assert.equal(s.verifyOk, 1, "sampled verification passes on the first ingest");
+            const rows = storeB.getMessages("handoff");
+            assert.equal(rows.length, 3, "A's orphaned rows are gone");
+            assert.deepEqual(rows.map((r) => r.msgId), ["h_msg0", "h_msg1", "h_msg2"]);
+            // Steady state resumes against B's own watermark.
+            b.record(...withRaw("handoff", [...view, msg(10)]));
+            assert.equal(stats(b).deltaIngests, 1, "post-handoff saves delta again");
+            assert.equal(stats(b).verifyDrift, 0);
+        } finally {
+            storeB.close();
+            b.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
+
+test("watermark: completeLog sweep skips lane-owned sessions (#3248/#3285)", () => {
+    const dir = tmpdir("bili-wm-lane-skip-");
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        try {
+            // Lane-owned: any "inc:" ext key marks positional consumption of the
+            // messages table — its rows must survive even when absent from the plan.
+            store.ingestSession(planIngest(mkLegacy("lane-a", [msg(0), msg(1)])));
+            store.setSessionExt("lane-a", "inc:base-seq", 2);
+            store.ingestSession(planIngest(mkLegacy("lane-a", [msg(2)])), undefined, { completeLog: true });
+            assert.deepEqual(store.getMessages("lane-a").map((r) => r.msgId), ["h_msg0", "h_msg1", "h_msg2"], "lane rows survive the sweep");
+            // Control: without a lane marker the #3285 sweep still applies.
+            store.ingestSession(planIngest(mkLegacy("plain-b", [msg(0), msg(1)])));
+            store.ingestSession(planIngest(mkLegacy("plain-b", [msg(2)])), undefined, { completeLog: true });
+            assert.deepEqual(store.getMessages("plain-b").map((r) => r.msgId), ["h_msg2"], "non-lane foreign rows swept");
+        } finally {
+            store.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});

@@ -428,8 +428,11 @@ test("#2432: per-turn nudge injection goes quiet while the compress breaker is a
     // third request sees the big report against the small baseline.
     const small = Array.from({ length: 8 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `warm-${i}-` + "z".repeat(1000) }));
     const grown = [...small, ...Array.from({ length: 48 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `grow-${i}-` + "z".repeat(1000) }))];
+    // #3177: DSH's ACP tools are host-scope (the preset agent can't reach them), so bili no
+    // longer nudges DSH at all — the breaker has nothing to silence there. Exercise it on a
+    // tool-visible plugin lane (omp) so the #2432 breaker-quenches-nudge coverage stays live.
     const post = (conv: string, messages: { role: string; content: string }[]) =>
-        fetch(chatUrl(rig), { method: "POST", headers: dshHeaders(conv), body: JSON.stringify({ model: MODEL, messages }) });
+        fetch(chatUrl(rig), { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "omp", "x-bili-plugin-conversation": conv }, body: JSON.stringify({ model: MODEL, messages }) });
     try {
         // Control: healthy session through the growth shape → nudge on turn 3.
         for (const [i, m] of [small, grown, grown].entries()) {

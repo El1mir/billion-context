@@ -1,20 +1,14 @@
 import { assignRefs, highestUsedIndex, indexToRef } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
-import { prune, isSummaryMessageId } from "./prune.js";
+import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
-import {
-  advanceSurvival,
-  activeBlocks,
-  blockById,
-  isLiveCheckpointCarrier,
-} from "./state.js";
+import { advanceSurvival, activeBlocks, blockById } from "./state.js";
 import { allocateBlockId, allocateRunId, createInitialState } from "./state.js";
 import { countMessageTokens, defaultCountTokens } from "./tokenize.js";
 import { validateConfig } from "./config.js";
 import {
   BoundaryNotFoundError,
   resolveBoundaries,
-  blockVisibleInRange,
   parseBoundary,
 } from "./boundaries.js";
 import type { ResolvedRange } from "./boundaries.js";
@@ -41,13 +35,12 @@ import {
   isMessageProtectedWithPairing,
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
-import { adjustBoundariesForToolPairs } from "./tool-pairs.js";
-import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
-import { computeIntegrityWithdrawals } from "./turn-integrity.js";
+import { projectUnit, collectCoverage } from "./unit-projection.js";
 import {
   computeProtectedRefs,
   buildCompressibleRanges,
   mergeRangesToThreshold,
+  screenRecommendedUnits,
 } from "./recommend.js";
 import {
   runPipeline,
@@ -115,6 +108,13 @@ export interface ProcessTurnInput {
   /** Per-session CCR content store (pass result.contentStore back here).
    *  Omit for pre-CCR sessions — an empty store is used. */
   contentStore?: MessageContentStore;
+  /** #3236: the EXACT message array class applyCompression will run on for
+   * this lane. Hosts whose render view (`messages`) differs from the fold
+   * view (pruned separators, host-side compaction tails) pass the unpruned
+   * log here so recommendation screening and unit projection judge ranges on
+   * the same class execute will — advertised and applied can't diverge.
+   * Omit when `messages` already IS that class. */
+  applyView?: CoreMessage[];
 }
 
 export interface ApplyCompressionInput {
@@ -769,7 +769,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
     const initial: NodeIO = {
       messages: input.messages,
       state: input.state,
-      effects: {},
+      effects: { applyView: input.applyView },
     };
     // Conversion (assign-refs) and rendering (render-refs) are separate
     // concerns. Refs are always assigned; renderTags only controls which
@@ -966,10 +966,12 @@ const syncBlocksNode: PipelineNode = {
 
 const pruneNode: PipelineNode = {
   name: "prune",
-  run(io) {
+  run(io, ctx) {
     return {
       ...io,
-      messages: prune(io.messages, io.state),
+      messages: prune(io.messages, io.state, {
+        isCompressTool: ctx.config.isCompressTool,
+      }),
       // #2663: keep the pre-prune resent array reachable so recommend can
       // judge foldability on the same input class applyCompression sees.
       effects: { ...io.effects, originalMessages: io.messages },
@@ -1066,21 +1068,40 @@ const recommendNode: PipelineNode = {
       ctx.config,
       ctx.countTokens,
     );
+    // #3236: screening must judge on the exact array class applyCompression
+    // runs on — the host's applyView when provided, else the pre-prune
+    // original (#2663 integritySource), else the view itself.
+    const screenArray =
+      io.effects.applyView ?? io.effects.originalMessages ?? io.messages;
     const contextRanges = buildCompressibleRanges(
       io.messages,
       io.state,
       ctx.config,
       protectedRefs,
       ctx.countTokens,
-      io.effects.originalMessages,
+      screenArray,
     );
     const nothingToCompress = contextRanges.compressible.length === 0;
-    const recommendation: Recommendation = {
-      contextRanges,
-      recommendedRanges: mergeRangesToThreshold(
+    // #3236: re-screen each merged unit through the SAME judgment
+    // applySingleRange executes (unit-projection.ts). A unit that would be
+    // rejected wholesale (zone-only span, turn/pair split, nothing new to
+    // fold) is demoted to a gap instead of advertised — global screening
+    // alone passed turns whose partners sit in another advertised unit, so
+    // every submission of such a range threw (permanent advertise/reject
+    // loop in production).
+    const recommendedRanges = screenRecommendedUnits(
+      mergeRangesToThreshold(
         contextRanges.compressible,
         ctx.config.compress.minCompressRange,
       ),
+      screenArray,
+      io.state,
+      ctx.config,
+      computeProtectedRefs(screenArray, io.state, ctx.config, ctx.countTokens),
+    );
+    const recommendation: Recommendation = {
+      contextRanges,
+      recommendedRanges,
       nothingToCompress,
     };
     return { ...io, effects: { ...io.effects, recommendation } };
@@ -1253,218 +1274,27 @@ interface SingleRangeOutcome {
 
 function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   const warnings: string[] = [];
-  const resolved = resolveBoundaries({
-    startRef: input.spec.startRef,
-    endRef: input.spec.endRef,
+  // #3236: the pre-block sequence runs as ONE shared projection
+  // (unit-projection.ts) that the recommendation side screens with — same
+  // definition for advertise and execute; fatal errors are thrown verbatim.
+  const projection = projectUnit({
     messages: input.messages,
     state: input.state,
+    config: input.config,
+    startRef: input.spec.startRef,
+    endRef: input.spec.endRef,
+    preExistingCoverage: input.preExistingCoverage,
+    protectedMessageIds: input.protectedMessageIds,
+    warnings,
   });
-
-  // Host checkpoint carriers (#335): a host that renders its own compression
-  // summaries marks each carrier with `summaryOfBlockId`. A plain message-ref
-  // range does not go through the block-distillation path, so folding a live
-  // carrier would silently drop the previous distillation from the visible
-  // context while the result reports nothing superseded. Keep carriers of
-  // still-active blocks visible; stale carriers (block already consumed, or
-  // unknown id) fold like ordinary messages. Block-ref boundaries deliberately
-  // distill across checkpoints and keep folding carriers.
-  const plainRange = resolved.boundaryKind !== "block";
-  const liveCarrierIds = new Set<string>();
-  if (plainRange) {
-    // #2663: the selector screens with this same predicate — one definition,
-    // two call sites, so advertise/validate cannot drift apart again.
-    for (const message of input.messages) {
-      if (isLiveCheckpointCarrier(message, input.state)) {
-        liveCarrierIds.add(message.id);
-      }
-    }
-  }
-  const adjustedIds = applyPairBoundaryAdjustments(resolved, input.messages);
-  const skippedCarriers = adjustedIds.filter((id) => liveCarrierIds.has(id));
-  if (skippedCarriers.length > 0) {
-    warnings.push(
-      `Excluded ${skippedCarriers.length} checkpoint message(s) ${skippedCarriers.join(
-        ", ",
-      )} from the compression range — they carry the visible summary of still-active block(s), which a plain message-ref range does not supersede. The checkpoints stay visible; to fold them, reference the block ids (bN..bM) instead.`,
-    );
-  }
-  const rangeMessageIds = adjustedIds.filter(
-    (id) => !isSummaryMessageId(id) && !liveCarrierIds.has(id),
-  );
-
-  // Re-scan for nested blocks in the ADJUSTED range (tool-pair extension may
-  // have pulled in messages that are anchors of existing blocks).
-  if (rangeMessageIds.length > resolved.messageIds.length) {
-    const indexByMessageId = new Map<string, number>();
-    input.messages.forEach((m, i) => indexByMessageId.set(m.id, i));
-    const adjustedStart =
-      rangeMessageIds.length > 0
-        ? (indexByMessageId.get(rangeMessageIds[0]!) ?? resolved.startIndex)
-        : resolved.startIndex;
-    const adjustedEnd =
-      rangeMessageIds.length > 0
-        ? (indexByMessageId.get(rangeMessageIds[rangeMessageIds.length - 1]!) ??
-          resolved.endIndex)
-        : resolved.endIndex;
-    const nestedSeen = new Set(resolved.nestedBlockIds);
-    for (const block of activeBlocks(input.state)) {
-      if (nestedSeen.has(block.blockId)) continue;
-      if (
-        blockVisibleInRange(block, indexByMessageId, adjustedStart, adjustedEnd)
-      ) {
-        nestedSeen.add(block.blockId);
-        resolved.nestedBlockIds.push(block.blockId);
-      }
-    }
-  }
-
-  const isBlockBoundary = resolved.boundaryKind === "block";
-  const targetTier = resolveTargetTier(
-    input.state,
-    resolved.nestedBlockIds,
+  if (projection.fatal) throw projection.fatal.error;
+  const {
+    filteredIds,
+    consumedBlockIds,
+    effectiveMessageIds,
+    outputTier,
     isBlockBoundary,
-  );
-  const outputTier = isBlockBoundary
-    ? (Math.min(3, targetTier + 1) as CompressionTier)
-    : 1;
-
-  const consumedBlockIds = resolved.nestedBlockIds.filter((id) => {
-    const block = blockById(input.state, id);
-    return block?.active && block.tier === targetTier;
-  });
-
-  const effectiveMessageIds = new Set<string>(rangeMessageIds);
-  for (const consumedId of consumedBlockIds) {
-    const consumed = blockById(input.state, consumedId);
-    if (consumed) {
-      for (const id of consumed.effectiveMessageIds)
-        effectiveMessageIds.add(id);
-    }
-  }
-
-  const directMessageIds = [...effectiveMessageIds].filter(
-    (id) => !input.preExistingCoverage.has(id),
-  );
-
-  let filteredIds = filterProtectedToolMessages(
-    directMessageIds,
-    input.messages,
-    input.config,
-  );
-
-  // filterProtectedToolMessages drops protected tool calls (and their paired
-  // results) from the compressible set. They must also leave effectiveMessageIds,
-  // otherwise the block would record them as covered and hide them from view.
-  // (Bug 39: protected tool messages folded into a block.)
-  if (filteredIds.length < directMessageIds.length) {
-    const kept = new Set(filteredIds);
-    for (const id of directMessageIds) {
-      if (!kept.has(id)) effectiveMessageIds.delete(id);
-    }
-  }
-
-  const mediaExcluded = directMessageIds.filter((id) => {
-    const msg = input.messages.find((m) => m.id === id);
-    return !!msg && hasUnrecoverableMediaPayload(msg);
-  });
-  if (mediaExcluded.length > 0) {
-    warnings.push(
-      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (remote URL / file references with no stored bytes) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Inline images fold normally and stay restorable via decompress({ imageRef }).`,
-    );
-  }
-
-  // SOFT PROTECTION: the recent-N / last-user-message zone is advisory-only at
-  // compress time. Instead of failing the whole range when it brushes protected
-  // messages, exclude those messages and proceed with the rest (so the model
-  // isn't blocked when it picks a range that slightly overlaps the recent
-  // window). If excluding them empties the range entirely AND there are no
-  // consumed blocks to merge, we still fail — there is genuinely nothing to
-  // compress. `protectedMessageIds` holds REF ids (mNNNNN) from
-  // computeProtectedRefs; filteredIds holds RAW message ids, so convert via
-  // state.messageRefs.byRaw before testing membership.
-  const protectedRefs = input.protectedMessageIds;
-  const hitProtectedRaw = protectedRefs
-    ? filteredIds.filter((id) => {
-        const ref = input.state.messageRefs.byRaw[id];
-        return ref !== undefined && protectedRefs.has(ref);
-      })
-    : [];
-  if (hitProtectedRaw.length > 0) {
-    const protectedSet = new Set(hitProtectedRaw);
-    filteredIds = filteredIds.filter((id) => !protectedSet.has(id));
-    // Remove protected messages from effective coverage too, so they are NOT
-    // hidden by the new block (they must stay fully visible).
-    for (const id of hitProtectedRaw) effectiveMessageIds.delete(id);
-
-    const hitRefs = hitProtectedRaw
-      .map((id) => input.state.messageRefs.byRaw[id])
-      .filter((v): v is string => typeof v === "string");
-
-    if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
-      const recentN = input.config.preserveRecentMessages;
-      throw new Error(
-        `Range is entirely within the protected zone (the last ${recentN} messages and/or the most recent user message): ${hitRefs.join(
-          ", ",
-        )}. Adjust startId/endId to older messages.`,
-      );
-    }
-    warnings.push(
-      `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
-        ", ",
-      )} from compression range (recent/last-user zone) — they stay visible outside the new block; do not target them in another compress call.`,
-    );
-  }
-
-  // TURN-INTEGRITY GATE (#684): the protected carve above (and the protected
-  // tool filter before it) remove individual messages AFTER
-  // applyPairBoundaryAdjustments completed the range, which can split a turn.
-  // The DIRECTIONAL invariant that strict-echo providers enforce: an assistant
-  // tool-call message that survives the fold must keep its reasoning run
-  // (DeepSeek thinking mode: "reasoning_content ... must be passed back").
-  // The reverse split — reasoning + text kept while the call and result fold —
-  // leaves a valid message stream and stays allowed (#564 depends on it), so
-  // only turns whose KEPT side carries a tool-call while the FOLDED side
-  // carries the reasoning are withdrawn, entirely (all members stay visible).
-  // The same carve can also strip a call and its result onto opposite sides of
-  // the fold. Either half alone is invalid — a visible call whose result folded
-  // is an unanswered tool_call_id, a visible result whose call folded answers
-  // nothing — so those pairs are withdrawn together, both halves staying
-  // visible. Whole pairs may still fold while the turn's reasoning and text
-  // stay visible (#564).
-  //
-  // Both invariants are re-checked to a fixed point inside
-  // computeIntegrityWithdrawals: withdrawing a pair for the result half can
-  // strand a turn whose reasoning still folds and whose call now stays visible.
-  // The recommendation side calls the same helper, so it never advertises a
-  // range this gate always empties.
-  {
-    const {
-      withdrawn: withdrawIds,
-      splitTurnCount,
-      splitPairCount,
-    } = computeIntegrityWithdrawals(input.messages, effectiveMessageIds);
-    if (withdrawIds.size > 0) {
-      for (const id of withdrawIds) effectiveMessageIds.delete(id);
-      const beforeWithdraw = filteredIds.length;
-      filteredIds = filteredIds.filter((id) => !withdrawIds.has(id));
-      const splitDesc = [
-        splitTurnCount > 0 ? `${splitTurnCount} turn(s)` : null,
-        splitPairCount > 0
-          ? `${splitPairCount} tool call/result pair(s)`
-          : null,
-      ]
-        .filter((part): part is string => part !== null)
-        .join(" and ");
-      if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
-        throw new Error(
-          `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
-        );
-      }
-      warnings.push(
-        `Withdrawn ${beforeWithdraw - filteredIds.length} message(s) from compression range to keep ${splitDesc} intact (visible tool-call would lose its reasoning run or its results).`,
-      );
-    }
-  }
+  } = projection;
 
   // Livelock guard (billion-context-pi#199): a message-ref range whose entire
   // content is already owned by active block(s) — its raw ids are all covered
@@ -1554,53 +1384,6 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   return { tokens: compressedTokens, warnings };
 }
 
-function applyPairBoundaryAdjustments(
-  resolved: {
-    startIndex: number;
-    endIndex: number;
-    messageIds: string[];
-    boundaryKind: string;
-  },
-  messages: CoreMessage[],
-): string[] {
-  if (resolved.boundaryKind === "block") {
-    return resolved.messageIds;
-  }
-  // Compose tool-pair and reasoning-pair boundary adjustments to a fixpoint
-  // (≤2 passes). Reasoning may pull in a tool-call whose result tool-pairs
-  // then extends for; tool-pairs may pull in a tool-call whose preceding
-  // reasoning is then drawn in. Both only ever WIDEN the range.
-  let startIndex = resolved.startIndex;
-  let endIndex = resolved.endIndex;
-  for (let pass = 0; pass < 2; pass++) {
-    const reasoningAdjusted = adjustBoundariesForReasoningPairs(
-      startIndex,
-      endIndex,
-      messages,
-    );
-    const toolAdjusted = adjustBoundariesForToolPairs(
-      reasoningAdjusted.startIndex,
-      reasoningAdjusted.endIndex,
-      messages,
-    );
-    const changed =
-      toolAdjusted.startIndex !== startIndex ||
-      toolAdjusted.endIndex !== endIndex;
-    startIndex = toolAdjusted.startIndex;
-    endIndex = toolAdjusted.endIndex;
-    if (!changed) break;
-  }
-  if (startIndex === resolved.startIndex && endIndex === resolved.endIndex) {
-    return resolved.messageIds;
-  }
-  const ids: string[] = [];
-  for (let i = startIndex; i <= endIndex; i++) {
-    const msg = messages[i];
-    if (msg) ids.push(msg.id);
-  }
-  return ids;
-}
-
 function validateCompressionRange(
   input: SingleRangeInput,
   directMessageIds: string[],
@@ -1640,77 +1423,6 @@ function validateSummaryLength(
       `Summary too long (${summary.length} chars, max ${effectiveMax}). Strip noise — keep critical paths, decisions, errors, and code references. Or pass summaryMaxChars to increase the limit — don't lose critical info just to fit.`,
     );
   }
-}
-
-function filterProtectedToolMessages(
-  directMessageIds: string[],
-  messages: CoreMessage[],
-  config: Config,
-): string[] {
-  // Protected tool calls (and their results, paired by toolCallId) stay in
-  // visible context and are simply dropped from the compressible set. They are
-  // NOT folded into the summary — the summary reflects what the author wrote,
-  // nothing auto-appended.
-  const protectedCallIds = new Set<string>();
-  const removedIds = new Set<string>();
-  const latest = collectLatestProtected(messages, config);
-  for (const id of latest.callIds) protectedCallIds.add(id);
-  for (const msg of messages) {
-    if (isMessageProtected(msg, config) && msg.toolCallId) {
-      protectedCallIds.add(msg.toolCallId);
-    }
-  }
-
-  for (const id of directMessageIds) {
-    const msg = messages.find((m) => m.id === id);
-    if (!msg) continue;
-    if (
-      hasUnrecoverableMediaPayload(msg) ||
-      isMessageProtected(msg, config) ||
-      isMessageLatestProtected(msg, latest)
-    ) {
-      removedIds.add(id);
-      if (msg.toolCallId) protectedCallIds.add(msg.toolCallId);
-    }
-  }
-
-  for (const id of directMessageIds) {
-    if (removedIds.has(id)) continue;
-    const msg = messages.find((m) => m.id === id);
-    if (!msg) continue;
-    if (
-      msg.contentType === "tool-result" &&
-      msg.toolCallId &&
-      protectedCallIds.has(msg.toolCallId)
-    ) {
-      removedIds.add(id);
-    }
-  }
-
-  return directMessageIds.filter((id) => !removedIds.has(id));
-}
-
-function resolveTargetTier(
-  state: CompressionState,
-  nestedBlockIds: string[],
-  isBlockBoundary: boolean,
-): CompressionTier {
-  if (!isBlockBoundary) return 1;
-  if (nestedBlockIds.length === 0) return 1;
-  let minTier: CompressionTier = 3;
-  for (const id of nestedBlockIds) {
-    const block = blockById(state, id);
-    if (block && block.tier < minTier) minTier = block.tier;
-  }
-  return minTier;
-}
-
-function collectCoverage(state: CompressionState): Set<string> {
-  const coverage = new Set<string>();
-  for (const block of activeBlocks(state)) {
-    for (const id of block.effectiveMessageIds) coverage.add(id);
-  }
-  return coverage;
 }
 
 interface NudgeInput {

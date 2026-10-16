@@ -5,6 +5,14 @@ import { decodeRequestBody, DecompressedTooLargeError } from "../src/content-enc
 import { checkOutboundBody, DecodedRequestAdmission, DecodedRequestBusyError, MAX_REQUEST_BYTES, MAX_DECODED_REQUEST_BYTES, OutboundBodyTooLargeError } from "../src/request-body-budget.ts";
 import { fetchWithTimeout, _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 
+// #3128: assert the LEGACY byte-budget behavior at the old 100/200/100 MiB caps. Pin the
+// knobs to those exact values so these stay independent of the new 5 GiB shipped defaults
+// (the defaults themselves are covered by knobs-config-precedence). node --test isolates
+// each file's process, so this cannot leak into other suites.
+process.env.BILI_RECEIVE_BODY_BYTES = "104857600";
+process.env.BILI_DECODED_BODY_BYTES = "209715200";
+process.env.BILI_OUTBOUND_BODY_BYTES = "104857600";
+
 test("large decoded admission keeps normal requests free, limits two large requests, and releases idempotently", () => {
     const a = new DecodedRequestAdmission(), b = new DecodedRequestAdmission(), c = new DecodedRequestAdmission();
     try {

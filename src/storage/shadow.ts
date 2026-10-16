@@ -23,7 +23,7 @@
 
 import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
-import { resolveStorageMode, type StorageMode } from "../knobs.ts";
+import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
@@ -77,12 +77,19 @@ export class UnifiedShadow {
         env: NodeJS.ProcessEnv = process.env,
         legacyLoad?: (record: unknown) => LegacySessionLike | null,
         fileUnified?: string,
+        fileWalLimit?: number,
     ): UnifiedShadow | null {
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
+        const walLimit = resolveStorageWalJournalSizeLimit(env, fileWalLimit);
         let store: UnifiedStore;
         try {
-            store = UnifiedStore.open(`${dir}/index.db`);
+            store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            // #3285: watermark trust does not cross process boundaries — a
+            // restart-handoff overlap leaves the previous writer's rows AND
+            // watermark behind; drop them all so this process's first save
+            // per session re-establishes trust from its own view.
+            store.resetAllIngestWatermarks();
         } catch (err) {
             // #2771: a corrupt/unreadable index.db must degrade to legacy-only
             // (same shape as the encryption opt-out), never brick SessionStore
@@ -98,11 +105,12 @@ export class UnifiedShadow {
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
+        const walTag = ` [wal-cap: ${walLimit}]`;
         loggerLog(
             "info",
             mode === "full"
-                ? `[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back${engineTag}`
-                : `[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled${engineTag}`,
+                ? `[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back${engineTag}${walTag}`
+                : `[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled${engineTag}${walTag}`,
         );
         return shadow;
     }
@@ -155,7 +163,9 @@ export class UnifiedShadow {
             // a full ingest, never a corrupt one.
             if (!this.ingestDelta(legacy, hasRawTail)) {
                 const plan = planIngest(legacy);
-                this.store.ingestSession(plan);
+                // #3285: only a raw-tail plan is the complete log — that is
+                // what lets the full path sweep foreign rows as stale.
+                this.store.ingestSession(plan, undefined, { completeLog: hasRawTail });
             }
             this.stats.ingests++;
             // #3133 sampled verification: ingest integrity is already guarded
@@ -349,6 +359,15 @@ export class UnifiedShadow {
         return this.store.lookupConversation(namespace, conversationId);
     }
 
+    /** #3049: O(1) counter probe backing the persist stale-guard fast path.
+     *  Safe on a disabled sidecar? NO — call sites must check stats first
+     *  (this throws like every other pass-through; the guard treats any
+     *  failure as "no fast path" and falls back to the full envelope read). */
+    sessionCounters(sessionId: string): { requests: number; nextBlockId: number } | null {
+        this.assertLive();
+        return this.store.sessionCounters(sessionId);
+    }
+
     listConversationBindings(namespace?: string): { namespace: string; conversationId: string; sessionId: string; claimedAt: number }[] {
         this.assertLive();
         return this.store.listConversationBindings(namespace);
@@ -356,6 +375,13 @@ export class UnifiedShadow {
 
     /** Summary fast-path rows (#2960 R2.1): export/web lists serve from one
      *  SQL instead of walking + parsing every legacy file. */
+    /** #3248: raw canonical rows for the incremental lane (core-form
+     *  message JSON in seq order — exactly what planIngest interned). */
+    rawMessages(sessionId: string): { seq: number; content: string }[] {
+        this.assertLive();
+        return this.store.getMessages(sessionId).map((m) => ({ seq: m.seq, content: m.content }));
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         this.assertLive();
         return this.store.sessionSummaries();

@@ -120,6 +120,21 @@ export type ProviderRoute = {
      *  store (`billion-context.json.summary-credentials.json`) — same
      *  semantics as apiKeyEnv, for keys kept out of the environment. */
     credentialRef?: string;
+    /** #3211: per-route estimator-calibration (k̂) policy. The learned k̂ is
+     *  this route's billing reports ÷ local estimates — on a route that
+     *  INFLATES its usage reports (relay markup, non-token accounting), the
+     *  learned ratio is the inflation mark itself, and applying it to the
+     *  decision meter pins usage into the pressure band (`nudge.maxContextLimitPct`)
+     *  permanently, which bypasses growth-gate + cadence → high-frequency
+     *  small-yield fold churn (#3211). Opt-in escape hatch applied at k̂
+     *  PUBLICATION time — the learned ring stays raw and visible for audit:
+     *  - `disabled: true` — never apply a learned factor on this route
+     *    (decision meters run on the raw local estimate);
+     *  - `max: <number>` — clamp the applied factor to ≤ max (e.g. `1` =
+     *    allow deflation learning only, never inflation). Must be > 0 and ≤ 4
+     *    (higher is inert anyway — the publication clamp already caps at 4).
+     *  Invalid values reject the config load loudly (strict #1909 discipline). */
+    calibration?: { disabled?: boolean; max?: number };
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -184,11 +199,23 @@ export type CompressSettings = {
      *  be >= maxContextLimit. Maps to kernel `nudge.emergencyThresholdPct` +
      *  `truncate.threshold`. */
     emergencyThresholdPercent?: number | string;
-     /** Nudge growth magnitude in tokens — a compression nudge fires roughly
-      *  every time this many tokens become compressible. Flattens the kernel's
-      *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
-      *  `nudge.growthCap`). */
+    /** Nudge growth magnitude in tokens — a compression nudge fires roughly
+     *  every time this many tokens become compressible. Flattens the kernel's
+     *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
+     *  `nudge.growthCap`). */
     nudgeGrowthTokens?: number;
+    /** #3211: minimum reclaimable tokens a pressure-band nudge must have to
+     *  fire (usage already ≥ `maxContextLimit`). Default when unset at every
+     *  level: `max(5000, context limit × 1%)`. On routes whose decision meter
+     *  runs inflated (k̂ amplification, #3211), raising this (e.g. 50000) stops
+     *  the "fold a little each time we hit the line" churn: sub-floor pending
+     *  batches suppress the nudge (logged; truncate.threshold remains the
+     *  safety valve) so growth accumulates until one batch big enough to push
+     *  usage out of the band. An explicit 0 restores the legacy any-pending
+     *  behavior. Maps to kernel `nudge.minPressureBenefitTokens`. Deepest
+     *  level wins PER FIELD across global → provider → model, like every
+     *  other compress field. */
+    minPressureBenefitTokens?: number;
     /** Per-tier nudge growth thresholds in tokens (#2376): independent token
       *  trigger sizes for the T1/T2/T3 mass paths, e.g. keep T1 aggressive for
       *  long tasks while letting T2 distill earlier/later. Each UNSET tier
@@ -361,32 +388,6 @@ export type CompressSettings = {
      *  builtin (`default`, `lean`)]. Deepest-wins like every other field;
      *  unknown names fall back to the identity surface. Kernel >= 0.0.66. */
     promptPack?: string;
-    /** Instant tool-result absorption (kernel absorb API, acp-kernel >= 0.0.54).
-     *  When `enabled`, eligible large tool results carry a forced [ACP absorb]
-     *  instruction and the model distills them via the injected `absorb` tool;
-     *  the original output is then hidden from every wire view until the next
-     *  fold round (and its token cost is netted out of usage credits, like
-     *  compress). Maps to kernel `Config.absorb`. Off unless explicitly
-     *  enabled at some level. NOT supported on Responses marker/text-protocol
-     *  routes (no native tool surface there). */
-    absorb?: {
-        /** Enable absorb for this scope. Absent/false = off (kernel semantics). */
-        enabled?: boolean;
-        /** Tool results smaller than this many tokens never get the absorb
-         *  instruction (kernel default 1000). */
-        minToolTokens?: number;
-        /** Only emit instructions once context usage reaches this fraction of
-         *  the model window (kernel `contextThresholdPct`). Accepts a ratio
-         *  (0.5) or percent string ("50%"); 0 = size gate alone (kernel
-         *  default). */
-        contextThresholdPct?: number | string;
-        /** Tool names whose results are never absorbable (glob-suffix
-         *  patterns, e.g. "read"). Kernel default: none. */
-        excludeTools?: string[];
-        /** Rename the wire tool (default "absorb"). Must stay unique against
-         *  the client's own tool names or the agent will call its own tool. */
-        toolName?: string;
-    };
     /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
      *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
      *  ID-referenced at arrival by the kernel's ccr-store node (prune →
@@ -396,7 +397,7 @@ export type CompressSettings = {
      *  Lossless by default — a retrieve not made costs one cheap tool call,
      *  whereas a distilled-away detail is gone for good. ID-reference wins
      *  over absorb (kernel ordering). Off unless explicitly enabled at some
-     *  level. Merged sub-field-wise across the three levels like `absorb`. */
+     *  level. Merged sub-field-wise across the three levels like `prompts`. */
     ccr?: {
         /** Enable CCR for this scope. Absent/false = off (kernel semantics). */
         enabled?: boolean;
@@ -422,36 +423,11 @@ export type CompressSettings = {
      *  are all reused unchanged. Disabled or no plan state in context ⇒
      *  byte-identical output to the plain lexical ranking. Off by default;
      *  measure before enabling in shared configs. Merged sub-field-wise across
-     *  the three levels like `absorb`/`ccr`. See src/decompress-shared.ts. */
+     *  the three levels like `ccr`. See src/decompress-shared.ts. */
     search?: {
         /** Enable plan-aware re-ranking + steering for search_context.
          *  Absent/false = off (byte-identical output). */
         planAware?: boolean;
-    };
-    /** [#1095] Image pre-compression (kernel `Config.imageCompression`,
-     *  acp-kernel >= 0.0.84). When `enabled`, screenshot-like images in tool
-     *  results are downscaled ONCE at arrival before entering the wire
-     *  (kernel routing decision + recipe, host executes with optional `sharp`);
-     *  non-screenshot originals pass through byte-identical. Lossy by nature —
-     *  backstopped by the injected `image_full` tool: the model requests the
-     *  original resolution for a ref and it applies for the rest of the
-     *  session (originals cached in memory). Off unless explicitly enabled at
-     *  some level; disabled ⇒ byte-identical pass-through. Merged sub-field-wise
-     *  across the three levels like `absorb`/`ccr`. */
-    imageCompression?: {
-        /** Enable image pre-compression for this scope. Absent/false = off
-         *  (byte-identical pass-through). */
-        enabled?: boolean;
-        /** Only route images whose token estimate >= this (kernel default
-         *  512). */
-        minTokens?: number;
-        /** Longest side (px) of the downsample recipe (kernel default 1280). */
-        maxDimension?: number;
-        /** Lossy encode quality 1-100 of the downsample recipe (kernel
-         *  default 80). */
-        quality?: number;
-        /** Encode format of the downsample recipe (kernel default "webp"). */
-        format?: "webp" | "jpeg" | "png";
     };
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
@@ -471,7 +447,7 @@ export type CompressSettings = {
      *  billion-context-pi #336/#339 and opencode-acp #377). Compress turns
      *  are hard-exempt from compression, so their reasoning is otherwise an
      *  unreclaimable context floor. Merged sub-field-wise across the three
-     *  config levels like `absorb`. */
+     *  config levels like `prompts`. */
     reasoning?: {
         /** Master switch (default true). Set `drop: false` per-provider for
          *  models whose reasoning must round-trip unmodified. */
@@ -486,7 +462,7 @@ export type CompressSettings = {
      *  hits the lattice AND carries an encrypted_content blob, bili buffers the
      *  response, replays its own reasoning plus a continue nudge (up to maxContinue
      *  rounds), and folds to ONE response with true summed usage. Merged sub-field-wise
-     *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
+     *  across the three levels like `reasoning`; off unless enabled at some
      *  level. See src/reasoning-guard.ts. */
     reasoningGuard?: ReasoningGuardConfig;
     /** [#1093] Output-side compression levers — verbosity steering (a conciseness
@@ -508,7 +484,7 @@ export type CompressSettings = {
      *  unset profile yields byte-identical reports to pre-#1279 behavior. The
      *  last request's effective value is stamped onto the session and used by
      *  every report face. Merged sub-field-wise across the three levels like
-     *  `absorb`. */
+     *  `prompts`. */
     priceProfile?: { w?: number; r?: number; q?: number };
     /** [#1921] Fold-state reconciliation — how the proxy reacts when the
      *  resent history no longer contains a folded message's content-hash id
@@ -913,7 +889,7 @@ export interface DshFileSettings {
 const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "protocol", "compat", "imageBilling", "imageTokenCap"] as const;
 
 // Once-per-signature dedup so hot-reload / repeated launcher loads don't spam
-// the same named-provider warning (same pattern as the absorb warnings below).
+// the same named-provider warning.
 const seenNamedProviderWarnings = new Set<string>();
 
 function warnNamedProviderOnce(signature: string, message: string): void {
@@ -1169,45 +1145,6 @@ export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: bool
     return { enabled: fileAllow, source: fileAllow ? "file" : null };
 }
 
-// #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin
-// lane follows the base block). Warn once per load so the divergence isn't silent.
-const ABSORB_DIVERGENCE_FIELDS = ["enabled", "toolName", "minToolTokens", "contextThresholdPct", "excludeTools"] as const;
-const seenAbsorbDivergenceWarnings = new Set<string>();
-
-function normAbsorbValue(field: string, v: unknown): unknown {
-    if (field === "contextThresholdPct" && typeof v === "string") {
-        const m = v.match(/^(-?\d+(?:\.\d+)?)\s*%$/);
-        if (m) return Number(m[1]) / 100;
-    }
-    return v;
-}
-
-export function findAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: CompressSettings["absorb"]): string[] {
-    const out: string[] = [];
-    const check = (scope: string, level?: CompressSettings["absorb"]) => {
-        if (!level) return;
-        for (const field of ABSORB_DIVERGENCE_FIELDS) {
-            if (level[field] === undefined) continue;
-            if (JSON.stringify(normAbsorbValue(field, level[field])) !== JSON.stringify(normAbsorbValue(field, baseAbsorb?.[field]))) {
-                out.push(`${scope}.absorb.${field}=${JSON.stringify(level[field])} (base=${JSON.stringify(baseAbsorb?.[field])})`);
-            }
-        }
-    };
-    for (const [url, route] of Object.entries(routes)) {
-        check(url, route.compress?.absorb);
-        for (const [model, entry] of Object.entries(route.models ?? {})) check(`${url}/${model}`, entry.compress?.absorb);
-    }
-    return out;
-}
-
-function warnAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: CompressSettings["absorb"]): void {
-    const divs = findAbsorbPluginDivergences(routes, baseAbsorb);
-    if (divs.length === 0) return;
-    const sig = divs.join("\u0000");
-    if (seenAbsorbDivergenceWarnings.has(sig)) return;
-    seenAbsorbDivergenceWarnings.add(sig);
-    loggerLog("warn", `[acp-config] provider/model absorb override diverges from base [${divs.join("; ")}] — plugin-mode sessions follow the base value, proxy-mode sessions honor the override (#1359)`);
-}
 
 
 /** [#1345] A provider/model-level `ccr` field that diverges from what plugin
@@ -1312,7 +1249,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
     const namedProviders = loadNamedProviders(env);
-    warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
     warnCcrPluginDivergences(routes, fileConfig.compress);
     const passthrough = passthroughState(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
@@ -1710,8 +1646,12 @@ type FileConfig = {
      *  collision with the top-level proxy `debug`). Boolean shorthand:
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
-     *  deprecated fallback, read only while this section is absent. */
-     pi?: { subagents?: PiSubagentsFileConfig | boolean };
+     *  deprecated fallback, read only while this section is absent.
+     *  `inline` (#3278): run the pi lane's compression IN-PROCESS (no spawned
+     *  proxy) — the config-file home of the BILI_PI_INLINE knob, resolved
+     *  env > file > default(off); BILI_PI_INLINE=0/false explicitly disables
+     *  it over the file. */
+     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
     /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
      *  per-feature overrides of the version's baked-in rollout plan
      *  (ROLLOUT_FEATURES). `installId` pins the bucketing identity instead of
@@ -1775,6 +1715,17 @@ type FileConfig = {
          *  unset (JSON writing resumes; index-only sessions keep loading via
          *  the boot union, and replicas/restore re-materialize envelopes). */
         jsonWriter?: string;
+        /** WAL reclamation cap for index.db-wal (#3250), in bytes: every
+         *  completed checkpoint truncates the WAL file back to this size.
+         *  NOT a per-session data quota — data lands in index.db as it is
+         *  written and the WAL only stages frames between checkpoints, so
+         *  session count/size does not scale this. Higher = rarer truncate
+         *  IO but more steady disk use and a longer crash-replay tail.
+         *  Env BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES wins; default
+         *  8388608 (8 MiB); a non-positive/non-integer value falls back to
+         *  the file/default tier. Applied when the store opens (lane boot) —
+         *  hot edits apply on the next restart. */
+        walJournalSizeLimitBytes?: number;
     };
     /** Network & timing knobs (#2030) — every field was an env-only variable
      *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
@@ -1812,6 +1763,14 @@ type FileConfig = {
          *  guards. Default false: plaintext stays loopback-only. Public IPs/domains and
          *  CGNAT (100.64/10) remain refused regardless. Env BILI_ALLOW_PRIVATE_HTTP_PROVIDERS wins. */
         allowPrivateHttpProviders?: boolean;
+        /** Per-request inbound wire byte budget (#3128; was hardcoded 100 MiB, now default 5 GiB).
+         *  Env BILI_RECEIVE_BODY_BYTES wins. Also the threshold above which a decoded request
+         *  consumes one of two shared large-decode admission slots. WebSocket lanes keep 100 MiB. */
+        receiveBodyBytes?: number;
+        /** Per-request DECODED byte budget after content-encoding expansion (#3128; default 10 GiB = 2x receive). Env BILI_DECODED_BODY_BYTES wins. */
+        decodedBodyBytes?: number;
+        /** Per-request rebuilt-outbound byte budget forwarded upstream (#3128; default 5 GiB). Env BILI_OUTBOUND_BODY_BYTES wins. */
+        outboundBodyBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {
@@ -1866,6 +1825,8 @@ type FileConfig = {
     fakeCompletion?: { retries?: number; bufCapBytes?: number };
     /** Codex compaction kill-switch (#2030) — was BILI_CODEX_COMPACT ("intercept" | "pass"). */
     codexCompact?: string;
+    /** Auto-mode classifier local-forge switch (#2740) — env BILI_AUTO_MODE_FORGE. */
+    autoModeForge?: { enabled?: boolean };
     /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
     ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
@@ -1918,6 +1879,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
+    "autoModeForge",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -1925,19 +1887,19 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
-    "nudgeGrowthTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
+    "nudgeGrowthTokens", "minPressureBenefitTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
+    "acknowledgePromptsRisk", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary",
 ]);
 
 // Deduped per unique key set per process (same pattern as
-// seenAbsorbDivergenceWarnings): loadConfigFile() runs on every config read,
+// seenNamedProviderWarnings): loadConfigFile() runs on every config read,
 // so without this one startup would log the same warning several times.
 const seenUnknownTopLevelKeySignatures = new Set<string>();
 
@@ -2288,7 +2250,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -2307,6 +2269,8 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (imageBilling) route.imageBilling = imageBilling;
         const imageTokenCap = parseImageTokenCap(obj.imageTokenCap);
         if (imageTokenCap !== undefined) route.imageTokenCap = imageTokenCap;
+        const calibration = parseCalibrationPolicy(obj.calibration);
+        if (calibration) route.calibration = calibration;
         // #2336 lane credential override. Only parsed for NON-recipe-shaped
         // entries: a dialing recipe (baseUrl/api present) validates its own
         // credential fields in parseNamedProviderRecipe, and letting this
@@ -2353,6 +2317,37 @@ function parseDeclaredWireProtocol(v: unknown): WireProtocol | undefined {
  *  parseImageBilling: anything else is dropped, never a throw). */
 export function parseImageTokenCap(value: unknown): number | undefined {
     return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+// #3211: same strict-#1909 stance as parseDeclaredWireProtocol — an invalid
+// calibration policy THROWS instead of being silently dropped, because a
+// dropped escape hatch leaves the user staring at pressure-band churn with no
+// signal that their config had no effect. `max` above the publication clamp
+// (4) is rejected as provably inert rather than accepted dead weight.
+export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; max?: number } | undefined {
+    if (value === undefined) return undefined;
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error(`[acp-config] providers entry calibration must be an object with "disabled" and/or "max" (got ${JSON.stringify(value)})`);
+    const vo = value as Record<string, unknown>;
+    for (const key of Object.keys(vo)) {
+        if (key !== "disabled" && key !== "max")
+            throw new Error(`[acp-config] providers entry calibration has unknown key "${key}" (allowed: disabled, max)`);
+    }
+    const out: { disabled?: boolean; max?: number } = {};
+    if ("disabled" in vo) {
+        if (typeof vo.disabled !== "boolean")
+            throw new Error(`[acp-config] providers entry calibration.disabled must be a boolean (got ${JSON.stringify(vo.disabled)})`);
+        out.disabled = vo.disabled;
+    }
+    if ("max" in vo) {
+        const m = vo.max;
+        if (typeof m !== "number" || !Number.isFinite(m) || m <= 0 || m > 4)
+            throw new Error(`[acp-config] providers entry calibration.max must be a number > 0 and <= 4 (got ${JSON.stringify(m)})`);
+        out.max = m;
+    }
+    if (out.disabled === undefined && out.max === undefined)
+        throw new Error('[acp-config] providers entry calibration requires at least one of "disabled" or "max"');
+    return out;
 }
 
 function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
@@ -2442,6 +2437,13 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof obj.nudgeModelDecided !== "boolean") ok = false;
         else out.nudgeModelDecided = obj.nudgeModelDecided;
     }
+    // #3211: an explicit 0 is meaningful (legacy any-pending), so validate
+    // >= 0 instead of takeNumber's plain finite check.
+    if ("minPressureBenefitTokens" in obj) {
+        const v = obj.minPressureBenefitTokens;
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
+        else out.minPressureBenefitTokens = Math.floor(v);
+    }
     for (const key of ["protectedLatestTools", "protectedTools"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;
         const v = obj[key];
@@ -2490,36 +2492,6 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof obj.acknowledgePromptsRisk !== "boolean") ok = false;
         else out.acknowledgePromptsRisk = obj.acknowledgePromptsRisk;
     }
-    if ("absorb" in obj && obj.absorb !== undefined) {
-        const a = obj.absorb;
-        if (!a || typeof a !== "object" || Array.isArray(a)) {
-            ok = false;
-        } else {
-            const ao = a as Record<string, unknown>;
-            const cleaned: NonNullable<CompressSettings["absorb"]> = {};
-            for (const key of ["enabled", "minToolTokens", "contextThresholdPct", "excludeTools", "toolName"] as const) {
-                if (!(key in ao)) continue;
-                const v = ao[key];
-                if (key === "enabled") {
-                    if (typeof v !== "boolean") { ok = false; continue; }
-                    cleaned.enabled = v;
-                } else if (key === "minToolTokens") {
-                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
-                    cleaned.minToolTokens = v;
-                } else if (key === "contextThresholdPct") {
-                    if (!numberOrPercent(v)) { ok = false; continue; }
-                    cleaned.contextThresholdPct = typeof v === "string" ? v.trim() : v;
-                } else if (key === "excludeTools") {
-                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
-                    cleaned.excludeTools = [...v] as string[];
-                } else {
-                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
-                    cleaned.toolName = v.trim();
-                }
-            }
-            if (ok) out.absorb = cleaned;
-        }
-    }
     if ("ccr" in obj && obj.ccr !== undefined) {
         const c = obj.ccr;
         if (!c || typeof c !== "object" || Array.isArray(c)) {
@@ -2561,30 +2533,6 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 cleaned.planAware = v;
             }
             if (ok) out.search = cleaned;
-        }
-    }
-    if ("imageCompression" in obj && obj.imageCompression !== undefined) {
-        const c = obj.imageCompression;
-        if (!c || typeof c !== "object" || Array.isArray(c)) {
-            ok = false;
-        } else {
-            const co = c as Record<string, unknown>;
-            const cleaned: NonNullable<CompressSettings["imageCompression"]> = {};
-            for (const key of ["enabled", "minTokens", "maxDimension", "quality", "format"] as const) {
-                if (!(key in co)) continue;
-                const v = co[key];
-                if (key === "enabled") {
-                    if (typeof v !== "boolean") { ok = false; continue; }
-                    cleaned.enabled = v;
-                } else if (key === "minTokens" || key === "maxDimension" || key === "quality") {
-                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
-                    cleaned[key] = v;
-                } else {
-                    if (v !== "webp" && v !== "jpeg" && v !== "png") { ok = false; continue; }
-                    cleaned.format = v;
-                }
-            }
-            if (ok) out.imageCompression = cleaned;
         }
     }
     if ("prompts" in obj && obj.prompts !== undefined) {

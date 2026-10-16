@@ -34,6 +34,8 @@ import {
 import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { segmentGroups } from "./segment.js";
+import { projectUnit, collectCoverage } from "./unit-projection.js";
+import type { UnitProjection } from "./unit-projection.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -528,4 +530,53 @@ export function mergeRangesToThreshold(
     }
   }
   return result;
+}
+
+/**
+ * #3236: re-screen each merged recommended unit through the SAME judgment
+ * applySingleRange executes (projectUnit, unit-projection.ts). A unit that
+ * would be rejected wholesale — protected-zone-only span, turn/pair split, or
+ * nothing new to fold — is demoted to a gap instead of advertised. Without
+ * this, global integrity screening passes turns whose partners sit in ANOTHER
+ * advertised unit, and every submission of such a range throws "Range would
+ * split N turn(s)" — a permanent advertise/reject loop observed in production
+ * (billion-context#3236). No re-merge after filtering: re-merging could
+ * resurrect a doomed unit under different groupings and oscillate; a dropped
+ * unit simply stops being offered until the geometry changes.
+ */
+export function screenRecommendedUnits(
+  units: CompressibleRange[],
+  source: CoreMessage[],
+  state: CompressionState,
+  config: Config,
+  protectedRefs: Set<string>,
+): CompressibleRange[] {
+  if (units.length === 0) return units;
+  const coverage = collectCoverage(state);
+  return units.filter((unit) => {
+    let projection: UnitProjection | undefined;
+    try {
+      projection = projectUnit({
+        messages: source,
+        state,
+        config,
+        startRef: unit.startRef,
+        endRef: unit.endRef,
+        preExistingCoverage: coverage,
+        protectedMessageIds: protectedRefs,
+      });
+    } catch {
+      // Endpoints that cannot resolve on this array class (dead/consumed)
+      // must never be advertised.
+      return false;
+    }
+    if (!projection || projection.fatal !== null) return false;
+    if (
+      projection.filteredIds.length === 0 &&
+      projection.consumedBlockIds.length === 0
+    ) {
+      return false;
+    }
+    return true;
+  });
 }

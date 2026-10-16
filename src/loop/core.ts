@@ -15,15 +15,13 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { coreToAnthropic } from "acp-kernel/wire";
 import {
     parseCompressInput,
-    ABSORB_TOOL_NAME,
     COMPRESS_TOOL_NAME,
     RULE_TOOL_NAME,
 } from "../compress-tool.js";
-import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
+import { isProxyToolFor } from "../proxy-tool.js";
 import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "../store.js";
 import { recordThreadTail } from "../server/thread-tracking.js";
-import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled, imageUsageSuffix } from "../image-compress.js";
 import { applyRanges } from "../stream.js";
 import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
@@ -56,7 +54,6 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
         decompress: "📤",
         search_context: "🔍",
         acp_status: "📊",
-        absorb: "🫧",
     };
     const icon = failed ? "❌" : (icons[toolName] ?? "📦");
 
@@ -141,10 +138,6 @@ const TRANSPORT_FAILURE_LABELS: Record<UpstreamFailureKind, string> = {
     unknown: "network error",
 };
 
-function activeAbsorbToolName(session: Session, config: Config): string | undefined {
-    const a = effectiveAbsorbConfig(session, config);
-    return a?.enabled === true ? a.toolName ?? ABSORB_TOOL_NAME : undefined;
-}
 
 // Canonical args for repeat-detection: key-order/whitespace differences must not
 // defeat an identical-call match, so parse + re-stringify with sorted keys.
@@ -225,6 +218,12 @@ export interface RequestOptions {
      *  degraded retry, rebuilt rounds — so re-sent bodies carry the same
      *  compat the initial forward() applied. Returns the body to serialize. */
     wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
+    /** #3280: ingress counterpart of wireTransform — applied to every
+     *  loop-originated response stream at the single adoption point
+     *  (adoptUpstream) so round-2+ consumers parse the STANDARD wire shape
+     *  even though egress went out dialect-wrapped (the v1internal envelope
+     *  nests candidates under .response). undefined for non-dialect traffic. */
+    responseStreamTransform?: (stream: ReadableStream<Uint8Array>) => ReadableStream<Uint8Array>;
     /** #1884: re-sign every re-sent body before it hits the wire (armed
      *  re-sign lane only; undefined on unsigned traffic). Each round rebuilds
      *  the body, so a signature computed for an earlier round is stale. */
@@ -239,7 +238,11 @@ export interface RequestOptions {
 type RoundPart =
     | { kind: "reasoning"; text: string; signature: string }
     | { kind: "text"; text: string }
-    | { kind: "redacted"; data: string };
+    | { kind: "redacted"; data: string }
+    // #3158: a Gemini part whose only payload is a thoughtSignature (no text,
+    // no functionCall). Recorded in stream order so a proxy-tool rebuild puts
+    // it back on the re-request at its position.
+    | { kind: "standalone_signature"; signature: string };
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
@@ -249,6 +252,11 @@ export type ParsedStreamEvent =
     // on re-request — Anthropic rejects modified thinking-family blocks — so
     // it is its own event instead of riding the (empty) reasoning seal.
     | { kind: "redacted_thinking"; data: string }
+    // #3158: a Gemini part carrying ONLY a thoughtSignature (no text, no
+    // functionCall). The adapter forwards it to the client itself; the loop
+    // records it so a proxy-tool rebuild carries it back on the re-request —
+    // dropped there, the rebuilt history loses the signature association.
+    | { kind: "standalone_signature"; signature: string }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean; signature?: string }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
     // #1766: keys on the upstream terminal frame that bili does not model
@@ -351,18 +359,11 @@ export function executeProxyTool(
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session, args);
     }
-    const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
-    if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
-        return executeAbsorb(args, callId, absorb, ctx);
-    }
     if (effectiveRulesEnabled(ctx.session, ctx.config) && toolName === RULE_TOOL_NAME) {
         return executeRule(args, ctx);
     }
     if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
         return executeRetrieve(args, ctx.session);
-    }
-    if (imageCompressionEnabled(ctx.session) && toolName === IMAGE_FULL_TOOL_NAME) {
-        return executeImageFull(args, ctx.session, ctx.config, callId);
     }
     return toolFail(`[Unknown proxy tool: ${toolName}]`);
 }
@@ -387,7 +388,7 @@ function recordUsage(
     const foldNew = ctx.session.stats.pendingFoldUsage === true;
     if (foldNew) ctx.session.stats.pendingFoldUsage = false;
     ctx.log(
-        `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}${imageUsageSuffix(ctx.session)}`,
+        `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
     );
     if (total > 0 || reportedCached !== null) {
         settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin });
@@ -479,7 +480,7 @@ export async function* runCompressLoop(
     // response (the incident's round-2 death left no bytes on disk at all).
     let loopFetchSeq = 0;
     const adoptUpstream = (respResult: { response: Response; clearTimer: () => void }): ReadableStream<Uint8Array> => {
-        const body = respResult.response.body as ReadableStream<Uint8Array>;
+        let body = respResult.response.body as ReadableStream<Uint8Array>;
         if (activeClearTimer) activeClearTimer();
         activeClearTimer = respResult.clearTimer;
         if (ctx.dumpSse && body) {
@@ -489,8 +490,12 @@ export async function* runCompressLoop(
             try {
                 ctx.dumpSse(`${Date.now()}-${sid}-loop${loopFetchSeq}-raw.sse`, dump);
             } catch { /* best-effort */ }
-            return read;
+            body = read;
         }
+        // #3280: undo the outbound dialect wrap (wireTransform) before any
+        // consumer parses — the dump twin above keeps RAW upstream bytes,
+        // mirroring the outer request's pre-unwrap tee order in relay.ts.
+        if (body && requestOptions.responseStreamTransform) body = requestOptions.responseStreamTransform(body);
         return body;
     };
 
@@ -712,6 +717,8 @@ export async function* runCompressLoop(
                         }
                     } else if (ev.kind === "redacted_thinking") {
                         roundParts.push({ kind: "redacted", data: ev.data });
+                    } else if (ev.kind === "standalone_signature") {
+                        roundParts.push({ kind: "standalone_signature", signature: ev.signature });
                     } else if (ev.kind === "tool_call") {
                         calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough, signature: ev.signature });
                     } else if (ev.kind === "usage") {
@@ -1136,6 +1143,7 @@ export async function* runCompressLoop(
                 let reasoningIdx = 0;
                 let textIdx = 0;
                 let redactedIdx = 0;
+                let sigIdx = 0;
                 for (const part of roundParts) {
                     if (part.kind === "reasoning") {
                         if (part.text.length === 0 || (requiresThinkingSignature && part.signature.length === 0)) continue;
@@ -1162,6 +1170,22 @@ export async function* runCompressLoop(
                             contentType: "text",
                             text: part.text,
                         });
+                    } else if (part.kind === "standalone_signature") {
+                        // #3158: put the standalone thoughtSignature back at its
+                        // stream position. rawGoogleParts is required: contentParts
+                        // returns the raw verbatim only when it can prove the raw's
+                        // texts equal the core's text, and an empty-text core with
+                        // no raw would serialize to zero parts — content vanishes.
+                        sigIdx += 1;
+                        const sigMsg: BiliMessage = {
+                            id: sigIdx === 1 ? `acp_loop_r${round}_asst_sig` : `acp_loop_r${round}_asst_sig_${sigIdx}`,
+                            role: "assistant",
+                            contentType: "text",
+                            text: "",
+                            googleThoughtSignature: part.signature,
+                            rawGoogleParts: [{ thoughtSignature: part.signature }],
+                        };
+                        coreMessages.push(sigMsg);
                     } else {
                         // #1960: byte-exact, position-exact replay of the opaque
                         // block; coreToAnthropic re-emits rawAnthropicBlock verbatim.
@@ -1243,10 +1267,9 @@ export async function* runCompressLoop(
                 // its refresh is a harmless identical-view re-fold. Falls back
                 // to the pre-compress view (previous behavior) if the host hook
                 // is absent or throws.
-                const absorbName = activeAbsorbToolName(ctx.session, ctx.config);
                 if (
                     ctx.refreshFolded &&
-                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
+                    proxyResults.some((pr) => (pr.name === "compress") && !pr.result.includes("FAILED"))
                 ) {
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
@@ -1398,10 +1421,9 @@ export async function* runCompressLoop(
                                 if (blocks) committedBlocks += Number(blocks[1]);
                             }
                         }
-                        const absorbed = proxyResults.some((pr) => pr.name === activeAbsorbToolName(ctx.session, ctx.config) && !pr.result.includes("FAILED"));
                         const note = committedTokens > 0
                             ? `compression committed (~${committedTokens.toLocaleString("en-US")} tokens saved${committedBlocks > 0 ? ` in ${committedBlocks} block(s)` : ""}); `
-                            : absorbed ? "context work committed; " : "";
+                            : "";
                         const msg = `${note}the follow-up request to the model failed (${TRANSPORT_FAILURE_LABELS[kind]}) before any response — your context is intact, resend your last message to continue`;
                         ctx.log(`[acp-loop] round ${round}: re-request transport failure (${kind}); ending turn in-band instead of throwing (#1453)`);
                         loggerLog("error", `[acp-loop] re-request transport failure after ${round} round(s): ${formatUpstreamError(e, requestOptions.url, ctx.proxyUrl, ctx.skippedProxy)}`);

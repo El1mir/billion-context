@@ -143,15 +143,41 @@ export const WEB_CLIENT = `(function () {
         // stands down completely — compatible family / non-compressors, not conflicts.
         const siblingOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && siblingN > 0;
         const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN + handledNativeN) > 0; // #2912: fully-handled (recovered-native-only) ledger also stands down
+        // #3235 owner rule: the banner is an ALARM for interception FAILURE — evidence a
+        // history rewrite actually LANDED unrecovered (confirmed third-party / inferred
+        // native landing / unexplained rewrite signal). Co-residence alone (suspected
+        // plugin stock, siblings, read-only viewers) never pops; it stays recorded in
+        // acp_status and the web conflict details for the curious.
+        const landed = hasConfirmed || signalN > 0;
         // #2969: per-client remediation hints are imperative ("disable auto-compaction,
         // start a fresh session") — they belong to CONFIRMED and UNCONFIRMED-SIGNAL tiers.
         // A suspected-only ledger already carries verify-first wording in riskText; an
         // imperative hint block beneath it contradicts it and demands action on a guess.
         const showHints = hasConfirmed || signalN > 0;
-        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, showHints: showHints, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, neutralOnly: neutralOnly, landed: landed, signalN: signalN, showHints: showHints, what: whatParts.join(t("conflict.what_join")), active: active, activeConfirmed: activeConfirmed };
+    }
+    // #3235: persisted banner dismissal — "don't show again" must survive new
+    // sessions (users reported the banner stalking them across sessions) but
+    // NEVER mask new evidence: the stored watermark (newest event timestamp +
+    // event count) re-arms the banner the moment a newer landing is recorded.
+    // Defined before the window exports so the Node test-extraction slice
+    // (web-conflict-banner.test.ts) can reach it without a window global.
+    function bili_conflictDismissed(c, stored) {
+        if (!stored || typeof stored !== "object") return false;
+        if (typeof stored.lastAt !== "number" || typeof stored.events !== "number") return false;
+        if (c.lastAt === null || c.lastAt === undefined) return c.events <= stored.events;
+        return c.lastAt <= stored.lastAt && c.events <= stored.events;
+    }
+    const CONFLICT_DISMISS_KEY = "biliConflictDismiss";
+    function loadConflictDismiss() {
+        try { return JSON.parse(localStorage.getItem(CONFLICT_DISMISS_KEY) || "null"); } catch { return null; }
+    }
+    function saveConflictDismiss(c) {
+        try { localStorage.setItem(CONFLICT_DISMISS_KEY, JSON.stringify({ lastAt: c.lastAt ?? 0, events: c.events, at: Date.now() })); } catch { /* private mode etc. — dismissal just won't persist */ }
     }
     window.bili_conflictLine = bili_conflictLine;
     window.bili_conflictSeverity = bili_conflictSeverity;
+    window.bili_conflictDismissed = bili_conflictDismissed;
     // #2219: per-client remediation block for the conflict surfaces — one
     // actionable i18n line per resolved client (capped so the banner stays a
     // summary), unknown clients fall back to the generic hint, and every block
@@ -380,6 +406,7 @@ export const WEB_CLIENT = `(function () {
         return '<a class="slink" href="' + href + '"><span class="row-title clip w-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
+            + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -577,8 +604,12 @@ export const WEB_CLIENT = `(function () {
             // context-pi / opencode-acp) is compatible and verified read-only viewers are not
             // compressors, so such ledgers are not warnings. The events stay recorded
             // (acp_status keeps the calm #2261 footer); only the banner goes quiet.
+            // #3235: the banner now requires LANDED-UNRECOVERED evidence (interception
+            // actually failed) — suspected-tier stock alone no longer pops — and a persisted
+            // dismissal (#3235) quiets it until a newer event re-arms the alarm.
             const sev0 = c && c.events > 0 ? bili_conflictSeverity(c) : null;
-            if (c && c.events > 0 && !(sev0 && sev0.neutralOnly)) {
+            const dismissed = c && c.events > 0 ? bili_conflictDismissed(c, loadConflictDismiss()) : false;
+            if (c && c.events > 0 && sev0 && sev0.landed && !dismissed) {
                 cb.hidden = false;
                 cb.classList.add("show");
                 // #2102: attribute per kind family present; split active from historical
@@ -591,7 +622,7 @@ export const WEB_CLIENT = `(function () {
                 // #2219: per-client remediation block between the summary line and the
                 // details pointer — clients[] comes from summarizeConflicts (server-side
                 // resolution); payloads without it degrade to the generic hint only.
-                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + (sev.showHints ? conflictHintBlock(c.clients) : "") + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + (sev.showHints ? conflictHintBlock(c.clients) : "") + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>" + '<button id="conflicts-dismiss-btn" class="btn sm">' + t("conflict.dismiss") + "</button>" + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>" + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>";
                 // #2545: red styling follows CONFIRMED liveness — a fresh unconfirmed
                 // signal beside a stale confirmed ledger renders as info, not warn.
                 cb.classList.toggle("info", !(sev.hasConfirmed && sev.activeConfirmed > 0));
@@ -611,6 +642,19 @@ export const WEB_CLIENT = `(function () {
                         }
                     });
                 }
+                const dBtn = $("conflicts-dismiss-btn");
+                if (dBtn) {
+                    dBtn.addEventListener("click", () => {
+                        saveConflictDismiss(c);
+                        toast(t("conflict.dismissed"), "ok");
+                        cb.hidden = true;
+                        cb.classList.remove("show");
+                        cb.innerHTML = "";
+                    });
+                }
+                // #3235: ride the shared #3040 report wiring — copy diagnostics + prefilled
+                // GitHub issue link, cached per topic so the 5s overview poll stays cheap.
+                attachReportButtons("conflict-banner", cb);
             } else {
                 cb.hidden = true;
                 cb.classList.remove("show");
@@ -762,6 +806,8 @@ export const WEB_CLIENT = `(function () {
         }
         detEl.hidden = true;
         listEl.hidden = false;
+        trajState = null;
+        trajRange = null;
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
@@ -837,10 +883,13 @@ export const WEB_CLIENT = `(function () {
     function kv(parts, label, value, mono) {
         parts.push('<div class="k">' + label + '</div><div class="v' + (mono ? " mono" : "") + '">' + (value == null || value === "" ? t("common.none") : escapeHtml(String(value))) + "</div>");
     }
+    // #2489: chart geometry shared by the renderer and the brush interaction below.
+    const TRAJ_W = 960, TRAJ_H = 260, TRAJ_PL = 56, TRAJ_PR = 16, TRAJ_PT = 14, TRAJ_PB = 26;
+    const TRAJ_MIN_SAMPLES = 5;
     function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
         lines = (lines || []).filter((l) => Boolean(l));
         if (!lines.length) return "";
-        const W = 960, H = 260, PL = 56, PR = 16, PT = 14, PB = 26;
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
         const iw = W - PL - PR, ih = H - PT - PB;
         let maxY = 0;
         lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
@@ -1018,6 +1067,161 @@ export const WEB_CLIENT = `(function () {
         if (dashed) return '<span><span class="dot" style="background:none;border-top:2px dashed #cf222e;height:0;border-radius:0;width:14px"></span>' + label + "</span>";
         return '<span><span class="dot" style="' + style + '"></span>' + label + "</span>";
     }
+    // #1609: cache-miss attribution (#1606). Defensive reads — servers predating #1606
+    // carry no ledger.seam at all, and an all-zero shape must render nothing.
+    function detailSeam(ledger) {
+        const raw = ledger && ledger.seam && typeof ledger.seam === "object" ? ledger.seam : null;
+        if (!raw) return null;
+        return {
+            suspects: Number(raw.suspects) || 0,
+            missed: Number(raw.missed) || 0,
+            events: Array.isArray(raw.events) ? raw.events.filter((e) => e && e.at > 0) : [],
+            providerSide: { count: (raw.providerSide && Number(raw.providerSide.count)) || 0, missed: (raw.providerSide && Number(raw.providerSide.missed)) || 0 },
+            providerTtl: { count: (raw.providerTtl && Number(raw.providerTtl.count)) || 0, missed: (raw.providerTtl && Number(raw.providerTtl.missed)) || 0 },
+            rewinds: { count: (raw.rewinds && Number(raw.rewinds.count)) || 0, missed: (raw.rewinds && Number(raw.rewinds.missed)) || 0 },
+            client: { count: (raw.client && Number(raw.client.count)) || 0, missed: (raw.client && Number(raw.client.missed)) || 0 },
+            abortCorrelated: Number(raw.abortCorrelated) || 0,
+        };
+    }
+    function detailSeamActive(seam) {
+        return !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
+    }
+    // #2489: zoom-to-selection over the context-trajectory chart. The data is already
+    // client-side, so zooming re-renders the SAME renderer over a filtered slice — no
+    // server round-trip, and an un-zoomed view stays byte-identical to the full render.
+    let trajState = null;   // { lines, folds, seams, win, baseIn } of the rendered detail
+    let trajRange = null;   // absolute [i0, i1] into trajState.lines, or null = full view
+    let trajDrag = null;    // in-flight brush gesture
+    function trajVisible() {
+        if (!trajState) return null;
+        const L = trajState.lines;
+        let a = 0, b = L.length - 1;
+        if (trajRange) {
+            a = Math.max(0, Math.min(L.length - 1, trajRange[0]));
+            b = Math.max(a, Math.min(L.length - 1, trajRange[1]));
+        }
+        const lines = L.slice(a, b + 1);
+        // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
+        // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
+        // the byte-parity acceptance criterion pins). Time-filtering only applies to a
+        // ZOOMED window, where a foreign mark would land on the wrong sample.
+        if (!trajRange) return { lines, folds: trajState.folds || [], seams: trajState.seams || [], offset: a };
+        const t0 = lines[0] ? (lines[0].at || 0) : 0;
+        const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
+        return {
+            lines,
+            folds: (trajState.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
+            seams: (trajState.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+            offset: a,
+        };
+    }
+    function trajRender() {
+        const wrap = $("traj-chart");
+        const v = trajVisible();
+        if (!wrap || !v) return;
+        wrap.innerHTML = v.lines.length ? trajectorySvg(v.lines, v.folds, trajState.win, trajState.baseIn, v.seams) : "";
+        trajUpdateStatus(v);
+    }
+    function trajUpdateStatus(v) {
+        const st = $("traj-status");
+        if (!st) return;
+        if (!trajRange || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
+        const L = trajState.lines;
+        const a = v.offset, b = v.offset + v.lines.length - 1;
+        const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
+        const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
+        const times = v.lines.map((l) => l.at).filter(Boolean);
+        st.hidden = false;
+        st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
+            + '<button id="traj-reset" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
+        const rb = $("traj-reset");
+        if (rb) rb.addEventListener("click", () => trajSetRange(null));
+    }
+    function trajSetRange(r) {
+        trajRange = r && r[1] > r[0] ? [r[0], r[1]] : null;
+        trajRender();
+    }
+    function trajIdxFromX(x, n) {
+        if (n <= 1) return 0;
+        const iw = TRAJ_W - TRAJ_PL - TRAJ_PR;
+        return Math.max(0, Math.min(n - 1, Math.round(((x - TRAJ_PL) / iw) * (n - 1))));
+    }
+    function trajLocalX(wrap, ev) {
+        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+        if (!r || !(r.width > 0)) return null;
+        const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
+        return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+    }
+    function trajOverlayShow(wrap, xa, xb) {
+        if (!trajDrag || !trajDrag.overlay) return;
+        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+        if (!r || !(r.width > 0)) return;
+        const o = trajDrag.overlay;
+        o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
+        o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
+        o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
+        o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
+    }
+    function trajOnDown(ev) {
+        if (!trajState || ev.button !== 0) return;
+        const wrap = $("traj-chart");
+        const v = trajVisible();
+        if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
+        ev.preventDefault();
+        const x0 = trajLocalX(wrap, ev);
+        if (x0 == null) return;
+        const o = document.createElement("div");
+        o.className = "chart-brush";
+        wrap.appendChild(o);
+        trajDrag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
+        trajOverlayShow(wrap, x0, x0);
+        document.addEventListener("mousemove", trajOnMove);
+        document.addEventListener("mouseup", trajOnUp);
+    }
+    function trajOnMove(ev) {
+        if (!trajDrag) return;
+        const x = trajLocalX($("traj-chart"), ev);
+        if (x == null) return;
+        trajDrag.cur = x;
+        trajOverlayShow($("traj-chart"), trajDrag.x0, x);
+    }
+    function trajOnUp(ev) {
+        document.removeEventListener("mousemove", trajOnMove);
+        document.removeEventListener("mouseup", trajOnUp);
+        if (!trajDrag) return;
+        const d0 = trajDrag;
+        trajDrag = null;
+        if (d0.overlay) d0.overlay.remove();
+        const x1 = trajLocalX($("traj-chart"), ev);
+        if (x1 == null) return;
+        const i0 = trajIdxFromX(Math.min(d0.x0, x1), d0.n);
+        const i1 = trajIdxFromX(Math.max(d0.x0, x1), d0.n);
+        if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
+        if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
+        trajSetRange([d0.offset + i0, d0.offset + i1]);
+    }
+    function bindTrajectoryBrush(d) {
+        trajState = null;
+        trajRange = null;
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return;
+        const seam = detailSeam(ledger);
+        trajState = {
+            lines,
+            folds: ledger.folds || [],
+            seams: detailSeamActive(seam) && seam ? seam.events : [],
+            win: d.contextWindow || 0,
+            baseIn: d.systemPromptTokens || 0,
+        };
+        const wrap = $("traj-chart");
+        if (!wrap) return;
+        wrap.addEventListener("mousedown", trajOnDown);
+        wrap.addEventListener("dblclick", () => trajSetRange(null));
+        trajRender();
+    }
+    window.bili_trajSvg = trajectorySvg;
+    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: trajIdxFromX, visible: () => trajVisible(), range: () => trajRange };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -1184,6 +1388,8 @@ export const WEB_CLIENT = `(function () {
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
+        // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
+        if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
         // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render
@@ -1265,25 +1471,18 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div></div>");
         const ledger = d.ledger || {};
         const lines = ledger.lines || [];
-        // #1609: cache-miss attribution (#1606). Defensive reads — servers predating #1606
-        // carry no ledger.seam at all, and an all-zero shape must render nothing.
-        const seamRaw = ledger.seam && typeof ledger.seam === "object" ? ledger.seam : null;
-        const seam = seamRaw ? {
-            suspects: Number(seamRaw.suspects) || 0,
-            missed: Number(seamRaw.missed) || 0,
-            events: Array.isArray(seamRaw.events) ? seamRaw.events.filter((e) => e && e.at > 0) : [],
-            providerSide: { count: (seamRaw.providerSide && Number(seamRaw.providerSide.count)) || 0, missed: (seamRaw.providerSide && Number(seamRaw.providerSide.missed)) || 0 },
-            providerTtl: { count: (seamRaw.providerTtl && Number(seamRaw.providerTtl.count)) || 0, missed: (seamRaw.providerTtl && Number(seamRaw.providerTtl.missed)) || 0 },
-            rewinds: { count: (seamRaw.rewinds && Number(seamRaw.rewinds.count)) || 0, missed: (seamRaw.rewinds && Number(seamRaw.rewinds.missed)) || 0 },
-            client: { count: (seamRaw.client && Number(seamRaw.client.count)) || 0, missed: (seamRaw.client && Number(seamRaw.client.missed)) || 0 },
-            abortCorrelated: Number(seamRaw.abortCorrelated) || 0,
-        } : null;
-        const seamActive = !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
+        // #1609: cache-miss attribution (#1606) — shared by the legend group below and
+        // the brush state (bindTrajectoryBrush), so it stays a helper, not inline reads.
+        const seam = detailSeam(ledger);
+        const seamActive = detailSeamActive(seam);
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.trajectory") + '</span><span class="hint">' + t("det.trajectory_sub") + '</span></div><div class="card-b">');
         if (!lines.length) {
             parts.push('<div class="chart-empty">' + t("det.trajectory_empty") + "</div>");
         } else {
-            parts.push('<div class="chart-wrap">' + trajectorySvg(lines, ledger.folds || [], d.contextWindow, d.systemPromptTokens || 0, seamActive ? seam.events : []) + "</div>");
+            parts.push('<div class="chart-status" id="traj-status" hidden></div>');
+            // #2489: the wrap starts empty — bindTrajectoryBrush() → trajRender() fills it,
+            // so every chart state (full and zoomed) comes from the single render path.
+            parts.push('<div class="chart-wrap" id="traj-chart"></div>');
             parts.push('<div class="chart-legend">');
             parts.push(legendItem("background:var(--accent)", t("det.legend_input")));
             parts.push(legendItem("background:var(--accent);opacity:.4", t("det.legend_cached"), false));
@@ -1313,6 +1512,7 @@ export const WEB_CLIENT = `(function () {
             }
             if (d.systemPromptTokens || lines.length >= 20) parts.push(legendItem("border:1.5px solid #8b949e;background:#f2f5f7;", d.systemPromptTokens ? t("det.legend_base") : t("det.legend_base_est")));
             parts.push("</div>");
+            parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
         }
         parts.push("</div></div>");
@@ -1516,6 +1716,7 @@ export const WEB_CLIENT = `(function () {
             bindBlocksActions(d);
             bindCacheReportActions(d);
             bindSessionReportActions(d);
+            bindTrajectoryBrush(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
@@ -2490,6 +2691,8 @@ export const WEB_CLIENT = `(function () {
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
+    // #2489: Esc resets a zoomed trajectory view from anywhere on the page.
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && trajRange) trajSetRange(null); });
 
     function initStaticHandlers() {
         const tog = $("language-toggle");

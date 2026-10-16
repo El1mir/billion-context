@@ -14,6 +14,7 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, markIncrementalDead, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
@@ -1128,6 +1129,15 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         state.carriedSids.add(sid);
                     }
                     headers["x-bili-plugin"] = agent;
+                    // #3248: when the lane advertises incremental turns, declare
+                    // the divert intent. Declaring is safe — the lane shape-tests
+                    // the body, so full-resend turns (retries, dead conversations,
+                    // side lanes) ride the normal pipeline anyway. pi only: omp
+                    // never emits before_provider_headers, so its requests carry
+                    // no x-bili-plugin marker and the divert would never fire.
+                    if (agent === "pi" && proxyBase !== undefined && await probeIncrementalTurns(proxyBase)) {
+                        headers[INCREMENTAL_TURN_MARKER_HEADER] = "1";
+                    }
                     const window = ctx.model?.contextWindow;
                     if (typeof window === "number" && Number.isFinite(window) && window > 0) {
                         headers["x-bili-plugin-context-window"] = String(Math.floor(window));
@@ -1187,6 +1197,34 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         const forkAdopter = createForkAdopter((line) => logHostEvent("error", "[native-client]", `bili-plugin(${agent}): ${line}`));
         const forkParents = new Map<string, string | undefined>();
         const forkSeedVerdicts = new Map<string, "seeded" | "lineage-only" | "unknown">();
+        // #3248 incremental turns: outbound plans awaiting their ack. Keyed by
+        // conversation id; one entry per in-flight incremental turn (pi sends
+        // model requests strictly sequentially per session). Cleared on the
+        // after_provider_response ack, dropped on failure.
+        const pendingIncrementalAcks = new Map<string, { messages: IncrementalWireMessage[]; system: unknown; base: string }>();
+        async function maybeIncrementalTurn(event: { payload?: unknown }, ctx: Ctx): Promise<unknown> {
+            if (state.toolsReady !== true) return undefined; // no marker stamped → must not replace
+            const payload = event.payload as { messages?: unknown; system?: unknown } | undefined;
+            if (payload === null || typeof payload !== "object" || !Array.isArray((payload as { messages?: unknown }).messages)) return undefined;
+            const sid = sessionIdOf(ctx);
+            if (sid === undefined || sid.length === 0) return undefined;
+            let proxyBase = proxyBaseForCtx(ctx);
+            if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
+            if (proxyBase === undefined) return undefined;
+            if (!(await probeIncrementalTurns(proxyBase))) return undefined;
+            const plan = planIncrementalTurn({
+                conversationId: sid,
+                // The marker divert uses the ORIGINAL request URL server-side;
+                // this path is only a placeholder for the direct-endpoint form.
+                path: "/v1/messages",
+                messages: payload.messages as IncrementalWireMessage[],
+                system: "system" in payload ? payload.system : undefined,
+                request: payload as Record<string, unknown>,
+            });
+            if (plan.mode === "skip") return undefined;
+            pendingIncrementalAcks.set(sid, { messages: payload.messages as IncrementalWireMessage[], system: "system" in payload ? payload.system : undefined, base: proxyBase });
+            return JSON.parse((plan as { body: string }).body) as unknown;
+        }
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
             if (state.toolsReady !== true) return;
             const sid = sessionIdOf(ctx);
@@ -1252,8 +1290,63 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             } catch (err) {
                 logHostEvent("error", "[native-client]", `bili-plugin(${agent}): fork adoption failed (${err instanceof Error ? err.message : String(err)}) — starting the session fresh (#2399)`);
             }
+            // #3248 incremental turns: pi only (the divert needs the
+            // x-bili-plugin marker this extension stamps in
+            // before_provider_headers — omp never fires that hook). Replaces
+            // the full-resend payload with the delta; skips prompt-cache-key
+            // stamping when it does (the lane owns cache stability through
+            // the server-side canonical).
+            if (agent === "pi") {
+                try {
+                    const replaced = await maybeIncrementalTurn(event, ctx);
+                    if (replaced !== undefined) return replaced;
+                } catch (err) {
+                    logHostEvent("error", "[native-client]", `bili-plugin(${agent}): incremental turn skipped (${err instanceof Error ? err.message : String(err)}) — full resend this turn`);
+                }
+            }
             return stampPromptCacheKey(event, ctx, agent);
         });
+        // #3248 incremental turns: the ack channel. after_provider_response
+        // fires with status + headers BEFORE the stream is consumed, so the
+        // x-bili-applied-seq header is readable here. 200 → record the ack
+        // (the server seq is the only sinceSeq authority); 409 → sticky
+        // per-conversation fallback (seed always resyncs, so a delta 409 means
+        // genuine drift pi's own retry loop cannot repair); 503 → drop the
+        // probe cache so the next turn re-probes (rollout flag or sidecar
+        // liveness changed on the lane).
+        pi.on("after_provider_response", ((event: unknown, ctx: Ctx) => {
+            try {
+                const sid = sessionIdOf(ctx);
+                if (sid === undefined || sid.length === 0) return;
+                const pending = pendingIncrementalAcks.get(sid);
+                if (pending === undefined) return;
+                pendingIncrementalAcks.delete(sid);
+                const status = (event as { status?: unknown }).status;
+                const headers = (event as { headers?: Record<string, unknown> }).headers;
+                if (status === 200) {
+                    const seq = headers?.["x-bili-applied-seq"];
+                    if (typeof seq === "string" && /^\d+$/.test(seq)) {
+                        noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
+                        return;
+                    }
+                    // No ack header = the request did NOT ride the incremental
+                    // divert (marker raced the probe) — leave state untouched.
+                    return;
+                }
+                if (status === 409) {
+                    markIncrementalDead(sid);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turn rejected (seq drift) for ${sid} — falling back to full resend for this conversation`);
+                    return;
+                }
+                if (status === 503) {
+                    markIncrementalDead(sid);
+                    clearIncrementalProbe(pending.base);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turns unavailable on the lane — re-probing next turn`);
+                }
+            } catch (err) {
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): incremental ack handling failed (${err instanceof Error ? err.message : String(err)})`);
+            }
+        }) as unknown as (...args: unknown[]) => void);
         pi.on("session_start", (_event, ctx) => {
             if (!agentProvidersDone) {
                 agentProvidersDone = true;

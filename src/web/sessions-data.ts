@@ -4,6 +4,7 @@ import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../persist.js";
 import { flatFileNameFor } from "acp-kernel/persist";
+import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
@@ -302,6 +303,37 @@ function liveCoveredPaths(dir: string): Set<string> {
     return out;
 }
 
+/** #3199: how much newer a session file's mtime may be than its unified row's
+ *  updated_at before the row counts as stale and the file must be decoded.
+ *  Normal writes always land AFTER their row (guardedBuild ingests before the
+ *  JSON flush; updated_at is stamped at build time), so a bare mtime >=
+ *  updatedAt test would decode everything — the window absorbs that lag while
+ *  still catching bypass writes (#408 clamp, #286 rekey) and manual edits once
+ *  they age out. Exposure is display-only and self-healing: shadow detail
+ *  views always read the file, and any activity re-ingests the row. */
+const SHADOW_ROW_STALE_WINDOW_MS = 5 * 60 * 1000;
+
+/** #3199: basename → freshest unified row claiming that filename. Session
+ *  filenames derive from the session id (sha256 prefix), so row→file needs no
+ *  stat and no decode — the walk's own basenames are the join key (the same
+ *  three candidates liveCoveredPaths builds per live id). */
+function rowClaimsByBasename(rows: WebSummaryRow[]): Map<string, WebSummaryRow> {
+    const claims = new Map<string, WebSummaryRow>();
+    for (const r of rows) {
+        const candidates = [
+            relPathFor(r.sessionId, r.protocol, r.origin),
+            relPathFor(r.sessionId),
+            flatFileNameFor(r.sessionId),
+        ];
+        for (const rel of candidates) {
+            const base = path.basename(rel);
+            const cur = claims.get(base);
+            if (!cur || r.updatedAt > cur.updatedAt) claims.set(base, r);
+        }
+    }
+    return claims;
+}
+
 // #2260(F)/#2180 follow-up: bili's own infra dirs created under the data root
 // BEFORE any session exists (ensureRootCA() makes <data>/ca at proxy start) —
 // their presence alone must not read as "misconfigured". The set is closed by
@@ -356,11 +388,26 @@ async function refreshIndex(): Promise<void> {
         const prev = byFile ?? new Map<string, DiskEntry>();
         const next = new Map<string, DiskEntry>();
         const covered = liveCoveredPaths(dir);
+        // #3199: shadow mode adopts fresh unified rows instead of decoding the
+        // files they describe — cold-start cost drops from "decode the whole
+        // corpus" to one SQL + one stat per file. Full mode never walks here
+        // (its rows are authoritative); legacy has no rows; both keep the
+        // plain decode path below.
+        let claims: Map<string, WebSummaryRow> | null = null;
+        if (store.webSummaryBaseline() === "reconcile") {
+            const rows = store.unifiedWebSummaries();
+            if (rows !== null) claims = rowClaimsByBasename(rows);
+        }
         for (const f of files) {
             if (covered.has(f.abs)) continue;
             const p = prev.get(f.abs);
             if (p && p.mtimeMs === f.mtimeMs && p.size === f.size) {
                 next.set(f.abs, p);
+                continue;
+            }
+            const claim = claims?.get(path.basename(f.abs));
+            if (claim && f.mtimeMs - claim.updatedAt <= SHADOW_ROW_STALE_WINDOW_MS) {
+                next.set(f.abs, { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: claim.updatedAt, summary: summaryFromRow(claim) });
                 continue;
             }
             decodeCount++;
@@ -630,6 +677,14 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         && typeof (shRaw as Record<string, unknown>)["since"] === "number"
         ? { detected: (shRaw as Record<string, unknown>)["detected"] as string, action: (shRaw as Record<string, unknown>)["action"] as string, since: (shRaw as Record<string, unknown>)["since"] as number }
         : undefined;
+    // #2740: this session's Claude Code auto-mode verdicts were answered locally
+    // by bili (forged allow, zero egress) — surface it so the list can badge the session.
+    const amfRaw = metaRec["autoModeForge"];
+    const autoModeForge = amfRaw !== null && typeof amfRaw === "object"
+        && typeof (amfRaw as Record<string, unknown>)["count"] === "number"
+        && typeof (amfRaw as Record<string, unknown>)["lastAt"] === "number"
+        ? { count: (amfRaw as Record<string, unknown>)["count"] as number, lastAt: (amfRaw as Record<string, unknown>)["lastAt"] as number, ...(typeof (amfRaw as Record<string, unknown>)["lastVariant"] === "string" ? { lastVariant: (amfRaw as Record<string, unknown>)["lastVariant"] as string } : {}) }
+        : undefined;
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
@@ -657,6 +712,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         blocks: s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
         ...(selfHeal ? { selfHeal } : {}),
+        ...(autoModeForge ? { autoModeForge } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
@@ -695,14 +751,21 @@ export function hiddenEmptyCount(): number { return lastHiddenEmpty; }
 
 async function mergedSummaries(): Promise<WebSessionSummary[]> {
     const out = new Map<string, WebSessionSummary>();
-    // #2960 R2.2: full mode serves the disk side from the unified index (one
-    // SQL — no directory walk, no envelope decode, and sessions whose JSON
-    // file vanished stay listed). Legacy/shadow keep the bounded file walk:
-    // there the JSON tree is the truth base and rows may lag unrecorded files.
-    const rows = getDiskStore().unifiedWebSummaries();
-    if (rows !== null) {
-        for (const r of rows) out.set(r.sessionId, summaryFromRow(r));
-    } else {
+    // #2960 R2.2 / #3199: full mode serves the disk side from the unified index
+    // alone (one SQL — no walk, no decode; sessions whose JSON file vanished
+    // stay listed). Shadow RECONCILES the rows against the tree inside
+    // refreshIndex (fresh rows adopted without decode; stale/unrecorded files
+    // decoded; ghost rows dropped because only files produce entries). Legacy
+    // keeps the plain bounded file walk.
+    let fromRows = false;
+    if (getDiskStore().webSummaryBaseline() === "authoritative") {
+        const rows = getDiskStore().unifiedWebSummaries();
+        if (rows !== null) {
+            for (const r of rows) out.set(r.sessionId, summaryFromRow(r));
+            fromRows = true;
+        }
+    }
+    if (!fromRows) {
         const files = await ensureIndex();
         for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
     }

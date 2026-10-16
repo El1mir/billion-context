@@ -647,6 +647,35 @@ describe("#1658 anthropic signed-thinking gate (#651 drop vs #684 pair invariant
         assert.equal(c.lines.length, 1);
     });
 
+    it("redacted_thinking in view disables the #651 drop (#1960)", () => {
+        // The redacted carrier must sit BEFORE the reasoning run: coreToAnthropic merges same-role messages into one assistant message, so dropping the run rewrites the message carrying the redacted block. Placed after the run it would break contiguity and the drop never fires at all (test would pass without the fix).
+        const redacted: BiliMessage = { id: "rd", role: "assistant", contentType: "text", text: "[redacted_thinking]", rawAnthropicBlock: { type: "redacted_thinking", data: "ZGF0YQ==" } };
+        const msgs: BiliMessage[] = [redacted, { id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000) }, CALL(), RESULT(), USER()];
+        const c = collector();
+        assert.equal(withReasoningDrop(msgs, undefined, c.log, "s1", false), msgs);
+        assert.equal(c.lines.length, 0);
+    });
+
+    const reproInboundRedacted: AnthropicMessage[] = [
+        { role: "user", content: "q" },
+        { role: "assistant", content: [{ type: "redacted_thinking", data: "ZGF0YQ==" }, { type: "thinking", thinking: "x".repeat(3000) }, { type: "tool_use", id: "tu1", name: "compress", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "ok" }] },
+        { role: "user", content: "next" },
+    ];
+
+    it("regression: unsigned thinking beside a redacted block no longer drops (#1960 wire shape)", () => {
+        const { msgs } = anthropicToCore({ model: "claude-opus-4-5", messages: reproInboundRedacted });
+        assert.ok(msgs.some((m) => m.rawAnthropicBlock !== undefined && (m.rawAnthropicBlock as { type?: string }).type === "redacted_thinking"));
+        const c = collector();
+        const out = withReasoningDrop(msgs, undefined, c.log, "s1", false);
+        assert.equal(out, msgs);
+        assert.equal(c.lines.length, 0);
+        const outbound = coreToAnthropic(out);
+        const assistantOut = outbound[1]!;
+        assert.ok(Array.isArray(assistantOut.content));
+        assert.equal(assistantOut.content.length, 3);
+    });
+
     it("empty-string signature does not arm the gate", () => {
         const msgs: BiliMessage[] = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000), thinkingSignature: "" }, CALL(), RESULT(), USER()];
         const c = collector();

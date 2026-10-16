@@ -232,3 +232,12 @@ test("#2861: i18n — hostplug.* key sets are identical across locales and non-e
         assert.ok(MESSAGES["zh-CN"][k]?.length > 0 && MESSAGES["en"][k]?.length > 0, `${k} non-empty in both locales`);
     }
 });
+
+test("#3303: notice scopes the pre-compression claim to segment composition/timeline, not the headline size", () => {
+    const zh = MESSAGES["zh-CN"]["hostplug.desc"] ?? "";
+    const en = MESSAGES["en"]["hostplug.desc"] ?? "";
+    assert.ok(!zh.includes("数值不准确"), "zh desc must not re-assert the headline numbers are inaccurate (the #3303 false alarm)");
+    assert.ok(zh.includes("分段") || zh.includes("构成"), "zh desc must scope the pre-compression claim to segment composition");
+    assert.ok(!/not\s+accurate|inaccurate/i.test(en), "en desc must not re-assert the headline figures are inaccurate (the #3303 false alarm)");
+    assert.ok(/composition|segment|timeline/i.test(en), "en desc must scope the pre-compression claim to segment composition / timeline");
+});

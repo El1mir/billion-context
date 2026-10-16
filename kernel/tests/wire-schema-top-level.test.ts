@@ -9,9 +9,6 @@ import {
   ABSORB_TOOL,
   ABSORB_TOOL_OPENAI,
   ABSORB_TOOL_GOOGLE,
-  IMAGE_FULL_TOOL,
-  IMAGE_FULL_TOOL_OPENAI,
-  IMAGE_FULL_TOOL_RESPONSES,
   RETRIEVE_TOOL,
   RETRIEVE_TOOL_OPENAI,
   RETRIEVE_TOOL_RESPONSES,
@@ -76,17 +73,12 @@ function walk(
 test("anthropic input_schema: no top-level combinators on any tool", () => {
   walk(ACP_TOOLS_ANTHROPIC, "anthropic");
   assertPlainTopLevel(ABSORB_TOOL as Record<string, unknown>, "anthropic");
-  assertPlainTopLevel(IMAGE_FULL_TOOL as Record<string, unknown>, "anthropic");
   assertPlainTopLevel(RETRIEVE_TOOL as Record<string, unknown>, "anthropic");
 });
 
 test("openai function.parameters: no top-level combinators on any tool", () => {
   walk(ACP_TOOLS_OPENAI, "openai");
   assertPlainTopLevel(ABSORB_TOOL_OPENAI as Record<string, unknown>, "openai");
-  assertPlainTopLevel(
-    IMAGE_FULL_TOOL_OPENAI as Record<string, unknown>,
-    "openai",
-  );
   assertPlainTopLevel(
     RETRIEVE_TOOL_OPENAI as Record<string, unknown>,
     "openai",
@@ -96,10 +88,6 @@ test("openai function.parameters: no top-level combinators on any tool", () => {
 test("responses flat parameters: no top-level combinators on any tool", () => {
   walk(ACP_TOOLS_RESPONSES, "responses");
   walk(ACP_READONLY_TOOLS_RESPONSES, "responses");
-  assertPlainTopLevel(
-    IMAGE_FULL_TOOL_RESPONSES as Record<string, unknown>,
-    "responses",
-  );
   assertPlainTopLevel(
     RETRIEVE_TOOL_RESPONSES as Record<string, unknown>,
     "responses",

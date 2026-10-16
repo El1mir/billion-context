@@ -20,6 +20,11 @@ export interface NodeEffects {
    *  same input class the apply side sees. Optional — custom pipelines without
    *  a prune node simply don't set it and recommend falls back to its input. */
   originalMessages?: CoreMessage[];
+  /** #3236: the exact array class applyCompression runs on (host-passed, see
+   *  ProcessTurnInput.applyView). Ranks above originalMessages for
+   *  foldability judgment — on lanes whose processTurn input is itself a
+   *  pruned/render view, even the pre-prune input is not the apply class. */
+  applyView?: CoreMessage[];
   readonly [key: string]: unknown;
 }
 

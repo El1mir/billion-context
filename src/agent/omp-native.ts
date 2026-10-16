@@ -25,6 +25,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalAck, markIncrementalDead, planIncrementalTurn, probeIncrementalTurns, clearIncrementalProbe, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -66,6 +67,94 @@ function errMessage(err: unknown): string {
 }
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+
+// #3248 phase 2: incremental-turn divert for omp. omp never emits header
+// events, so the ONLY identity signal at the fetch layer is the
+// `prompt_cache_key` body field the omp extension stamps (pi.ts
+// stampPromptCacheKey — present exactly when the plugin is active). The
+// beforeSend hook reads it as the conversation id, plans the incremental
+// body, swaps init.body and stamps the plugin headers DIRECTLY ON init
+// (per-request, so concurrent sessions on one provider URL cannot cross
+// attributions) — plugin mode is safe here: x-bili-plugin-conversation gets
+// the same value wire mode already resolves to via
+// preferPromptCacheKeyIdentity, so the session id does not fork. One planned
+// in-flight request per URL (onResponse acks are URL-keyed); a second
+// concurrent request on the same URL falls back to full resend.
+interface IncrementalPendingTurn {
+    sid: string;
+    messages: IncrementalWireMessage[];
+    system: unknown;
+    base: string;
+    at: number;
+}
+const incPendingOmp = new Map<string, IncrementalPendingTurn>();
+
+/** Planned turns age out (onResponse only fires on successful sends — a
+ *  network-dead request must not block the URL forever). Mirrors opencode. */
+const INC_PENDING_TTL_MS = 30_000;
+
+/** Test hook: drop all planned turns (module state across suites). */
+export function __resetOmpIncrementalForTests(): void {
+    incPendingOmp.clear();
+}
+
+export async function ompIncrementalBeforeSend(url: string, init: RequestInit | undefined): Promise<void> {
+    try {
+        if (init === undefined || typeof init.body !== "string") { return; }
+        const stale = incPendingOmp.get(url);
+        if (stale !== undefined && Date.now() - stale.at < INC_PENDING_TTL_MS) { return; }
+        incPendingOmp.delete(url);
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(init.body);
+        } catch {
+            return;
+        }
+        if (parsed === null || typeof parsed !== "object") return;
+        const b = parsed as { messages?: unknown; model?: unknown; system?: unknown; prompt_cache_key?: unknown };
+        if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) { return; }
+        const sid = typeof b.prompt_cache_key === "string" ? b.prompt_cache_key.trim() : "";
+        if (sid.length === 0) { return; }
+        const base = state.origin;
+        if (base === undefined) { return; }
+        if (!(await probeIncrementalTurns(base))) { return; }
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
+        if (plan.mode === "skip") { return; }
+        init.body = plan.body;
+        const headers = new Headers(init.headers);
+        headers.set("x-bili-plugin", "omp");
+        headers.set("x-bili-plugin-conversation", sid);
+        headers.set(INCREMENTAL_TURN_MARKER_HEADER, "1");
+        init.headers = headers;
+        incPendingOmp.set(url, { sid, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
+    } catch (e) {
+        // never break the host's request on adapter failure
+    }
+}
+
+state.beforeSend = ompIncrementalBeforeSend;
+
+export function ompIncrementalOnResponse(url: string, response: Response): void {
+    const pending = incPendingOmp.get(url);
+    if (pending === undefined) return;
+    incPendingOmp.delete(url);
+    try {
+        const seq = response.headers.get("x-bili-applied-seq");
+        if (response.status === 200 && seq !== null && Number.isFinite(Number(seq))) {
+            noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
+            return;
+        }
+        if (response.status === 409 || response.status === 503) {
+            markIncrementalDead(pending.sid);
+            if (response.status === 503) clearIncrementalProbe(pending.base);
+            logHostEvent("warn", "[native-client]", `[omp] incremental turn rejected (${response.status}) — conversation ${pending.sid} falls back to full resend (#3248)`);
+        }
+    } catch {
+        // observability only
+    }
+}
+
+state.onResponse = ompIncrementalOnResponse;
 
 async function bootstrap(): Promise<string | undefined> {
     try {
@@ -115,16 +204,14 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
         // Restore the readyOrigin short-circuit — a runtime recovery clears
         // state.origin before re-probing, and a transient blip must not leave
         // it dangling.
-        state.origin = home;
-        process.env.BILLION_CONTEXT_PROXY = home;
+        publishOrigin(home);
         return home;
     }
     const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
         if (back !== undefined) {
-            state.origin = back;
-            process.env.BILLION_CONTEXT_PROXY = back;
+            publishOrigin(back);
             logHostEvent("info", "[native-client]", `bili-native(omp): attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
@@ -135,17 +222,15 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     logHostEvent("error", "[native-client]", `bili-native(omp): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     delete process.env.BILLION_CONTEXT_PROXY;
     state.attach = false;
-    state.origin = undefined;
+    publishOrigin(undefined, false); // env already cleared above
+
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
     // Publish whatever origin lands on BOTH the shared state and the env —
     // env readers (compaction reporter, /acp status) must never disagree with
     // what the route resolves, whoever produced the origin.
     const landed = start().then((o) => {
-        if (o !== undefined) {
-            state.origin = o;
-            process.env.BILLION_CONTEXT_PROXY = o;
-        }
+        if (o !== undefined) publishOrigin(o);
         return o;
     });
     state.ready = landed;
@@ -228,6 +313,28 @@ if (process.env.NODE_TEST_CONTEXT === undefined && ompTrafficRidesBili(process.e
 // patch globalThis.fetch or bootstrap a real proxy from inside a test run.
 if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
     installNativeFetchIntercept(state);
+}
+
+/** Test hook: point the module state at a lane origin (the incremental
+ *  beforeSend reads state.origin as its probe base). */
+let originPinnedForTest = false;
+
+/** Publish a discovered origin to the shared state + env. Every async
+ *  discovery path funnels through here so a test-pinned base (see
+ *  _setOmpOriginForTest) survives attach verify / respawn landing at an
+ *  arbitrary point during a suite — without the guard the pin gets clobbered
+ *  mid-test and probes race off to the REAL lane. */
+function publishOrigin(origin: string | undefined, envToo = true): void {
+    if (originPinnedForTest) return;
+    state.origin = origin;
+    if (!envToo) return;
+    if (origin === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+    else process.env.BILLION_CONTEXT_PROXY = origin;
+}
+
+export function _setOmpOriginForTest(origin: string | undefined): void {
+    originPinnedForTest = origin !== undefined;
+    state.origin = origin;
 }
 
 /** Test hook: expose the armed runtime-recovery seam (mirrors pi/opencode/dsh). */

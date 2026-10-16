@@ -12,47 +12,173 @@ on:
     branches: [master, "*_release-v*"]
   pull_request:
     branches: [master]
+    # three-layer CI (#3295): synchronize keeps the CORE matrix blocking on
+    # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
+    # matrix without a re-push (other labels no-op in the plan job).
+    types: [opened, synchronize, reopened, labeled]
+  # Three-layer CI (#3295): PRs and master pushes pay for the CORE matrix
+  # only. Every 30 minutes this cron asks the plan job whether master moved
+  # since the last green scheduled run; only then does the FULL matrix run.
+  # Lane workflows (e2e/registry/image/theorem/zcode) follow the same gated
+  # cron pattern on their own offsets.
+  schedule:
+    - cron: '3/30 * * * *'   # :03/:33 — a few seconds ahead of the lanes (:04+)
   # One-click release fallback: GitHub suppresses push-event delivery for
   # ref updates made with GITHUB_TOKEN, so the push trigger above never fires
   # on one-click fallback branches (#1744). release-manual.yml compensates by
   # explicitly dispatching this workflow on the fallback branch; the check
   # runs land on the same head sha and make the auto-PR mergeable once green
   # (#772, #1744).
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Run the FULL matrix (12 test legs + 4 static legs) instead of the CORE one"
+        type: boolean
+        default: false
 
 # Same-ref runs cancel superseded in-flight runs: a follow-up push to a
 # branch (bump -> merge master into a release branch, rapid PR pushes,
 # back-to-back master merges) no longer queues a full ~30-job matrix
-# behind its own predecessor. Groups are per workflow+ref, so different
-# branches and different workflows never cancel each other. Approved by
-# owner 2026-10-10 after the release-v0.1.191 CI queue piled up behind
-# same-ref reruns.
+# behind its own predecessor. Groups are per workflow+event+ref, so different
+# branches, different workflows, and (crucially) the scheduled full-matrix
+# runs never cancel each other — a schedule tick landing mid-push-run waits
+# for its own group instead of killing the push signal (#3071 lesson:
+# cancelled master runs shipped red). Approved by owner 2026-10-10 after
+# the release-v0.1.191 CI queue piled up behind same-ref reruns.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Three-layer CI (#3295) plan: decide the matrix scope BEFORE paying for
+  # legs. One cheap ubuntu job picks one of three scopes:
+  #   core — every PR (push) and master push: 6 test legs (ubuntu 22 full 3-shard
+  #          suite, ubuntu 24 single-leg whole suite, windows 22 2-shard) + 1
+  #          static leg. The blocking layer; branch protection requires exactly
+  #          these 6 test leg names.
+  #   full — `ci:full` label on a PR, workflow_dispatch full=true, or the 30-min
+  #          cron when master moved since the last green scheduled run: the
+  #          historical 12-leg test matrix + 4-leg static-gates.
+  #   skip — a `labeled` event for a label other than ci:full, or a cron tick
+  #          where master HEAD == the last green scheduled run's head: nothing
+  #          to do, every dependent job skips (run concludes success so the
+  #          tick records its head_sha — a quiet master costs ~20s per tick).
+  # Matrix entries carry shardTotal so a scope can run FEWER shards per combo
+  # (partitionAll in scripts/run-ci-tests.mjs is total for ANY i/N); the
+  # explicit job `name:` keeps check-run names identical to the legacy 12-leg
+  # names (branch protection keys off `test (os, node, shard)`).
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      scope: ${{ steps.scope.outputs.scope }}
+      testMatrix: ${{ steps.scope.outputs.testMatrix }}
+      staticMatrix: ${{ steps.scope.outputs.staticMatrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          LABEL_EVENT: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.sha }}
+          FULL_INPUT: ${{ inputs.full }}
+        run: |
+          set -euo pipefail
+          CORE_TEST='{"include":[
+            {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":22,"shard":2,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":22,"shard":3,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":1},
+            {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":2},
+            {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":2}]}'
+          CORE_STATIC='{"include":[{"os":"ubuntu-latest","node-version":24}]}'
+          FULL_TEST='{"include":[
+            {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":22,"shard":2,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":22,"shard":3,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":2,"shardTotal":3},
+            {"os":"ubuntu-latest","node-version":24,"shard":3,"shardTotal":3},
+            {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":3},
+            {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":3},
+            {"os":"windows-latest","node-version":22,"shard":3,"shardTotal":3},
+            {"os":"windows-latest","node-version":24,"shard":1,"shardTotal":3},
+            {"os":"windows-latest","node-version":24,"shard":2,"shardTotal":3},
+            {"os":"windows-latest","node-version":24,"shard":3,"shardTotal":3}]}'
+          FULL_STATIC='{"include":[
+            {"os":"ubuntu-latest","node-version":22},
+            {"os":"ubuntu-latest","node-version":24},
+            {"os":"windows-latest","node-version":22},
+            {"os":"windows-latest","node-version":24}]}'
+          scope=core
+          case "$EVENT" in
+            pull_request)
+              # a `labeled` event fires for EVERY label; only ci:full itself
+              # may (re)run — otherwise a random label would shadow the last
+              # full-matrix result with a core one.
+              if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then
+                scope=skip
+              elif grep -qw ci:full <<<"$PR_LABELS"; then
+                scope=full
+              fi
+              ;;
+            workflow_dispatch)
+              [ "$FULL_INPUT" = "true" ] && scope=full || true
+              ;;
+            schedule)
+              # Smart cron: pay for the full matrix only when master moved
+              # since the last green scheduled run of this workflow.
+              LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+              echo "last green scheduled head: ${LAST:-none}; current: $HEAD_SHA"
+              if [ "$LAST" = "$HEAD_SHA" ]; then scope=skip; else scope=full; fi
+              ;;
+            push)
+              ;;
+          esac
+          case "$scope" in
+            core)  TM="$CORE_TEST";  SM="$CORE_STATIC" ;;
+            full)  TM="$FULL_TEST";  SM="$FULL_STATIC" ;;
+            skip)  TM='{"include":[]}'; SM='{"include":[]}' ;;
+          esac
+          {
+            echo "scope=$scope"
+            printf 'testMatrix=%s\n' "$(printf '%s' "$TM" | jq -c .)"
+            printf 'staticMatrix=%s\n' "$(printf '%s' "$SM" | jq -c .)"
+          } >> "$GITHUB_OUTPUT"
+          echo "plan scope: $scope"
+
   # #2637 plan #8 (owner-approved): fail-fast tiering — the ~0-1m guards gate
   # the four platform legs so a broken commit stops in tier 1 instead of
   # paying 4x(install+typecheck+suites+build). Guards with `if: pull_request`
-  # skip on push/dispatch (skipped needs count as satisfied). Behavior change:
-  # on guard failure the required legs show pending (not red); merge blocked.
+  # skip on push/dispatch — and a SKIPPED need cascades the skip to dependents
+  # (the GitHub-documented behavior; the old comment here wrongly assumed
+  # "skipped needs count as satisfied" — the master-push run evidence
+  # (#3145/#3035/#3027 all slipped red to master with `test: skipped`)
+  # disproved it). The explicit `if` below tolerates skipped guards so:
+  #   - pull_request: guards run; guard failure -> failure() -> legs skip
+  #     (required checks show pending, merge blocked — #2637 semantics intact)
+  #   - push/dispatch: PR-only guards skip harmlessly, legs RUN — master gets
+  #     a real post-merge test signal (the missing master-push hole, #3197 era)
+  test:
+    needs: [plan, version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
+    name: test (${{ matrix.os }}, ${{ matrix.node-version }}, ${{ matrix.shard }})
   # #3143: the suite outgrew one runner — ~656 top-level files (~190k LOC) now
   # serialize through c=4 on a single 4-core leg for ~17-20 min (windows slowest;
   # measured 1225s on the last full green run). Sharding spreads the SAME files
   # across more legs: each runs a balanced slice (scripts/run-ci-tests.mjs partitions
   # deterministically + totally, so union of shards == allFiles, nothing skipped,
   # same tests/assertions/env, c=4 within each shard). Wall drops ~3x (~20 -> ~7min)
-  # with zero coverage loss. To go faster, add entries to the list AND bump the "/3"
-  # below together (they must stay equal).
-  test:
-    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
+  # with zero coverage loss. To go faster, add entries to the FULL_TEST include
+  # list in the plan job above (each entry carries its own shardTotal, so the
+  # legacy "bump the /3" coupling is gone — any denominator works).
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node-version: [22, 24]
-        shard: [1, 2, 3]   # keep in sync with CI_TEST_SHARD "<i>/3" below
+      matrix: ${{ fromJSON(needs.plan.outputs.testMatrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -76,19 +202,19 @@ jobs:
       - run: node scripts/run-ci-tests.mjs
         env:
           ACP_TEST_CLAUDE_NATIVE: "1"
-          CI_TEST_SHARD: "${{ matrix.shard }}/3"   # denominator MUST equal matrix.shard length
+          CI_TEST_SHARD: "${{ matrix.shard }}/${{ matrix.shardTotal }}"   # denominator carried per-include by the plan job (#3295)
 
   # #2816: typecheck + the in-repo component suites + the bundle build used
   # to run sequentially in front of the test job (~90s of critical path per
   # leg). They are independent of the proxy test suites, so they run as
   # parallel legs on the same matrix — same commands, off the critical path.
   static-gates:
-    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
+    needs: [plan, version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
+    name: static-gates (${{ matrix.os }}, ${{ matrix.node-version }})
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node-version: [22, 24]
+      matrix: ${{ fromJSON(needs.plan.outputs.staticMatrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

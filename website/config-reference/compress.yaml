@@ -62,6 +62,16 @@ entries:
     desc_zh: "分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。"
     site_en: "Per-tier token-mass trigger thresholds for the T1/T2/T3 paths; each unset sub-field keeps its derived value (T1 = growth step, T2/T3 = step × 1.5)."
     site_zh: "T1/T2/T3 路径的分层 token 质量触发阈值；未设置的子字段保持派生值（T1＝增长步长，T2/T3＝步长 × 1.5）。"
+  - key: compress.minPressureBenefitTokens
+    type: "number (≥ 0)"
+    default: "max(5000, limit × 1%)"
+    group: compress
+    id: cw.mpbt
+    render: compress-row
+    desc_en: "Minimum reclaimable tokens a pressure-band nudge must have to fire; on inflated-meter routes raise it so folds batch into big events instead of high-frequency small-yield churn (#3211). Explicit 0 = legacy any-pending."
+    desc_zh: "压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。"
+    site_en: "Minimum reclaimable tokens for a pressure-band nudge to fire (default max(5000, limit × 1%)); explicit 0 restores legacy any-pending behavior (#3211)."
+    site_zh: "压力带 nudge 触发所需的最小可回收 token 数（默认 max(5000, 上限×1%)）；显式 0 恢复老的任意 pending 行为（#3211）。"
   - key: compress.nudgeModelDecided
     type: boolean
     default: "off (unset)"
@@ -245,16 +255,6 @@ entries:
     desc_zh: "丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
     site_en: "{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
     site_zh: "{ drop?, threshold? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
-  - key: compress.absorb
-    type: object
-    default: "opt-in (disabled)"
-    group: compress
-    id: co.absorb
-    render: obj-item
-    desc_en: "Opt-in instant distillation of large tool results into short abstracts; originals go to the content store."
-    desc_zh: "可选即时蒸馏：把大段工具结果蒸馏成短摘要，原文进内容库。"
-    site_en: "<code>absorb</code> — opt-in instant distillation of large tool results into short abstracts; originals go to the content store (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, toolName \"absorb\"</span>)."
-    site_zh: "<code>absorb</code> —— 可选即时蒸馏：把大段工具结果蒸馏成短摘要，原文进内容库（<span class='mech'>enabled, minToolTokens(默认 1000), contextThresholdPct, excludeTools, toolName \"absorb\"</span>）。"
   - key: compress.ccr
     type: object
     default: "enabled in proxy mode since v2"
@@ -285,16 +285,6 @@ entries:
     desc_zh: "开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。"
     site_en: "<code>search.planAware</code> — off by default: when on, search_context candidates are re-ranked against current plan state (latest-wins todos + last user turn); off keeps byte-identical lexical results."
     site_zh: "<code>search.planAware</code> —— 默认关：开启后 search_context 候选按当前计划状态重排（todo 最新优先 + 上一轮用户消息）；关闭时结果逐字节不变。"
-  - key: compress.imageCompression
-    type: object
-    default: "opt-in (disabled)"
-    group: compress
-    id: co.img
-    render: obj-item
-    desc_en: "Opt-in lossy downscale via optional sharp before sending; image_full restores originals; proxy mode only."
-    desc_zh: "可选有损缩放（依赖可选 sharp）后再发送；image_full 取回原图；仅限代理模式。"
-    site_en: "<code>imageCompression</code> — opt-in lossy downscale via optional sharp before sending (<span class='mech'>enabled, minTokens 512, maxDimension 1280, quality 80, format \"webp\"</span>); <code>image_full</code> restores originals; proxy mode only."
-    site_zh: "<code>imageCompression</code> —— 可选有损缩放（依赖可选 sharp）后再发送（<span class='mech'>enabled, minTokens 512, maxDimension 1280, quality 80, format \"webp\"</span>）；<code>image_full</code> 取回原图；仅限代理模式。"
   - key: compress.prompts
     type: "Partial<Prompts>"
     default: "unset (kernel doctrine)"
@@ -345,36 +335,6 @@ entries:
     desc_zh: "必须先置 true，自定义 prompts 才会生效。"
     site_en: "<code>acknowledgePromptsRisk</code> — must be true before custom prompts take effect."
     site_zh: "<code>acknowledgePromptsRisk</code> —— 必须先置 true，自定义 prompts 才会生效。"
-  - key: compress.absorb.enabled
-    type: boolean
-    default: "false"
-    group: compress
-    desc_en: "Enable the absorb distillation block."
-    desc_zh: "启用 absorb 蒸馏块。"
-  - key: compress.absorb.minToolTokens
-    type: number
-    default: "1000"
-    group: compress
-    desc_en: "Minimum estimated token size of a tool result eligible for absorption."
-    desc_zh: "可被吸收的工具结果的最小估算 token 大小。"
-  - key: compress.absorb.contextThresholdPct
-    type: "number | %"
-    default: "unset"
-    group: compress
-    desc_en: "Only absorb when context usage passes this share of the window."
-    desc_zh: "仅当上下文使用率超过窗口该占比时才吸收。"
-  - key: compress.absorb.excludeTools
-    type: "string[]"
-    default: "[]"
-    group: compress
-    desc_en: "Tool names excluded from absorption."
-    desc_zh: "排除出吸收范围的工具名。"
-  - key: compress.absorb.toolName
-    type: string
-    default: "\"absorb\""
-    group: compress
-    desc_en: "Registered name of the absorb tool."
-    desc_zh: "absorb 工具的注册名。"
   - key: compress.ccr.enabled
     type: boolean
     default: "true (proxy mode)"
@@ -405,36 +365,6 @@ entries:
     group: compress
     desc_en: "Maximum head-excerpt length left inline at the storage pointer."
     desc_zh: "存储指针处内联首段摘录的最大长度。"
-  - key: compress.imageCompression.enabled
-    type: boolean
-    default: "false"
-    group: compress
-    desc_en: "Enable lossy image downscaling (requires the optional sharp dependency)."
-    desc_zh: "启用有损图片缩放（需要可选依赖 sharp）。"
-  - key: compress.imageCompression.minTokens
-    type: number
-    default: "512"
-    group: compress
-    desc_en: "Only downscale images whose counted tokens exceed this."
-    desc_zh: "只对计得 token 超过该值的图片做缩放。"
-  - key: compress.imageCompression.maxDimension
-    type: number
-    default: "1280"
-    group: compress
-    desc_en: "Largest output dimension after downscaling."
-    desc_zh: "缩放后的最大输出边长。"
-  - key: compress.imageCompression.quality
-    type: number
-    default: "80"
-    group: compress
-    desc_en: "Encoder quality (1–100)."
-    desc_zh: "编码质量（1–100）。"
-  - key: compress.imageCompression.format
-    type: string
-    default: "\"webp\""
-    group: compress
-    desc_en: "Output image format."
-    desc_zh: "输出图片格式。"
   - key: compress.prompts.compressPhilosophy
     type: string
     default: "unset (kernel text)"

@@ -41,7 +41,6 @@ interface Scenario {
     thresholdBytes: number;
     plan: Array<number | undefined>;
     gapless: boolean;
-    absorbPct: number;
     ccr: boolean;
     toolsOnClient: boolean;
 }
@@ -70,7 +69,6 @@ function genScenario(rnd: () => number, seed: number): Scenario {
         thresholdBytes: (34 + Math.floor(rnd() * 40)) * 1024,
         plan,
         gapless: rnd() < 0.5,
-        absorbPct: rnd() < 0.5 ? 0.05 : 0,
         ccr: rnd() < 0.5,
         toolsOnClient: rnd() < 0.6,
     };
@@ -181,7 +179,6 @@ async function drive(sc: Scenario, sessionId: string): Promise<string[]> {
             compress: {
                 injectTool: true,
                 injectNudge: true,
-                absorb: { enabled: true, contextThresholdPct: sc.absorbPct },
                 ...(sc.ccr ? { ccr: { enabled: true, minToolTokens: 50 } } : {}),
             },
             promptCache: { routing: "auto" },

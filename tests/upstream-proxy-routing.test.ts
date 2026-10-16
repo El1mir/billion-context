@@ -84,10 +84,12 @@ test("#535/#562: absolute-form request URLs route as forward-proxy targets", () 
         tunnel: true,
     });
     // A target pointing back at the proxy's own listen endpoint is still marked
-    // a tunnel here — the client Host header cannot distinguish it from a real
-    // upstream in a forward proxy. It is rejected downstream by
-    // checkTunnelDestination's self-layer (bound port + local IP) before any
-    // forwarding; see the forward-absolute-url self-target integration test.
+    // a tunnel HERE — resolveUpstream cannot see the bound port. In the live
+    // pipeline handle() rewrites such self-addressed requests to origin form
+    // BEFORE this resolves (#1073/#3245), so they are served locally like direct
+    // connections; the marking keeps any self destination that DOES reach
+    // admission 403'd by checkTunnelDestination's self-layer; see the
+    // forward-absolute-url integration tests.
     assert.deepEqual(resolveUpstream(opts, "http://127.0.0.1:8787/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), {
         upstream: "http://127.0.0.1:8787",
         rewrittenUrl: "http://127.0.0.1:8787/v1/chat/completions",

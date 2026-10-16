@@ -154,12 +154,31 @@ test("storage corpus: fork contract — receipt keeps store, retained-only DROPS
     assert.equal(retained.contentStore, undefined, "retained-only: forkContentStore is DROPPED by buildRecord — this verbatim asymmetry is why #2675 ② exists");
 });
 
-test("storage corpus: image case carries base64 media + image stats", () => {
+test("storage corpus: image case carries base64 media; legacy image-compression keys land per the #3266 back-compat contract", () => {
+    // Back-compat pin for the #3266 removal: the generator re-injects the
+    // pre-removal image-compression keys into the on-disk record after the
+    // normal write (scripts/update-storage-corpus.ts), so the fixture carries
+    // exactly what an older version persisted. Contract on load: whitelisted
+    // readers DROP the stats.* and state.* keys; metadata is an opaque host
+    // bag and passes THROUGH — its imageShrinks entry survives as inert data
+    // nothing reads anymore. Media bytes survive untouched either way.
     const s = loadCase("image");
     const img = s.lastMessages?.find((m) => (m as { contentType?: string }).contentType === "image");
     assert.ok(img, "image message must survive in the persisted tail");
-    assert.equal(s.stats.imageShrunkCount, 1);
-    assert.ok(Array.isArray(s.metadata.imageShrinks), "imageShrinks metadata must survive");
+    const st = s.stats as unknown as Record<string, unknown>;
+    assert.equal(st.imageShrunkCount, undefined, "legacy imageShrunkCount must NOT materialize");
+    assert.equal(st.imageBytesSaved, undefined, "legacy imageBytesSaved must NOT materialize");
+    assert.equal(st.imageTokensSaved, undefined, "legacy imageTokensSaved must NOT materialize");
+    assert.equal(st.imageFullCalls, undefined, "legacy imageFullCalls must NOT materialize");
+    assert.equal(st.imageFullRestores, undefined, "legacy imageFullRestores must NOT materialize");
+    const cs = s.state as unknown as Record<string, unknown>;
+    assert.equal(cs.imageShrinks, undefined, "legacy state.imageShrinks must NOT materialize");
+    assert.equal(cs.imageFullRestored, undefined, "legacy state.imageFullRestored must NOT materialize");
+    assert.deepEqual(
+        (s.metadata as Record<string, unknown>).imageShrinks,
+        [{ ref: "m00021", from: 8192, to: 4096 }],
+        "metadata is an opaque host bag — legacy imageShrinks passes through inert",
+    );
 });
 
 test("storage corpus: ccr sibling file holds the two #1097 originals", () => {

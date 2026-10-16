@@ -6,8 +6,8 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defaultConfig } from "acp-kernel";
-import { startServer } from "../src/server.ts";
+import { defaultConfig, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME } from "acp-kernel";
+import { startServer, BILI_TOOL_NAMES } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
@@ -341,4 +341,15 @@ test("(H) extracted relay module keeps the side-lane boundary (#1440 P2 cut 4)",
         /\b(resolveSideLane|demoteGate|SideLaneDecision|demotedSide|sideRequestLike|SIDE_REQUEST_MAX_TOKENS|isSideRequest|stripLeakedBiliTools|hasLeakedBiliToolsOnly|restoreOutputBudget|sideRequestGuard)\b/,
         "relay.ts must stay decoupled from the side-lane engine symbols",
     );
+});
+
+// (#3293): absorb was removed from bili entirely — the kernel's absorb tool
+// name must no longer be bili-owned: any "absorb" tool in a request is
+// host/client-originated and vetoes side-lane demotion like any other foreign
+// tool. Lands alongside the src/server/side-request.ts edit per #2170
+// (lane logic moves ⇔ a dedicated side-lane suite moves with it).
+test("(I) post-#3293: the removed absorb tool name is no longer bili-owned", () => {
+    assert.ok(!BILI_TOOL_NAMES.has(ABSORB_TOOL_NAME), "absorb is out of the bili-owned set");
+    assert.ok(BILI_TOOL_NAMES.has(RULE_TOOL_NAME), "rules tool still bili-owned");
+    assert.ok(BILI_TOOL_NAMES.has(RETRIEVE_TOOL_NAME), "retrieve tool still bili-owned");
 });

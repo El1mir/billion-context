@@ -1,12 +1,16 @@
-// #2861: known third-party host-side plugins whose context meter reads the
-// host's LOCAL session store. While bili compresses the wire, that store
-// diverges from what the model actually sees: dsh's durable log stays lossless
-// by architectural invariant, so a meter computed from it reports the unfolded
-// local surface (~full history) even though every request carries far fewer
-// tokens. This module detects such plugins conservatively from the client's own
-// registry (best-effort, read-only, cached) so the web UI tells users their
-// figures are pre-compression instead of letting them read "~1M" as a stuck
-// compressor. Every fs access is guarded — detection must NEVER fail a request
+// #2861: known third-party host-side plugins whose context BREAKDOWN derives
+// from the host's LOCAL session store. While bili compresses the wire, that
+// store diverges from what the model actually sees: dsh's durable log stays
+// lossless by architectural invariant and folds happen outside the host event
+// stream (storage: shadow), so the per-category composition / timeline a meter
+// computes from it is the PRE-COMPRESSION distribution even though every
+// request carries far fewer tokens. (dsh-context's headline size is anchored on
+// provider usage and tracks the effective volume — only its split is stale;
+// #3303 measured the two equal within one sampling phase.) This module detects
+// such plugins conservatively from the client's own registry (best-effort,
+// read-only, cached) so the web UI tells users their segment composition is
+// pre-compression instead of letting them read a stale split as the model's
+// view. Every fs access is guarded — detection must NEVER fail a request
 // or a page load.
 //
 // Detection keys off the dsh profile manifest (package.json): a bundle plugin
@@ -45,8 +49,10 @@ interface HostPluginEntry {
 // One row per known host-side metering plugin — adding the next one adds one
 // entry here.
 const KNOWN_HOST_PLUGINS: readonly HostPluginEntry[] = [
-    // #2837: dsh-context meters dsh's durable (lossless) session log, so under
-    // active compression its figures are the pre-compression local surface.
+    // #2837/#3303: dsh-context's segment composition / timeline derive from
+    // dsh's durable (lossless) session log, so under active compression they are
+    // the pre-compression distribution; its headline size is provider-usage-
+    // anchored and tracks the effective volume.
     { client: "dsh", id: "dsh-context", depName: "dsh-context", loaderId: "dsh-context", requiresBiliLane: true },
 ];
 

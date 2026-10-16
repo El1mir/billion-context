@@ -45,7 +45,15 @@ export interface RolloutPlan {
 
 /** Registry of features currently under rollout. EMPTY by default — adding an
  *  entry is a per-feature decision (issue + PR), never mechanical. */
-export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {};
+export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
+    // #3248 incremental turns: lets a native extension send only the delta of
+    // a conversation (marker `x-bili-plugin-turn` on ordinary model requests)
+    // once enabled for this install. Default 0% — every client keeps the
+    // byte-identical full-resend behavior. Operators force it on with
+    // `rollout.features.pluginIncrementalTurns: true` (or a percent), or
+    // `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1`.
+    pluginIncrementalTurns: { percent: 0 },
+};
 
 export const BP_MAX = 10_000;
 

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -199,7 +199,9 @@ test("#841 cold-loaded historical session: read-only, file untouched, no save sc
 
         const allFiles: string[] = [];
         for (const d of readdirSync(dir)) {
-            if (!d.startsWith(".")) for (const f of readdirSync(path.join(dir, d))) allFiles.push(path.join(dir, d, f));
+            // Unified-storage sidecars (index.db, WAL files) sit at the top
+            // level next to the protocol dirs — only descend into directories.
+            if (!d.startsWith(".") && statSync(path.join(dir, d)).isDirectory()) for (const f of readdirSync(path.join(dir, d))) allFiles.push(path.join(dir, d, f));
         }
         assert.ok(allFiles.length > 0, "session file must exist");
         const before = allFiles.map((f) => readFileSync(f, "utf8"));

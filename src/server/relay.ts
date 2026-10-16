@@ -6,8 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
-import { absorbToolName, applyAbsorbView } from "../absorb.js";
-import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, resignApig } from "../apig-resign.js";
+import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { credentialFingerprint, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
@@ -15,7 +14,7 @@ import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } 
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
-import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
+import { buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
@@ -23,7 +22,6 @@ import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
 import { currentFetchTransport } from "../fetch-transport.js";
-import { applyImageCompressionPass, imageFullTrailingNote, imageUsageSuffix } from "../image-compress.js";
 import { countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
 import { dumpReqAllowed as knobDumpReqAllowed, rawDumpDir as knobRawDumpDir } from "../knobs.js";
@@ -47,16 +45,15 @@ import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
 import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
-import { clearUpstreamAlertsForHost, recordUpstreamAlert } from "../upstream-alerts.js";
+import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason } from "../upstream-alerts.js";
 import { formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
-import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, outboundContextEstimates, repairResponsesAssistantOrdering, resignSettingsFor, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -157,6 +154,11 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
     if (est > s.stats.lastInputTokens) {
         s.stats.lastInputTokens = est;
         s.stats.lastInputTokensSource = "estimate";
+        // #3148: the armed state used to be visible only in this warn line —
+        // record it on the session so acp_status can show it to the host/model.
+        // Cleared by the next real usage report (settleUsageReport).
+        s.stats.emergencyShrinkAt = Date.now();
+        s.stats.emergencyShrinkEstimate = est;
         // The error path returns before forward()'s trailing markDirty — the
         // arm must schedule its OWN save or it is lost on restart.
         markDirty(s);
@@ -186,6 +188,15 @@ export async function forward(
         log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
+        return;
+    }
+    // #2740: auto-mode classifier one-shots are answered locally — same
+    // zero-egress contract as codexForge; the audit line was written in
+    // prepare (this line is the egress-proof for the serve itself).
+    if (prepared?.autoModeForge) {
+        log("info", `[${prepared.session.id}] auto-mode classifier served locally (${prepared.autoModeForge.variant}); upstream not contacted`);
+        if (!res.headersSent) res.writeHead(200, { "content-type": prepared.autoModeForge.contentType });
+        res.end(prepared.autoModeForge.body);
         return;
     }
     // #300: stamp the chain marker ONLY when this instance actually processed
@@ -222,6 +233,11 @@ export async function forward(
             return b;
         }
     };
+    // #3280: in v1internal traffic `body` here is ALREADY the standard inner
+    // request — handle.ts unwrapped the envelope before prepare*, and prepared.body
+    // (the rebuilt inner) is what forward() ships. The retry paths below mutate
+    // that inner body directly, so their egress must be re-nested into the
+    // CloudCode envelope via v1Wrap.
     // #1884 re-sign arm: the native lane tunneled this request with the
     // signing credential (x-bili-resign markers — stripped in
     // buildForwardTarget, they must never reach the upstream). Every egress
@@ -230,11 +246,7 @@ export async function forward(
     // just before it hits the wire, so the rewritten body and the signature
     // always agree. A failed re-sign logs and sends the previous signature:
     // the upstream's 401 stays visible instead of a synthetic bili error.
-    const fwdResign = resignSettingsFor(opts, upstreamUrl);
-    const resignCtx =
-        fwdResign.enabled && String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") === APIG_RESIGN_SCHEME
-            ? decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER])
-            : undefined;
+    const resignCtx = inboundResignCredential(req.headers, opts, upstreamUrl);
     if (resignCtx !== undefined) {
         log("info", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign arm active (${APIG_RESIGN_SCHEME}) — every egress body is re-signed (#1884)`);
     }
@@ -572,6 +584,18 @@ export async function forward(
         // instead of blaming the rebuild.
         noteInboundMessages(prepared.session, prepared.originalMessages);
     }
+    // #3148: round-level breaker — while the endpoint is provably dead, fail
+    // fast WITHOUT contacting it instead of burning another full cold send +
+    // the whole in-request retry ladder per host-driven retry round. The
+    // thrown detail carries the actionable state (last failure + next probe)
+    // that the dispatch catch renders into the 502 body.
+    const circuitBlock = upstreamCircuitBlockReason(upstreamUrl);
+    if (circuitBlock !== undefined) {
+        log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
+        if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "upstream circuit open", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
+        if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream circuit open");
+        throw new Error(`upstream circuit open: ${circuitBlock}`);
+    }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
         upstreamResult = await fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
@@ -580,16 +604,19 @@ export async function forward(
         recordUpstreamConnection(upstreamUrl, proxyUrl);
         // #1682: any resolved response proves the host is reachable again.
         clearUpstreamAlertsForHost(upstreamUrl);
+        recordUpstreamCircuitSuccess(upstreamUrl);
     } catch (error) {
         recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
         recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
+        const failureDetail = formatUpstreamError(error, upstreamUrl, proxyUrl, skippedProxy);
+        recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failureDetail);
         // #604: a network-level failure (socket reset, timeout abort) also never
         // reports usage — arm the emergency shrink like the 5xx branch below.
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         // [#1343] no response means the attached full text never reached the model —
         // drop-and-log it (a corrective note surfaces on the next qualifying request).
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-        throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl, skippedProxy)}`, { cause: error });
+        throw new Error(`upstream request failed: ${failureDetail}`, { cause: error });
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
     // ≥0.153 sends "developer"; vLLM/SGLang-style backends answer 400
@@ -1097,7 +1124,7 @@ export async function forward(
                 // Sits AFTER the #2347 plugin-lane tee on purpose: the dump twin must
                 // observe the raw upstream bytes even when the guard aborts them.
                 pluginBody = wrapStreamWithRunawayGuard(pluginBody, (v) => {
-                    log("error", `[${prepared.session.id}] runaway enumeration detected (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+                    log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
                     clientAbort.abort();
                 });
                 if (prepared.protocol === "responses") {
@@ -1210,6 +1237,7 @@ export async function forward(
             const resolvedBuf = await resolveFakeCompletion(upstream.body, {
                 protocol: prepared.protocol,
                 wireBody,
+                wrapBody: v1Active ? v1Wrap : undefined,
                 upstreamUrl,
                 reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                 proxyUrl,
@@ -1337,6 +1365,7 @@ export async function forward(
                     makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
+                        wrapBody: v1Active ? v1Wrap : undefined,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -1385,7 +1414,7 @@ export async function forward(
         // responseBody), so the guard wraps the post-tee body: the dump twin still
         // observes raw upstream bytes even when the guard aborts them.
         responseBody = wrapStreamWithRunawayGuard(responseBody, (v) => {
-            log("error", `[${prepared.session.id}] runaway enumeration detected (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+            log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
             clientAbort.abort();
         });
         // P1.1: wrap the rewriter loops in try/catch. If a rewriter throws
@@ -1399,22 +1428,13 @@ export async function forward(
             // Same absorb gate as prepare*: the section only exists where the
             // tool is callable, keeping loop re-requests byte-consistent with
             // the first request (prefix-cache anchor).
-            const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
-            const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
-            const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-            // Cache-seam: the compress<->absorb join must be byte-identical to
-            // the steady prepare* paths. Every steady wire joins the absorb
-            // section with a plain "\n\n" (sysParts.join / injectSystem parts
-            // join); the historical "---" divider here existed ONLY on round-2
-            // and broke the system-element prefix on every fold while absorb
-            // was armed (probe: cache-seam-probes P1+P2, chat wire diverged at
-            // the absorb boundary char).
-            const absorbSection = absorbActive
-                ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
-                : "";
+            const loopConfig = ccrLoopConfig(prepared.session, config);
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
-            const systemPrompt = withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
+            // #3298 cache-seam parity: every steady prepare* path appends the
+            // project-attribution outermost, so the round-2 rebuild must too or
+            // the head bytes drift at every fold.
+            const systemPrompt = withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, false);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
@@ -1449,7 +1469,7 @@ export async function forward(
                     // crossings — absorb prompts appeared/disappeared mid-history
                     // and broke the prefix cache on every fold while the
                     // threshold was being straddled (probe: cache-seam-probes).
-                    const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, effectiveTokenCount(prepared.session, turn.messages).tokens);
+                    const viewed = turn.messages;
                     const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
                     // #1548: strip only when the compress call rides INBOUND history (client persists
                     // it). Ephemeral acp_loop_* pairs are never re-sent by proxy-mode clients; stripping
@@ -1466,13 +1486,6 @@ export async function forward(
                     // byte prefix broke mid-history on every fold.
                     const dropped = prepared.dropReasoning ? prepared.dropReasoning(out) : out;
                     const ordered = prepared.protocol === "responses" ? repairResponsesAssistantOrdering(dropped, prepared.originalMessages) : dropped;
-                    // [#1095] the folded re-request must carry the SAME bytes the
-                    // model saw (deterministic encode + per-fingerprint cache) —
-                    // applied after the ordering repair, matching the steady
-                    // paths' sequence.
-                    await applyImageCompressionPass(prepared.session, ordered as BiliMessage[], { config: loopConfig, billing: imageBillingFor(opts, route?.rewrittenUrl), cap: imageTokenCapFor(opts, route?.rewrittenUrl), log: ctx.log });
-                    const imgNote = imageFullTrailingNote(prepared.session);
-                    if (imgNote) (ordered as BiliMessage[]).push({ id: "bili_image_full_note", role: "user", contentType: "text", text: imgNote });
                     return ordered;
                 });
             };
@@ -1486,7 +1499,10 @@ export async function forward(
                 responseBody,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
-                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign },
+                // #3280: egress goes out enveloped via wireTransform, so every
+                // round-2+ response comes back enveloped too — unwrap at the loop's
+                // single adoption point or parseStream sees no candidates.
+                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign, responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
@@ -1527,8 +1543,18 @@ export async function forward(
         // this, a thrown arrayBuffer() leaks the timeout and skips markDirty(),
         // losing the persistence of any block this turn's compress created.
         try {
-            const buf = await upstream.arrayBuffer();
-            const text = Buffer.from(buf).toString("utf8");
+            // #3280: read responseBody, not upstream — in v1 mode the Round-1
+            // unwrap above replaced responseBody with a TransformStream that
+            // LOCKS upstream.body, so upstream.arrayBuffer() threw "Body is
+            // unusable" and every non-streaming CloudCode turn responded 200
+            // with an empty body. Non-v1 traffic is unaffected: both pre-branch
+            // body swaps (fake-completion, dumpSse tee) are stream-gated, so
+            // responseBody === upstream.body there. When v1Active, responseBody
+            // is already the unwrapped standard shape (usageMetadata visible to
+            // the accounting below); res.end hands the bare JSON to the v1
+            // framer, which re-wraps it for the client.
+            const buf = responseBody ? Buffer.from(await new Response(responseBody).arrayBuffer()) : Buffer.alloc(0);
+            let text = Buffer.from(buf).toString("utf8");
             try {
                 let json = JSON.parse(text) as Record<string, unknown>;
                 if (prepared.protocol === "responses" && prepared.responsesTextProtocol) {
@@ -1575,7 +1601,7 @@ export async function forward(
                     settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
-                    loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}${imageUsageSuffix(prepared.session)}`);
+                    loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
                 } else {
                     diagnoseSuccessWithoutUsage(prepared.session, "proxy-json");
                 }
@@ -1643,6 +1669,10 @@ async function resolveFakeCompletion(
         /** #1884: re-sign the retry body before it hits the wire (armed
          *  re-sign lane only; undefined on unsigned traffic). */
         resign?: (headers: Record<string, string>, body: string | Buffer) => void;
+        /** #3280: v1internal egress re-wrap — wireBody above is the INNER
+         *  request (the hint needs top-level contents), so the hinted retry
+         *  must go back out inside the CloudCode envelope. */
+        wrapBody?: (body: string | Buffer) => string | Buffer;
     },
 ): Promise<Buffer> {
     let buffer = await readStreamToBuffer(stream, fakeBufCap());
@@ -1653,16 +1683,17 @@ async function resolveFakeCompletion(
         for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
             const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody);
             if (hinted === null) break;
+            const wireHinted = opts.wrapBody ? opts.wrapBody(hinted) : hinted;
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
             let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
             try {
-                opts.resign?.(opts.reqHeaders, hinted);
+                opts.resign?.(opts.reqHeaders, wireHinted);
                 r = await fetchWithTimeout(
                     opts.upstreamUrl,
                     {
                         method: "POST",
                         headers: opts.reqHeaders,
-                        body: hinted,
+                        body: wireHinted,
                         ...(opts.proxyUrl ? { dispatcher: proxyDispatcher(opts.proxyUrl) } : {}),
                     },
                     undefined,

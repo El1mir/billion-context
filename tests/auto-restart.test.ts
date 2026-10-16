@@ -172,7 +172,11 @@ function makeReadyStub(name: string): string {
         "import http from 'node:http';",
         "const port = Number(process.argv[2]);",
         "if (!Number.isFinite(port)) process.exit(64);",
-        "http.createServer((_req, res) => res.end('ok')).listen(port, '127.0.0.1');",
+        // #3182: a stolen port must be distinguishable from a product
+        // failure — exit 91 lets the retry wrapper below re-run the scenario.
+        "const srv = http.createServer((_req, res) => res.end('ok'));",
+        "srv.on('error', (e) => process.exit(e && e.code === 'EADDRINUSE' ? 91 : 1));",
+        "srv.listen(port, '127.0.0.1');",
     ].join("\n"));
     return p;
 }
@@ -589,6 +593,10 @@ test("performSelfRestart: replacement spawn env carries the bind-or-die marker w
 });
 
 test("performSelfRestart: replacement that binds the WRONG port is terminated and service resumes (#3044)", { timeout: 30_000 }, async () => {
+    // #3182: the stub's port can be stolen by concurrent load on a shared
+    // shard runner (bind-0 TOCTOU). A stub that died with exit 91 never
+    // reached the product scenario — re-pick ports and re-run, bounded.
+    for (let attempt = 0; ; attempt++) {
     const { server, port } = await startServer();
     const { log, entries } = makeLog();
     const record: SpawnRecord = {};
@@ -621,10 +629,14 @@ test("performSelfRestart: replacement that binds the WRONG port is terminated an
             for (let i = 0; i < 100 && isPidAlive(record.child.pid); i++) await new Promise((r) => setTimeout(r, 20));
             assert.equal(isPidAlive(record.child.pid), false, "misplaced replacement must be gone — no orphan left behind");
         }
+        break;
+    } catch (e) {
+        if (record.child?.exitCode !== 91 || attempt >= 2) throw e;
     } finally {
         record.child?.kill("SIGKILL");
         server.closeAllConnections?.();
         await new Promise<void>((r) => server.close(() => r()));
+    }
     }
 });
 
@@ -662,12 +674,17 @@ test("performSelfRestart: port taken over by another bili instance → parent ex
     }
 });
 
-test("performSelfRestart: a replacement that survives SIGTERM is escalated loudly (#3044)", { timeout: 30_000 }, async () => {
+test("performSelfRestart: a replacement that survives SIGTERM is escalated loudly (#3044)", { timeout: 30_000, skip: process.platform === "win32" ? "POSIX-only: Windows terminates on SIGTERM uncatchably, so a SIGTERM-surviving stub cannot be modeled (was a w24 CI red, #3182 family)" : false }, async () => {
+    // #3182: same stolen-port retry as above (stub exit 91 = infra TOCTOU).
+    const stubborn = path.join(root, "stub-stubborn.mjs");
+    for (let attempt = 0; ; attempt++) {
     const { server, port } = await startServer();
     const { log, entries } = makeLog();
     const record: SpawnRecord = {};
-    const stubborn = path.join(root, "stub-stubborn.mjs");
     writeFileSync(stubborn, [
+        // No listener by design: the stub models a replacement that never
+        // reaches readiness. It only ignores SIGTERM to force the loud
+        // escalation path (#3044).
         "process.on('SIGTERM', () => {});",
         "setInterval(() => {}, 1000);",
     ].join("\n"));
@@ -687,9 +704,13 @@ test("performSelfRestart: a replacement that survives SIGTERM is escalated loudl
         // parent's timeout — the loud escalation is the point of this test.
         assert.match(entries.join("\n"), /still alive after SIGTERM — manual cleanup required \(kill \d+\)/s);
         assert.equal(await waitForListening(server), true, "service resumes regardless");
+        break;
+    } catch (e) {
+        if (record.child?.exitCode !== 91 || attempt >= 2) throw e;
     } finally {
         record.child?.kill("SIGKILL");
         server.closeAllConnections?.();
         await new Promise<void>((r) => server.close(() => r()));
+    }
     }
 });

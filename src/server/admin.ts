@@ -20,7 +20,7 @@ import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { isCodexClient } from "../codex-compact.js";
-import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
+import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
@@ -103,6 +103,25 @@ function isTrustedAdminOrigin(origin: string | undefined, host: string | undefin
  *  matching the port would reject every forwarded session. Every previously
  *  accepted Host carried a loopback hostname, so dropping the port admits no
  *  non-loopback identity. */
+/** #3248: the /__bili/ gate for surfaces handled OUTSIDE handleAdminRoute
+ *  (the incremental turn endpoint re-enters the proxy pipeline from
+ *  handle.ts, so it cannot ride handleAdminRoute's dispatch — but it must
+ *  pass the exact same loopback + trusted-origin + anti-tunnel checks).
+ *  Exported for handle.ts; returns an error string, or undefined when the
+ *  request may proceed. */
+export function adminGateDenial(req: http.IncomingMessage, bindHost: string): string | undefined {
+    if (headerValue(req, BILI_TUNNEL_HEADER) !== undefined) {
+        return "management endpoints are not reachable through the bili tunnel";
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        return `management endpoints are loopback-only; access denied for ${req.socket.remoteAddress ?? "unknown"}`;
+    }
+    if (!isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHostnames(bindHost))) {
+        return "management request origin does not match the local bili UI";
+    }
+    return undefined;
+}
+
 function adminTrustedHostnames(bindHost: string): Set<string> {
     const names = ["localhost", "127.0.0.1", "::1"];
     const bound = normalizeAdminHostname(bindHost);
@@ -124,12 +143,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // only), but a user can set --host 0.0.0.0 to share the proxy on a LAN —
     // in that case we still must NOT expose management to the LAN. Only the
     // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
-    // #1073: an absolute-form request addressed to THIS instance's own endpoint
-    // is a fetch of us, not a tunnel — strip the authority so the admin gate
-    // below sees a normal origin-form request and answers with real health
-    // state instead of 403ing via the tunnel path.
-    const selfProbePath = selfAdminProbePath(req.url ?? "", req.socket.localPort);
-    if (selfProbePath !== undefined) req.url = selfProbePath;
+    // #1073/#3245: self-addressed absolute-form requests arrive already
+    // rewritten to origin form by handle() (selfAddressedLocalPath), so the
+    // gates below always judge a path, never a full URL.
     const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
     // #409: management must never be reachable THROUGH the bili tunnel, not
     // even from a loopback client: the tunnel's inner connection originates

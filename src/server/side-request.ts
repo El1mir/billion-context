@@ -3,7 +3,7 @@ import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, shouldReserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
-import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
+import { ACP_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -185,10 +185,8 @@ export function resolveSideLane(s: SideLaneSignals): SideLaneDecision {
 // guaranteed bili-owned, and any host tool vetoes the demotion.
 export const BILI_TOOL_NAMES: ReadonlySet<string> = new Set([
     ...ACP_TOOL_NAMES,
-    ABSORB_TOOL_NAME,
     RULE_TOOL_NAME,
     RETRIEVE_TOOL_NAME,
-    IMAGE_FULL_TOOL_NAME,
 ]);
 
 /** Tool names declared by `parsed.tools`, proto-agnostically. null when the
@@ -296,20 +294,43 @@ export function writeOutputBudget(parsed: Record<string, unknown>, field: Output
     parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: tokens };
 }
 
-// #1840: one-shot "restore has no ceiling" warnings, keyed by MODEL (the fact
-// is model-scoped — any session hitting the same ceiling-less model repeats
-// the same silent degradation). Capped like warnedNoModelRequests: an unbounded
-// set would grow one entry per dead model id on long-running daemons.
+// #3071: absolute capability floor for the output budget when NO source knows a
+// ceiling for the model. The client's raw-history-derived budget decays unbounded
+// (…, 3071, 2061, 252, <=200); "last non-starved wins" then pins the session at a
+// death rattle with NO lower bound, and a fresh fork child inherits that rattle and
+// forwards it verbatim (max_tokens=1 out the door). Floor the forwarded budget at
+// this minimum so a ceiling-less model can never truncate every reply below the
+// point where the model can even emit a compress call or short visible text. It is
+// a LOWER bound only — a healthy client value above it passes through untouched.
+// Magnitude is 32K, not 8K (#3071 follow-up, owner decision 2026-10-15): a ceiling-less
+// model generally sustains >=32K of output, while 8K is consumed by a single modest
+// thinking block before any visible text survives, so 8K left the problem unfixed.
+// Flat (not window-relative): restoreOutputBudget runs BEFORE the window is resolved
+// at its call site, and both the downstream #453 clamp and the output-headroom
+// reservation (which self-caps at 25% of window) bound the result by real headroom
+// regardless of this floor.
+export const OUTPUT_RESTORE_ABSOLUTE_FLOOR = 32768;
+
+// #1840/#3071: one-shot "restore has no ceiling" warnings, keyed by SESSION+MODEL.
+// #1840 keyed them by MODEL alone, but the degradation is SESSION-scoped: the
+// session actually being starved got no warn because another session hit the same
+// ceiling-less model first (#3071 path 2a). Keying by session+model gives each
+// affected session exactly one WARN naming itself while staying bounded (the cap
+// limits the set size, not the turn count).
 const warnedNoOutputCeiling = new Set<string>();
 const WARNED_NO_OUTPUT_CEILING_CAP = 4096;
-function noteNoOutputCeilingWarning(model: string): boolean {
-    if (warnedNoOutputCeiling.has(model)) return false;
+function noteNoOutputCeilingWarning(sessionId: string, model: string): boolean {
+    const key = `${sessionId}|${model}`;
+    if (warnedNoOutputCeiling.has(key)) return false;
     if (warnedNoOutputCeiling.size >= WARNED_NO_OUTPUT_CEILING_CAP) warnedNoOutputCeiling.clear();
-    warnedNoOutputCeiling.add(model);
+    warnedNoOutputCeiling.add(key);
     return true;
 }
 export function _resetNoOutputCeilingWarningsForTest(): void {
     warnedNoOutputCeiling.clear();
+}
+function noCeilingWarnText(sessionId: string, model: string, from: number, to: number): string {
+    return `[${sessionId}] output-budget restore has NO known output ceiling for model=${model} (raised ${from} -> ${to}) — the target was the client's own raw-history estimate, which decays unbounded; while it stays pathologically small every turn truncates at max-tokens. Declare the model's max output in the bili config (providers.<url>.models."${model}".output) or have the client report it to floor the restore higher (#1840/#3071)`;
 }
 
 // #2904: the no-ceiling degraded state surfaced by the /acp panel, the
@@ -345,9 +366,13 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  still bounds the result by real window headroom. A ceiling at/below the
  *  side-request threshold is not usable; a healthy water mark above the
  *  ceiling keeps winning (it is a capability floor, not an instruction cap).
- *  When NO source knows a ceiling, warn once per model: the restore is backed
- *  only by the client's own last non-starved value, which is exactly the
- *  silent-degradation path this issue reports. */
+ *  #3071: when NO source knows a ceiling, a STARVED / born-starved /
+ *  fork-inherited value must never leave the proxy below
+ *  OUTPUT_RESTORE_ABSOLUTE_FLOOR — the restore target is floored there so a
+ *  ceiling-less model can never pin the session at a death rattle (the client's
+ *  own decaying high-water is itself the poisoned quantity). A non-starved value
+ *  is always trusted and recorded verbatim as the high-water. The no-ceiling
+ *  condition warns once per SESSION+model (the degradation is session-scoped). */
 export function restoreOutputBudget(
     parsed: unknown,
     session: { id: string; metadata: Record<string, unknown> },
@@ -360,6 +385,9 @@ export function restoreOutputBudget(
     const value = readOutputBudget(p, field);
     if (value === undefined) return;
     const modelName = typeof p.model === "string" && p.model.length > 0 ? p.model : "?";
+    // A usable ceiling is known from some source (runtime-info / launcher /
+    // configured route / registry); a value at/below the side threshold is not usable.
+    const ceiling = typeof outputCeiling === "number" && outputCeiling > SIDE_REQUEST_MAX_TOKENS ? outputCeiling : undefined;
     if (value > SIDE_REQUEST_MAX_TOKENS) {
         session.metadata.outputBudgetHighWater = value;
         // #2904: a healthy (non-starved) budget means the client's own estimate
@@ -368,24 +396,35 @@ export function restoreOutputBudget(
         clearNoCeilingDegraded(session, modelName);
         return;
     }
+    // Starved main request (tiny budget + tools present). A side request (no tools)
+    // never reaches here — restoring it would break its side status.
     if (!Array.isArray(p.tools) || p.tools.length === 0) return;
     const highWaterRaw = session.metadata.outputBudgetHighWater;
     const highWater = typeof highWaterRaw === "number" && highWaterRaw > SIDE_REQUEST_MAX_TOKENS ? highWaterRaw : undefined;
     let target = highWater;
-    const ceiling = typeof outputCeiling === "number" && outputCeiling > SIDE_REQUEST_MAX_TOKENS ? outputCeiling : undefined;
-    if (ceiling !== undefined && (target === undefined || ceiling > target)) target = ceiling;
+    if (ceiling !== undefined && (target === undefined || ceiling > target)) {
+        target = ceiling;
+    } else if (ceiling === undefined) {
+        // #3071 path 1 + path 2b: a starved budget must never leave the proxy
+        // verbatim. A fresh fork child inherits the parent's rattle with no
+        // high-water of its own, so this branch guarantees max_tokens is always
+        // raised to at least the capability floor when no ceiling is known.
+        if (target === undefined || OUTPUT_RESTORE_ABSOLUTE_FLOOR > target) target = OUTPUT_RESTORE_ABSOLUTE_FLOOR;
+    }
     if (typeof target === "number") {
         writeOutputBudget(p, field, target);
-        const note = target === ceiling && ceiling !== undefined
+        const note = ceiling !== undefined && target === ceiling
             ? (highWater === undefined ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)" : `; high-water ${highWater} below known output ceiling — floored (#1665/#1840)`)
-            : "";
+            : (ceiling === undefined ? "; no known output ceiling — floored to the absolute capability minimum (#3071)" : "");
         log("info", `[${session.id}] output budget restored ${value} -> ${target} (#546: client shrank it from its raw-history estimate${note})`);
     }
     // #2904: persist the no-ceiling degraded state for the user-visible surfaces.
+    // With the #3071 absolute floor a ceiling-less starve is ALWAYS restored (never
+    // forwarded verbatim), so target is always a number in that branch.
     if (ceiling !== undefined) clearNoCeilingDegraded(session, modelName);
     else session.metadata.outputBudgetDegraded = { model: modelName, value: typeof target === "number" ? target : value, ts: Date.now() };
-    if (ceiling === undefined && noteNoOutputCeilingWarning(modelName)) {
-        log("warn", `[${session.id}] output-budget restore has NO known output ceiling for model=${modelName}${typeof target === "number" ? ` (restored ${value} -> ${target})` : ` (starved budget ${value} forwarded verbatim)`} — the target is the client's own last non-starved budget; while it stays pathologically small every turn truncates at max-tokens. Declare the model's max output in the bili config (providers.<url>.models."${modelName}".output) or have the client report it to floor the restore (#1840)`);
+    if (ceiling === undefined && noteNoOutputCeilingWarning(session.id, modelName)) {
+        log("warn", noCeilingWarnText(session.id, modelName, value, typeof target === "number" ? target : value));
     }
 }
 

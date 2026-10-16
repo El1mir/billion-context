@@ -10,7 +10,6 @@
     "search_context",
     "acp_status",
     "acp_cache",
-    "absorb",
     "acp_rule",
     "acp_retrieve"
   ],
@@ -18,7 +17,7 @@
     "anthropic": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -136,7 +135,7 @@
       },
       {
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -172,7 +171,7 @@
       },
       {
         "name": "search_context",
-        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -192,7 +191,7 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {}
@@ -200,7 +199,7 @@
       },
       {
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -213,27 +212,6 @@
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
             }
           }
-        }
-      },
-      {
-        "name": "absorb",
-        "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
-        "input_schema": {
-          "type": "object",
-          "properties": {
-            "ref": {
-              "type": "string",
-              "description": "mNNNNN ref of the tool result to absorb (from the [ACP absorb] instruction)"
-            },
-            "summary": {
-              "type": "string",
-              "description": "Distilled essentials of the tool result — this replaces the original output in context"
-            }
-          },
-          "required": [
-            "ref",
-            "summary"
-          ]
         }
       },
       {
@@ -279,7 +257,7 @@
         "type": "function",
         "function": {
           "name": "compress",
-          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -400,7 +378,7 @@
         "type": "function",
         "function": {
           "name": "decompress",
-          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
+          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -439,7 +417,7 @@
         "type": "function",
         "function": {
           "name": "search_context",
-          "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+          "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -462,7 +440,7 @@
         "type": "function",
         "function": {
           "name": "acp_status",
-          "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+          "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {}
@@ -473,7 +451,7 @@
         "type": "function",
         "function": {
           "name": "acp_cache",
-          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -486,30 +464,6 @@
                 "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
               }
             }
-          }
-        }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "absorb",
-          "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "ref": {
-                "type": "string",
-                "description": "mNNNNN ref of the tool result to absorb (from the [ACP absorb] instruction)"
-              },
-              "summary": {
-                "type": "string",
-                "description": "Distilled essentials of the tool result — this replaces the original output in context"
-              }
-            },
-            "required": [
-              "ref",
-              "summary"
-            ]
           }
         }
       },
@@ -561,7 +515,7 @@
       {
         "type": "function",
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -680,7 +634,7 @@
       {
         "type": "function",
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -709,7 +663,7 @@
       {
         "type": "function",
         "name": "search_context",
-        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -730,7 +684,7 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {}
@@ -739,7 +693,7 @@
       {
         "type": "function",
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -752,28 +706,6 @@
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
             }
           }
-        }
-      },
-      {
-        "type": "function",
-        "name": "absorb",
-        "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "ref": {
-              "type": "string",
-              "description": "mNNNNN ref of the tool result to absorb (from the [ACP absorb] instruction)"
-            },
-            "summary": {
-              "type": "string",
-              "description": "Distilled essentials of the tool result — this replaces the original output in context"
-            }
-          },
-          "required": [
-            "ref",
-            "summary"
-          ]
         }
       },
       {

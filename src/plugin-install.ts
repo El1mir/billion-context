@@ -1738,7 +1738,15 @@ function readKimiInstalledRegistry(file: string): { version: number; plugins: Ki
 function writeJsonAtomic(file: string, data: unknown): void {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+    // fsync before rename: a crash between write and rename otherwise leaves a
+    // size-correct, VDL=0 zero file (#3157).
+    const fd = fs.openSync(tmp, "w");
+    try {
+        fs.writeFileSync(fd, `${JSON.stringify(data, null, 2)}\n`);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
     fs.renameSync(tmp, file);
 }
 

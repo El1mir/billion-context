@@ -60,7 +60,6 @@ const BILI_INJECTABLE_TOOL_NAMES = new Set([
     "acp_rule",
     "acp_retrieve",
     "absorb",
-    "image_full",
 ]);
 
 // module-local type: only this file's exported detectors return it (internal-only export

@@ -1057,28 +1057,6 @@
     }
   },
   "synthesized": {
-    "absorbResponses": {
-      "type": "function",
-      "name": "absorb",
-      "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "ref": {
-            "type": "string",
-            "description": "mNNNNN ref of the tool result to absorb (from the [ACP absorb] instruction)"
-          },
-          "summary": {
-            "type": "string",
-            "description": "Distilled essentials of the tool result — this replaces the original output in context"
-          }
-        },
-        "required": [
-          "ref",
-          "summary"
-        ]
-      }
-    },
     "ruleAnthropic": {
       "name": "acp_rule",
       "description": "Record a short, principle-level reminder so it survives context compression — the call and its result are protected and stay in context. Record when: the user calls out or repeatedly emphasizes a lesson; the user asks you to remember or follow a behavior; you personally hit a major pitfall worth remembering long-term. Keep each rule to one short line. Omit the rule argument to list recorded rules. To remove a recorded rule pass delete with its id (e.g. \"rule3\"); to remove every recorded rule pass clear: true. delete and clear are mutually exclusive with each other and with rule — use one operation per call.",
@@ -1235,22 +1213,6 @@
             "ref"
           ]
         }
-      }
-    },
-    "imageFullGoogle": {
-      "name": "image_full",
-      "description": "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "ref": {
-            "type": "string",
-            "description": "mNNNNN ref of the message whose image(s) should be restored to full resolution"
-          }
-        },
-        "required": [
-          "ref"
-        ]
       }
     }
   }

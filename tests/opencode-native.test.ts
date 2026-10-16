@@ -29,14 +29,14 @@ after(() => {
 
 import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
-import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
+import { ACP_TOOLS_OPENAI } from "../src/compress-tool.ts";
 
 const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode, armNativeOpencode, verifyAttachAndRecover, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } = await import("../src/agent/opencode-native.ts");
 const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
 const { markNativeHost, nativeAttachOrigin } = await import("../src/agent/native-bootstrap.ts");
 const nativeDefault = (await import("../src/agent/opencode-native.ts")).default;
 
-const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
+const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name)];
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -421,6 +421,135 @@ test("native route: attach mode respawns on runtime death and routes to the repl
     await route(e2, s);
     assert.equal(respawnCalls, 1, "no re-spawn while the replacement is healthy");
     assert.equal((e2.request as Request).url, `${spawned}/bili/${MODEL_URL}`);
+});
+
+// #3308: the degrade branch must apply the #2924 ruling — a body that
+// provably cannot fit the model's window is refused locally instead of riding
+// the direct fallback into a guaranteed upstream 400 (which on an over-window
+// session history then repeats on every later turn until restart).
+test("route: proxy down + body provably over the model window throws a local refusal", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const route = createNativeRoute(state, { probe: async () => false });
+    const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+    const body = JSON.stringify({ messages: [{ role: "user", content: "x".repeat(5_000) }] });
+    const e: V2HttpRequestEvent = {
+        sessionID: "ses_ow",
+        model: { providerID: "prov", id: "model-x" },
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body }),
+    };
+    await assert.rejects(route(e, s), /proxy unavailable/);
+    assert.equal((e.request as Request).url, MODEL_URL, "refused request is not rewritten");
+    assert.equal(s.proxyBase, undefined);
+    assert.equal(await (e.request as Request).text(), body, "measuring through the clone leaves the original body sendable");
+});
+
+test("route: proxy down + under-window body keeps the fail-open direct send", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const route = createNativeRoute(state, { probe: async () => false });
+    const s: V2State = { windows: new Map([["prov/model-x", 1_000_000]]) };
+    const body = JSON.stringify({ messages: [{ role: "user", content: "hi" }] });
+    const e: V2HttpRequestEvent = {
+        sessionID: "ses_uw",
+        model: { providerID: "prov", id: "model-x" },
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body }),
+    };
+    await route(e, s);
+    assert.equal((e.request as Request).url, MODEL_URL);
+    assert.equal(s.proxyBase, undefined);
+});
+
+test("route: proxy down + unknown or mismatched window keeps the fail-open direct send (no false refusal)", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const route = createNativeRoute(state, { probe: async () => false });
+    const bigBody = JSON.stringify({ messages: [{ role: "user", content: "x".repeat(5_000) }] });
+    // no window map at all (bootstrap never landed, catalog never harvested)
+    const s1: V2State = {};
+    const e1: V2HttpRequestEvent = {
+        sessionID: "ses_nw",
+        model: { providerID: "prov", id: "model-x" },
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body: bigBody }),
+    };
+    await route(e1, s1);
+    assert.equal((e1.request as Request).url, MODEL_URL);
+    // window known for a DIFFERENT model — this model's window is still unknown
+    const s2: V2State = { windows: new Map([["other/model-y", 1_000]]) };
+    const e2: V2HttpRequestEvent = {
+        sessionID: "ses_mm",
+        model: { providerID: "prov", id: "model-x" },
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body: bigBody }),
+    };
+    await route(e2, s2);
+    assert.equal((e2.request as Request).url, MODEL_URL);
+    // no model info on the event — cannot attribute a window
+    const s3: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+    const e3: V2HttpRequestEvent = {
+        sessionID: "ses_nm",
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body: bigBody }),
+    };
+    await route(e3, s3);
+    assert.equal((e3.request as Request).url, MODEL_URL);
+});
+
+test("setup(route): window priming before the route arms the refusal on a fresh degraded session", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const hooks: Array<{ name: string; cb: (e: V2HttpRequestEvent) => void | Promise<void> }> = [];
+    const ctx: V2PluginContext = {
+        session: {
+            hook: (name, cb) => {
+                hooks.push({ name, cb });
+                return Promise.resolve({ dispose() {} });
+            },
+        },
+        model: {
+            list: () => Promise.resolve({ data: [{ providerID: "prov", id: "model-x", limit: { context: 1_000 } }] }),
+        },
+    };
+    const setup = createOpencodeV2Setup({ route: createNativeRoute(state, { probe: async () => false }) });
+    const cleanup = await setup(ctx);
+    try {
+        const body = JSON.stringify({ messages: [{ role: "user", content: "x".repeat(5_000) }] });
+        const e: V2HttpRequestEvent = {
+            sessionID: "ses_prim",
+            model: { providerID: "prov", id: "model-x" },
+            request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body }),
+        };
+        // The harvest commits on microtasks ahead of the route's own awaits,
+        // so even the FIRST request of a never-bootstrapped session is refused
+        // once the catalog answers fast (#3308 priming order).
+        await assert.rejects(async () => { await hooks[0].cb(e); }, /proxy unavailable/);
+        assert.equal((e.request as Request).url, MODEL_URL);
+    } finally {
+        cleanup();
+    }
+});
+
+test("setup(route): empty catalog keeps the fail-open direct send (no false refusal)", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const hooks: Array<{ name: string; cb: (e: V2HttpRequestEvent) => void | Promise<void> }> = [];
+    const ctx: V2PluginContext = {
+        session: {
+            hook: (name, cb) => {
+                hooks.push({ name, cb });
+                return Promise.resolve({ dispose() {} });
+            },
+        },
+        model: { list: () => Promise.resolve({ data: [] }) },
+    };
+    const setup = createOpencodeV2Setup({ route: createNativeRoute(state, { probe: async () => false }) });
+    const cleanup = await setup(ctx);
+    try {
+        const body = JSON.stringify({ messages: [{ role: "user", content: "x".repeat(5_000) }] });
+        const e: V2HttpRequestEvent = {
+            sessionID: "ses_empty",
+            model: { providerID: "prov", id: "model-x" },
+            request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body }),
+        };
+        await hooks[0].cb(e);
+        assert.equal((e.request as Request).url, MODEL_URL);
+        assert.equal((e.request as Request).headers.get("x-bili-plugin"), null, "degraded request stays unstamped");
+    } finally {
+        cleanup();
+    }
 });
 
 test("native route: attach mode transient blip re-attaches to the SAME origin (no migration, #1135)", async () => {

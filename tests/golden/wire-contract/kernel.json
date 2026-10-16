@@ -1509,58 +1509,6 @@
         ]
       }
     },
-    "IMAGE_FULL_TOOL": {
-      "name": "image_full",
-      "description": "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "ref": {
-            "type": "string",
-            "description": "mNNNNN ref of the message whose image(s) should be restored to full resolution"
-          }
-        },
-        "required": [
-          "ref"
-        ]
-      }
-    },
-    "IMAGE_FULL_TOOL_OPENAI": {
-      "type": "function",
-      "function": {
-        "name": "image_full",
-        "description": "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "ref": {
-              "type": "string",
-              "description": "mNNNNN ref of the message whose image(s) should be restored to full resolution"
-            }
-          },
-          "required": [
-            "ref"
-          ]
-        }
-      }
-    },
-    "IMAGE_FULL_TOOL_RESPONSES": {
-      "type": "function",
-      "name": "image_full",
-      "description": "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "ref": {
-            "type": "string",
-            "description": "mNNNNN ref of the message whose image(s) should be restored to full resolution"
-          }
-        },
-        "required": [
-          "ref"
-        ]
-      }
-    },
     "RETRIEVE_TOOL": {
       "name": "acp_retrieve",
       "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text; the placeholder stays in context. Unknown refs return not-found.",
@@ -1661,13 +1609,6 @@
         "enabled": false,
         "minReduction": 0.1
       },
-      "imageCompression": {
-        "enabled": false,
-        "minTokens": 512,
-        "maxDimension": 1280,
-        "quality": 80,
-        "format": "webp"
-      },
       "ccr": {
         "enabled": false,
         "toolName": "acp_retrieve",
@@ -1691,8 +1632,7 @@
       "ACP_CACHE_TOOL_NAME": "acp_cache",
       "ABSORB_TOOL_NAME": "absorb",
       "RETRIEVE_TOOL_NAME": "acp_retrieve",
-      "RULE_TOOL_NAME": "acp_rule",
-      "IMAGE_FULL_TOOL_NAME": "image_full"
+      "RULE_TOOL_NAME": "acp_rule"
     },
     "markers": {
       "ACP_TEXT_OPEN": "<acp_compress>",

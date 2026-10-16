@@ -9,10 +9,10 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import biliOpencodePlugin from "../src/agent/opencode.ts";
-import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI, RETRIEVE_TOOL_NAME, retrieveToolsFor } from "../src/compress-tool.ts";
+import { ACP_TOOLS_OPENAI, RETRIEVE_TOOL_NAME, retrieveToolsFor } from "../src/compress-tool.ts";
 import { fetchManifest, fitNoticeDescription } from "../src/agent/shared.ts";
 
-const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
+const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name)];
 
 const LONG_PANEL = Array.from({ length: 30 }, (_, i) => `panel line ${String(i + 1).padStart(2, "0")}: ${"x".repeat(38)}`).join("\n");
 const LONG_REPORT = Array.from({ length: 200 }, (_, i) => `report line ${String(i + 1).padStart(3, "0")}: ${"y".repeat(38)}`).join("\n");
@@ -230,7 +230,7 @@ test("v2 setup: registers the bundled bili tools synchronously with exact schema
                 assert.equal(t.options?.codemode, false);
                 assert.equal(t.options?.permission, "allow");
             }
-            const compressSrc = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].find((t) => t.function.name === "compress")!;
+            const compressSrc = [...ACP_TOOLS_OPENAI].find((t) => t.function.name === "compress")!;
             assert.deepEqual(fake.addedTools.find((t) => t.name === "compress")!.input, compressSrc.function.parameters);
         } finally {
             cleanup();
