@@ -1,4 +1,5 @@
 import { ACP_NAME_ALT } from "./loop/tag-echo-filter.js";
+import { DEFAULT_TEXT_RUN_THRESHOLD, guardrailTextRunThreshold } from "./knobs.js";
 
 // Runaway-enumeration intrinsic termination (#2346). One assistant message can
 // degenerate into hundreds of echoed markers (render tags / tool-call XML) with no
@@ -67,9 +68,14 @@ export const TOOL_XML_THRESHOLD = 300; // legit multi-tool turns << this; runawa
 const TOOL_XML_GAP_AVG_BYTES = 64;
 // #3260: single-codepoint repetition lane. Parity with pi's findDegenerateRuns minRun
 // (200) — the value billion-context-pi runs in production; legit text never carries
-// 200 identical codepoints in a row, a symbol-loop model does (#3946). Internal
-// constant on purpose: no config surface for a detector threshold (#2030 discipline).
-export const TEXT_RUN_THRESHOLD = 200;
+// 200 identical codepoints in a row, a symbol-loop model does (#3946). The default
+// stayed internal through #3260; #3406 item 1 (from the #3331 review) added the
+// guardrails.textRunThreshold knob — BILI_GUARDRAIL_TEXT_RUN_THRESHOLD > config file
+// > this default, 0 disables the lane — so users whose models legitimately emit long
+// same-char runs (code comment separators, ASCII rules) have an escape hatch. The
+// EFFECTIVE threshold resolves per guard at creation; the exported constant is the
+// documented default (kept stable for the tests that pin default behavior).
+export const TEXT_RUN_THRESHOLD = DEFAULT_TEXT_RUN_THRESHOLD;
 // Size at which the NDJSON fallback engages: a real SSE body separates every frame
 // with a blank line long before this, so a buffer this large holding no blank line
 // is not SSE-shaped.
@@ -110,14 +116,23 @@ const TEXT_LEAF_KEYS: ReadonlySet<string> = new Set([
     "content", "text", "thinking", "reasoning", "reasoning_content", "delta",
 ]);
 // Branches whose strings are NEVER model output. Tool-call arguments are user intent
-// (#1039): a write-tool payload of 300 '=' must not abort the turn.
+// (#1039): a write-tool payload of 300 '=' must not abort the turn. `args` /
+// `functionCall` cover the Google wire, where a tool call rides
+// candidates[].content.parts[].functionCall.args and its payload fields are often
+// named `content` — a TEXT_LEAF_KEYS name, so without the branch exclusion the
+// argument bytes would be fed to the text-run lane (the openai `arguments` /
+// responses `partial_json` keys were already excluded; Google events carry no
+// top-level `type`, so the snapshot/function_call frame gate can't catch them).
 const EXCLUDED_BRANCHES: ReadonlySet<string> = new Set([
     "arguments", "input", "partial_json", "tool_calls", "tools", "functions", "system",
     "instructions", "metadata", "usage", "usageMetadata", "logprobs", "annotations",
-    "error", "id", "url",
+    "error", "id", "url", "args", "functionCall", "parameters",
 ]);
 
 export function createRunawayGuard(): RunawayGuard {
+    // #3406: resolve the text-run threshold ONCE per guard — a stream keeps the
+    // threshold it started with even if the knob flips mid-flight. 0 = lane off.
+    const textRunThreshold = guardrailTextRunThreshold();
     let pending = "";
     let acpTags = 0;
     let toolXml = 0;
@@ -213,7 +228,7 @@ export function createRunawayGuard(): RunawayGuard {
     // CODE POINT, so an astral character (emoji) counts as one unit, not two surrogates.
     const feedText = (text: string): RunawayVerdict => {
         if (tripped) return { tripped: true, reason: undefined, detail: detail() };
-        if (text.length === 0) return { tripped: false };
+        if (text.length === 0 || textRunThreshold <= 0) return { tripped: false };
         for (const cp of text) {
             if (cp === lastCp) {
                 textRun += 1;
@@ -225,7 +240,7 @@ export function createRunawayGuard(): RunawayGuard {
                 lastCp = cp;
                 textRun = 1;
             }
-            if (textRun >= TEXT_RUN_THRESHOLD) {
+            if (textRun >= textRunThreshold) {
                 tripped = true;
                 return { tripped: true, reason: "text-run", detail: detail() };
             }

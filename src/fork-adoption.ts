@@ -262,14 +262,86 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     // dropped (its failed tail, a rewound branch) — and the model's older
     // text may still cite those. Reserve the parent's whole ref space.
     reserveRefsThrough(session, highestUsedIndex(parent.state.messageRefs));
+    // #3769: carry the orphan-cleanup ledgers too — without this, the failed
+    // compress pairs the pre-upgrade keep-two rotation hid (hiddenOrphanRefs)
+    // or the fold-gated sweep already swept (sweptOrphanCallIds) would
+    // RESURFACE on resume/fork replay, rewriting mid-history at full cache
+    // cost. Both are monotonic id/ref sets; the hide pass re-records them
+    // every turn, so the carry self-perpetuates afterwards.
+    if (parent.state.hiddenOrphanRefs?.length) session.state.hiddenOrphanRefs = [...parent.state.hiddenOrphanRefs];
+    if (parent.state.sweptOrphanCallIds?.length) session.state.sweptOrphanCallIds = [...parent.state.sweptOrphanCallIds];
+    // #3939 ③: same carry for the truncation latch — resume/fork replay
+    // re-sends the clipped messages; without the latch the first replayed
+    // turn under a lower estimate re-exposes the full bytes (oscillation).
+    if (parent.state.emergencyTruncateLatch?.length) {
+        session.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch.map((e) => ({ ...e }));
+    }
+    // #3939 ②: same carry for the migration render deferral — a resumed/forked
+    // session re-sends the same history; without the deferral the first replay
+    // stamps migration tags mid-history (the #3805 byte flip, resurrected).
+    if (parent.state.renderDeferredRefs?.length) {
+        session.state.renderDeferredRefs = [...parent.state.renderDeferredRefs];
+    }
+    // #3939 ⑤: same carry for the view latch — a resumed session re-sends the
+    // same history; a dropped latch would flip transform bytes on the first
+    // replayed turn (crush re-derived, absorb hides landing late).
+    if (parent.state.viewLatches) {
+        session.state.viewLatches = Object.fromEntries(
+            Object.entries(parent.state.viewLatches).map(([k, v]) => [k, { ...v }]),
+        );
+    }
+    if (parent.state.viewLatchConfigDigest) {
+        session.state.viewLatchConfigDigest = parent.state.viewLatchConfigDigest;
+    }
     markDirty(session);
+}
+
+/** #3925 → #3011 C9: what acp_status renders while a fork runs with zero
+ *  inherited blocks — the "starting fresh despite an adoptable parent" gap. */
+interface ForkAdoptionSkipped {
+    parentId: string;
+    blocks: number;
+    tokens: number;
+}
+
+/** Typed read of the forkAdoptionSkipped metadata field (session.metadata is
+ *  a free Record<string, unknown>; validate the shape on the way out). */
+export function forkAdoptionSkippedOf(session: Session): ForkAdoptionSkipped | undefined {
+    const raw = session.metadata.forkAdoptionSkipped;
+    if (typeof raw !== "object" || raw === null) return undefined;
+    const r = raw as Record<string, unknown>;
+    if (typeof r.parentId !== "string" || typeof r.blocks !== "number" || typeof r.tokens !== "number") return undefined;
+    return { parentId: r.parentId, blocks: r.blocks, tokens: r.tokens };
+}
+
+/** #2986/#3925: the lineage link must be durable BEFORE the next request —
+ *  markDirty alone persists on the debounce cadence, and a non-graceful exit
+ *  inside that window strands the child unlinked forever (the boot sweep and
+ *  the read-time decompress/search fallback both key off this link). Fire-
+ *  and-forget on purpose: this runs on the model-request hot path, so we must
+ *  not stall the response (mirrors persistLineageLinkNow in server/handle.ts). */
+function persistForkLineageNow(session: Session, log: (level: string, msg: string) => void): void {
+    void getStore().writeNow(session).catch((err) => {
+        log("warn", `[fork-adoption] lineage durable write failed for ${session.id}: ${String(err)} (#2986)`);
+    });
 }
 
 /** Server hook: on a fresh anonymous fork (via "new" + lineage "forked"),
  *  find the parent (memory first, then disk), measure what is adoptable, and
  *  seed the fresh session when enabled. Always logs the adoptable inventory —
  *  the measurement ework asked for in #629 — so operators can size the win
- *  before turning adoption on. */
+ *  before turning adoption on.
+ *
+ *  #3925 → #3011 C9: records the persistent derivedFromSessionId link at
+ *  detection time whatever the adoption outcome — the same unconditional link
+ *  #1333 writes for explicitly derived conversations. Without it a bail left
+ *  NO trace: the boot sweep (reconcileDerivedLineage) only iterates sessions
+ *  carrying derivedFromSessionId, and decompress/search_context's read-time
+ *  parent fallback (derivedAncestorSessions) walks that same link — so an
+ *  unlinked child is never healed across a restart and its search stays blind
+ *  for life. The link copies nothing at link time; adoption still judges per
+ *  block in raw-id set semantics, so a mis-guessed parent can at most be
+ *  searched read-only, never adopted from. */
 export function maybeAdoptForkBlocks(args: {
     session: Session;
     parentId: string;
@@ -292,15 +364,29 @@ export function maybeAdoptForkBlocks(args: {
         return;
     }
     const plan = planForkAdoption(parent, new Set(incomingMsgs.map((m) => m.id)));
+    // Link once the parent is confirmed loadable (a dangling link to a
+    // vanished id would only churn the read-time walk for nothing).
+    const linked = session.metadata.derivedFromSessionId === undefined;
+    if (linked) {
+        session.metadata.derivedFrom = parentId;
+        session.metadata.derivedFromSessionId = parentId;
+    }
     if (plan.adoptedActive === 0) {
-        log("info", `[fork-adoption] fork of ${parentId}: no fully-present blocks to adopt (${plan.straddled} straddle the fork point); starting fresh (#629)`);
+        if (linked) persistForkLineageNow(session, log);
+        log("info", `[fork-adoption] fork of ${parentId}: no fully-present blocks to adopt (${plan.straddled} straddle the fork point); starting fresh; lineage linked so the startup sweep can inherit later folds (#629/#3925)`);
         return;
     }
     if (!enabled) {
-        log("info", `[fork-adoption] fork of ${parentId}: parent has ${plan.adoptedActive} adoptable block(s) covering ~${plan.adoptedTokens} tokens; forkAdoption disabled, starting fresh (set forkAdoption: true or BILI_FORK_ADOPTION=1)`);
+        session.metadata.forkAdoptionSkipped = { parentId, blocks: plan.adoptedActive, tokens: plan.adoptedTokens };
+        persistForkLineageNow(session, log);
+        log("warn", `[fork-adoption] fork of ${parentId}: parent has ${plan.adoptedActive} adoptable block(s) covering ~${plan.adoptedTokens} tokens; forkAdoption disabled, starting fresh (set forkAdoption: true or BILI_FORK_ADOPTION=1). Lineage linked — a bili restart lets the startup sweep inherit those blocks, and acp_status shows the gap (#3925)`);
         return;
     }
     applyForkAdoption(session, plan, parent);
+    // #3351 discipline: close the derived-blocks gate ONLY on real block
+    // adoption — the boot-sweep retry door stays open otherwise.
+    session.metadata.derivedBlocksAdopted = true;
+    persistForkLineageNow(session, log);
     log("info", `[fork-adoption] session ${session.id} adopted ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens, refs up to ${plan.maxRef || "n/a"}) from parent ${parentId} across fork (#629)`);
     // #1341: carry the originals behind the refs the fork now advertises as
     // retrievable — covered messages of the adopted blocks ∪ refs cited by
@@ -312,6 +398,15 @@ export function maybeAdoptForkBlocks(args: {
         const n = Object.keys(storeSlice.byRef).length;
         log("info", `[fork-adoption] session ${session.id} adopted ${n} CCR content-store entr${n === 1 ? "y" : "ies"} for the covered/cited refs from parent ${parentId} (#1341)`);
     }
+}
+
+/** Outcome of an inheritance attempt (#3351): lets the caller tell "blocks
+ *  were adopted" apart from "refs-only / nothing," so the derived-blocks gate
+ *  closes only on real block adoption — the same discipline the boot sweep
+ *  (reconcileDerivedLineage) applies, not on ref-only seeding. */
+interface AdoptionOutcome {
+    adoptedActive: number;
+    seededRefs: number;
 }
 
 /** #1486: copy-on-resume for an identified client whose resume forked a new
@@ -330,19 +425,19 @@ export function maybeAdoptResume(args: {
     upstreamOrigin: string;
     blocksEnabled: boolean;
     log: (level: string, msg: string) => void;
-}): void {
+}): AdoptionOutcome {
     const { session, parent, sharedDepth, protocol, parsed, upstreamOrigin, blocksEnabled, log } = args;
     const incomingMsgs = incomingCoreMessages(protocol, parsed);
     if (!incomingMsgs) {
         log("info", `[resume-inheritance] ${session.id}: resumed ${parent.id} (${sharedDepth} shared msgs) but ${protocol} has no adoption support in v1; lineage recorded, refs/blocks not inherited (#1486)`);
-        return;
+        return { adoptedActive: 0, seededRefs: 0 };
     }
     const ids = new Set(incomingMsgs.map((m) => m.id));
     const plan = planForkAdoption(parent, ids, { seedAllRefs: true, includeBlocks: blocksEnabled });
     const seededRefs = Object.keys(plan.refs.byRaw).length;
     if (seededRefs === 0 && plan.adoptedActive === 0) {
         log("info", `[resume-inheritance] ${session.id}: resume of ${parent.id} had nothing to inherit (no overlapping refs${blocksEnabled ? " or fully-present blocks" : ""}); starting fresh (#1486)`);
-        return;
+        return { adoptedActive: 0, seededRefs: 0 };
     }
     applyForkAdoption(session, plan, parent);
     log(
@@ -356,6 +451,7 @@ export function maybeAdoptResume(args: {
         const n = Object.keys(storeSlice.byRef).length;
         log("info", `[resume-inheritance] ${session.id} adopted ${n} CCR content-store entr${n === 1 ? "y" : "ies"} for the inherited/cited refs from parent ${parent.id} (#1341/#1486)`);
     }
+    return { adoptedActive: plan.adoptedActive, seededRefs };
 }
 
 /** #2807: the derived (plugin-register) fork link previously recorded
@@ -365,8 +461,12 @@ export function maybeAdoptResume(args: {
  *  history while the parent's fold ledger sat on disk. Adopt the parent's
  *  fully-present blocks by message-id intersection at link time — the same
  *  copy-on-fork seeding maybeAdoptResume runs for the strong path, minus the
- *  byte-prefix requirement. Runs once per session (derivedBlocksAdopted).
- *  Gated on resumeInheritance, NOT forkAdoption: this is an identified fork
+ *  byte-prefix requirement. The call lands once per session (handle.ts gates
+ *  it on derivedFromSessionId === undefined); the derivedBlocksAdopted marker
+ *  it sets gates the BOOT reconcile, and since #3351 it is set only when blocks
+ *  were actually adopted (mirroring reconcileDerivedLineage), so a young parent
+ *  with no folds yet keeps the door open for a later retry. Gated on
+ *  resumeInheritance, NOT forkAdoption: this is an identified fork
  *  (the parent came from the plugin register), same class as the strong
  *  path; #1834/#629 reserve forkAdoption for anonymous forks, and answering
  *  to two different switches left the weak path dark while the boot-time
@@ -383,8 +483,12 @@ export function maybeAdoptDerivedFork(args: {
     const { session, parent, protocol, parsed, upstreamOrigin, enabled, log } = args;
     if (!enabled || session.metadata.derivedBlocksAdopted === true) return;
     try {
-        maybeAdoptResume({ session, parent, sharedDepth: 0, protocol, parsed, upstreamOrigin, blocksEnabled: true, log });
-        session.metadata.derivedBlocksAdopted = true;
+        const outcome = maybeAdoptResume({ session, parent, sharedDepth: 0, protocol, parsed, upstreamOrigin, blocksEnabled: true, log });
+        if (outcome.adoptedActive > 0) {
+            session.metadata.derivedBlocksAdopted = true;
+        } else {
+            log("info", `[${session.id}] [derived] no blocks adopted from ${parent.id} yet (refs-only or none fully present); leaving the gate open so the boot reconcile can retry once the parent folds (#3351)`);
+        }
     } catch (e) {
         log("warn", `[${session.id}] [derived] block adoption from ${parent.id} failed (${String(e)}); continuing fresh (#2807)`);
     }

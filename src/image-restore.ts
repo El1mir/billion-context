@@ -234,6 +234,12 @@ export function bodyMightCarryImages(bodyText: string, protocol: WireProtocol): 
     }
 }
 
+/** Warn-once dedupe for inbound-index conversion failures: the catch must
+ * stay fail-open (empty index, request unaffected) but never SILENT — #2824
+ * class. Keyed by protocol + error signature; bounded by distinct error
+ * shapes, which is a handful per process. */
+const conversionWarned = new Set<string>();
+
 /** Parse the INBOUND wire body into core messages and index every carried image
  *  by its mNNNNN ref. A message is indexed only when it is already known to the
  *  session (`state.messageRefs.byRaw[message.id]` resolves) — brand-new tail
@@ -257,7 +263,17 @@ export function buildIncomingImageIndex(
             case "google": result = googleToCore(parsed as GoogleRequestBody); break;
             case "responses": result = responsesToCore(parsed as ResponsesRequestBody); break;
         }
-    } catch {
+    } catch (e) {
+        // Fail-open by design (an unparseable body must not kill the request),
+        // but visible: a converter throw here silently disables image recovery
+        // for every session carrying that shape — exactly how the #3642
+        // single-object-content TypeError hid (#2824). One warn per signature
+        // per process so a broken shape logs once, not twice per turn.
+        const sig = `${protocol}:${String((e as Error)?.message ?? e).slice(0, 120)}`;
+        if (!conversionWarned.has(sig)) {
+            conversionWarned.add(sig);
+            loggerLog("warn", `[image-restore] inbound index conversion failed — images in affected sessions are NOT recoverable until this wire shape is handled (${sig}; #2824 class — please report the body shape)`);
+        }
         return index;
     }
     const msgs = coreMsgsOf(result);

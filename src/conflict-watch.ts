@@ -13,7 +13,7 @@ import { markDirty, type Session } from "./session.js";
 import { isCodexClient } from "./codex-compact.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
 
-type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan";
+type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan" | "id-churn-adoption";
 
 export interface ConflictEvent {
     at: number;
@@ -69,11 +69,35 @@ export function recordConflict(session: Session, kind: ConflictKind, detail: str
 // must NOT rebase onto a guessed view (rebase stays gated on the framed detector).
 // Returns the refusal count when the inference holds, else undefined (caller keeps
 // the existing unannounced-rewrite classification).
-export function dshNativeCompactionWitness(session: Session): number | undefined {
+//
+// #3814 (via #3806): the refusal counter alone is NOT enough — it persists for the
+// session's life (often accumulated days ago under an older bili), and a dsh
+// RESTART re-keys ~all resent message ids, which trips the same #1001 rewrite
+// detector without anything having been compacted. The discriminator is the
+// compaction fingerprint: a landed client compaction folds the replayed region
+// into one summary, so the first replay after it carries only the recent tail —
+// #2709's real landings measured 320/771 (41%) and 427/875 (49%) incoming/known;
+// #3806's restart re-keys measured 2793/2814 (99%) and 395/389 (101%, it GREW).
+// Callers that have the rewrite evidence MUST pass it: a flat-or-larger resend
+// (incoming >= 75% of known) is a re-key, not a landing, and must keep the quiet
+// unannounced-rewrite tier even with a non-zero stale refusal counter.
+const DSH_COMPACTION_LANDING_MAX_INCOMING_RATIO = 0.75;
+
+interface RewriteFingerprint {
+    incomingTotal: number;
+    knownBefore: number;
+}
+
+export function dshNativeCompactionWitness(session: Session, fingerprint?: RewriteFingerprint): number | undefined {
     const md = session.metadata;
     if (!md || md.pluginAgent !== "dsh") return undefined;
     const n = md["dshCompactionRefusals"];
-    return typeof n === "number" && n > 0 ? n : undefined;
+    if (typeof n !== "number" || n <= 0) return undefined;
+    if (fingerprint && fingerprint.knownBefore > 0
+        && fingerprint.incomingTotal >= fingerprint.knownBefore * DSH_COMPACTION_LANDING_MAX_INCOMING_RATIO) {
+        return undefined;
+    }
+    return n;
 }
 
 // #2219: resolve which CLIENT a conflicting session belongs to, so the conflict
@@ -224,14 +248,11 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
             ? "The events above are client-native compaction landings bili ALREADY rebased onto (#2372/#2432): each detected checkpoint rebuilt the fold base, so there is no ongoing double-compression risk and nothing to disable. If you did not expect these sessions to auto-compact, review the client's own auto-compaction setting; otherwise clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
             : "All events above are client-native compaction landings older than 7 days (historical stock) that bili already rebased onto (#2372/#2432): handled at the time, no ongoing risk. Clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
     } else if (orphanOnly) {
-        // #2802 review: identity-loss takeover (#2791 family) — bili KNOWS what
-        // happened (its own resolver detected the headerless replay of this
-        // conversation); commanding a plugin hunt or an auto-compaction toggle
-        // on this ledger would send the reader after a compressor that does
-        // not exist.
+        // A headerless replay does not prove that the original client moved.
+        // Older ledgers may contain tail-only matches; neither proves state loss.
         advice = active.length > 0
-            ? "The events above are identity-loss takeovers (#2791 family): the client's lane stopped stamping its conversation id mid-conversation, so a headerless replay minted a fresh anonymous fork and THIS session's fold continuity broke — there is NO second compressor to hunt for and no auto-compaction to disable. Restore the lane that stamps identity (host/plugin wiring — e.g. a profile wire-protocol switch the identity patch missed), or start a fresh conversation."
-            : "All events above are identity-loss takeovers older than 7 days (historical stock): the anonymous forks named above already happened and the continuity loss is in the past. Verify the client's lane stamps its conversation id again (host/plugin wiring), then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+            ? "The events above are possible identity-loss replays (#2791 family): an anonymous request shared history with an identified conversation. This does NOT prove that the original client stopped sending its id or that fold continuity was lost; older tail-only matches can also come from unrelated auxiliary requests. Original session state is retained. Verify whether subsequent main requests still use the original conversation id. There is NO second compressor to hunt for and no auto-compaction to disable."
+            : "All events above are possible identity-loss replays older than 7 days (historical stock), not proof of continuity loss. Older tail-only matches may be unrelated auxiliary requests. Verify the client's main requests still use their conversation id, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
     } else if (signals.length === 0) {
         advice = active.length > 0
             ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."

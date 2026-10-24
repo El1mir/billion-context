@@ -7,7 +7,7 @@ on:
   # runner on doc-only diffs. Manual dispatch covers everything else.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-    branches: [master]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
     paths:
       - "src/image-*.ts"
       - "src/preflight.ts"
@@ -25,8 +25,14 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-image-${{ github.ref }}
-  cancel-in-progress: true
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its gate job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: ci-image-${{ github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   # three-layer CI: this lane only runs on demand (ci:full label / dispatch)

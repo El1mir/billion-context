@@ -15,6 +15,7 @@ billion-context/
 │   │   ├── admin.ts              #   /__bili/* + /__acp/* admin route surface (stats/status/overview/sessions/detail/logs/config/plugin/watcher/upstream endpoints), loopback + trusted-origin gated (#1440)
 │   │   ├── budget.ts             #   chars/4 overhead measure outside the kernel fold space
 │   │   ├── chain-artifacts.ts    #   Allocation-free byte pre-filter for chain artifacts (#1421)
+│   │   ├── codex-catalog-cache.ts #   Same-credential, bounded offline model metadata for Codex discovery
 │   │   ├── context-window.ts     #   Context-window resolution (launcher model channel, beta headers)
 │   │   ├── dsh-compaction-guard.ts #   Rejects dsh whole-prefix compaction replays (#1729)
 │   │   ├── handle.ts             #   Proxy request pipeline (route triage, compat relay, compress orchestration) (#1440 P2 cut 3)
@@ -66,12 +67,13 @@ billion-context/
 │   ├── image-tokens.ts           # Image token cost estimation (pixels/bytes modes, #767)
 │   ├── image-compress.ts         # Image-compression policy stamping per request
 │   ├── image-note.ts             # Image-block placeholder → rich note rendering
-│   ├── proxy-tool.ts             # isProxyToolFor — client-named tools routed to the bili proxy
+│   ├── absorb.ts                 # absorb tool (kernel ACP_TOOL_NAMES extension)
 │   ├── compress-loop-responses.ts # Compress loop for Responses API format
 │   ├── compress-settings.ts      # Three-level compress config merge (global→provider→model)
 │   ├── compress-tool.ts          # ACP tool surface — thin re-export from acp-kernel
 │   ├── decompress-shared.ts      # Shared decompress logic + large-decompress tmp retention cap
 │   ├── fold-reconcile.ts         # Fold-anchor reconciliation for stable prefix cache
+│   ├── generation-boundary.ts    # Standing generation-boundary note for post-switch stale-ref residue (#4305)
 │   ├── orphan-gc.ts              # Orphan block garbage collection
 │   ├── fork-adoption.ts          # Fork block adoption on mid-history divergence (#629)
 │   ├── prefix-affinity.ts        # Anonymous prefix-affinity session resolution (#309)
@@ -144,6 +146,7 @@ billion-context/
 │   │   └── tag-echo-filter.ts    #   Streaming-safe stripper for model-echoed render tags (#206); tool args byte-exact
 │   ├── agent/                    # Thin agent-side plugins (per-host, each with a -native variant)
 │   │   ├── shared.ts             #   Host plan/bootstrap shared helpers (BILLION_CONTEXT_PLUGIN gate)
+│   │   ├── media-bytes.ts        #   Shared inline-media byte accounting for native direct-send refusal gates
 │   │   ├── native-bootstrap.ts   #   dist/agent/<entry>.js → dist/index.js resolution
 │   │   ├── native-intercept.ts   #   Model-API fetch routing, attribution and proxy recovery
 │   │   ├── fetch-chain/
@@ -176,7 +179,7 @@ billion-context/
 │   │   └── native.ts             #   Routing scope/exemptions policy (#1622)
 │   └── web/                      # Web UI (config editor, sessions, logs)
 │       ├── api.ts                #   REST handlers (config get/put with parse-state guard)
-│       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420)
+│       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420); tier tree + lazy block content (#3917)
 │       ├── logs-query.ts         #   GET /__bili/logs selection engine
 │       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420)
 │       ├── page.ts               #   Server-rendered HTML page shell (CA cert hint, i18n)

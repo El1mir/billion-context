@@ -62,9 +62,15 @@ function renderMessage(
   countTokens: (text: string) => number,
   strategy: RenderStrategy,
   snapshot: Record<string, number> | null = null,
+  deferred: ReadonlySet<string> | null = null,
 ): CoreMessage {
   const ref = refForRaw(map, message.id);
   if (!ref || ref === BLOCKED_REF) return message;
+
+  // #3939 ②/#3805: refs minted by the BLOCKED→numeric migration keep their
+  // pre-migration UNTAGGED bytes until the next fold boundary — stamping the
+  // tag now would rewrite an old message mid-history on a quiet turn.
+  if (deferred?.has(ref)) return message;
 
   // "none": host reads the ref map directly — never pollute text.
   if (strategy === "none") return message;
@@ -110,8 +116,11 @@ export function renderVisibleRefs(
 ): CoreMessage[] {
   // Legacy behavior: recompute tokens every render (snapshot = null).
   const map = state.messageRefs;
+  const deferred = state.renderDeferredRefs
+    ? new Set(state.renderDeferredRefs)
+    : null;
   return messages.map((message) =>
-    renderMessage(message, map, countTokens, strategy),
+    renderMessage(message, map, countTokens, strategy, null, deferred),
   );
 }
 
@@ -132,8 +141,11 @@ export function renderWithSnapshot(
 ): RenderWithSnapshotResult {
   const map = state.messageRefs;
   const snapshot = { ...(state.tokenSnapshot ?? {}) };
+  const deferred = state.renderDeferredRefs
+    ? new Set(state.renderDeferredRefs)
+    : null;
   const rendered = messages.map((message) =>
-    renderMessage(message, map, countTokens, strategy, snapshot),
+    renderMessage(message, map, countTokens, strategy, snapshot, deferred),
   );
   return { messages: rendered, tokenSnapshot: snapshot };
 }

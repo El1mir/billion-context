@@ -224,7 +224,7 @@ for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES
           "ALL_PROXY", "all_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE"):
     os.environ.pop(k, None)
 
-RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": []}
+RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": [], "status": []}
 
 # --- hermetic YAML backend stubs for the MITM-domain discovery tests (#2838) ---
 # A minimal parser for the restricted config shape under test; lets each scenario pin exactly
@@ -297,6 +297,24 @@ class Handler(BaseHTTPRequestHandler):
                 {"name": "compress", "description": "compress a range", "input_schema": {"type": "object"}},
                 {"name": "decompress", "description": "decompress a block", "input_schema": {"type": "object"}},
                 {"name": "acp_status", "description": "context status", "input_schema": {"type": "object"}}]}})
+        elif self.path.startswith("/__bili/plugin/status"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            RECORDED["status"].append({"conversationId": (q.get("conversationId") or [""])[0],
+                                       "fallback": (q.get("fallback") or [""])[0]})
+            canned = os.environ.get("BC_CMD_STATUS")
+            if SCENARIO == "cmd-acp-multi":
+                cid = (q.get("conversationId") or [""])[0]
+                if cid not in ("sess-a", "sess-b"):
+                    if q.get("fallback") == ["latest"]:
+                        cid = "sess-b"
+                    else:
+                        self._send({"ok": False, "error": "unknown plugin conversation"}, 404)
+                        return
+                self._send({"ok": True, "conversationId": cid, "panel": "PANEL-" + cid})
+            else:
+                self._send(json.loads(canned) if canned else
+                           {"ok": True, "conversationId": "sess-real", "panel": "PANEL-TEXT"})
         else:
             self._send({"error": "not found"}, 404)
 
@@ -305,7 +323,8 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n) or b"{}")
         if self.path == "/__bili/plugin/tool":
             RECORDED["tool"].append(body)
-            self._send({"ok": True, "result": "compressed 3 blocks"})
+            canned = os.environ.get("BC_CMD_TOOL_RESULT")
+            self._send(json.loads(canned) if canned else {"ok": True, "result": "compressed 3 blocks"})
         elif self.path == "/__bili/plugin/runtime-info":
             RECORDED["runtime_info"].append(body)
             self._send({"ok": True})
@@ -370,6 +389,7 @@ class FakeCtx:
         self.tools = {}
         self.middlewares = {}
         self.hooks = {}
+        self.commands = {}
 
     def register_tool(self, name=None, toolset=None, schema=None, handler=None, description="", **kw):
         self.tools[name] = {"toolset": toolset, "schema": schema, "handler": handler, "description": description}
@@ -379,6 +399,10 @@ class FakeCtx:
 
     def register_hook(self, name, cb):
         self.hooks[name] = cb
+
+    def register_command(self, name=None, handler=None, description="", args_hint="", argument_mode=None):
+        self.commands[name] = {"handler": handler, "description": description}
+        return object()
 
 mod = load_module()
 mod._reset_for_test()
@@ -460,6 +484,18 @@ elif SCENARIO.startswith("attach-window"):
         with open(os.path.join(home, "config.yaml"), "w") as f:
             f.write("providers:\n  solprov:\n    base_url: http://127.0.0.1:3425\n")
         win_model, win_provider = "group/sol", "solprov"
+    elif SCENARIO == "attach-window-nested":
+        # #3730 regression: hermes persists a NESTED {"context_lengths": {...}} document (via
+        # agent/model_metadata_cache._write_context_cache); the pre-#3730 reader looked at the top
+        # level only and matched nothing, so the window never reached the proxy. Same fixture as
+        # the flat leg above, wrapped in the section hermes actually writes.
+        with open(os.path.join(home, "context_length_cache.yaml"), "w") as f:
+            f.write("context_lengths:\n"
+                    "  group/sol@http://127.0.0.1:3425/v1: 500000\n"
+                    "  unrelated@https://other.example/v1: 123456\n")
+        with open(os.path.join(home, "config.yaml"), "w") as f:
+            f.write("providers:\n  solprov:\n    base_url: http://127.0.0.1:3425\n")
+        win_model, win_provider = "group/sol", "solprov"
     else:
         with open(os.path.join(home, "context_length_cache.yaml"), "w") as f:
             f.write("amb@http://a.example/v1: 100000\n"
@@ -479,6 +515,39 @@ elif SCENARIO.startswith("attach-window"):
         "req_unmutated": req == frozen,
         "win_headers": first["request"]["extra_headers"] if isinstance(first, dict) else None,
     })
+elif SCENARIO == "output-limits":
+    import types
+    def fetch(base):
+        if base == "http://offline.example/v1":
+            raise OSError("metadata unavailable")
+        return {"group/sol": {"max_completion_tokens": 393216 if "other" not in base else 8192},
+                "group/no-cap": {"context_length": 500000}}
+    mod._host_import = lambda name: types.SimpleNamespace(fetch_endpoint_model_metadata=fetch)
+    mod._host_resolve = lambda name, base: 500000
+    mod._state.update(origin=ORIGIN, tools_ready=True)
+    out["limits"] = []
+    for model, base, explicit in [
+        ("group/sol", "http://upstream.example/v1", None),
+        ("group/no-cap", "http://upstream.example/v1", None),
+        ("sol", "http://upstream.example/v1", None),
+        ("unknown", "http://upstream.example/v1", None),
+        ("group/sol", "http://other.example/v1", None),
+        ("group/sol", "http://offline.example/v1", None),
+        ("group/sol", "http://upstream.example/v1", 4096),
+    ]:
+        session = "limit-" + str(len(out["limits"]))
+        req = {"model": model, "messages": []}
+        context = dict(session_id=session, model=model, base_url=base)
+        mod.on_llm_request(request=req, **context)
+        for thread in threading.enumerate():
+            if thread.name.startswith("bili-"):
+                thread.join(3)
+        mod.on_pre_api_request(max_tokens=explicit, **context)
+        headers = mod.on_llm_request(request=req, **context)["request"]["extra_headers"]
+        out["limits"].append(headers.get("x-bili-plugin-max-output"))
+    deadline = __import__("time").monotonic() + 3
+    while len(RECORDED["runtime_info"]) < 7 and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.01)
 elif SCENARIO.startswith("attach"):
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
@@ -519,6 +588,35 @@ elif SCENARIO.startswith("attach"):
             "tool_result": tool_result,
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
+        })
+elif SCENARIO.startswith("cmd-acp"):
+    # no-proxy leg: no sidecar installed -> register() stays inert, origin unset
+    if SCENARIO != "cmd-acp-no-proxy":
+        install_sidecar(False)
+        os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+        mod.register(ctx)
+    import inspect
+    import types
+    route = types.ModuleType("hermes_cli.plugin_session")
+    route.session_key = lambda: "route-for-another-session"
+    sys.modules["hermes_cli.plugin_session"] = route
+    os.environ["HERMES_SESSION_ID"] = "stale-process-session"
+    def command(name, session_id):
+        handler = ctx.commands[name]["handler"]
+        context = dict(session_id=session_id, session_key="route-for-another-session", platform="cli", source=None)
+        params = inspect.signature(handler).parameters
+        return handler("", **{k: v for k, v in context.items() if k in params})
+    if SCENARIO == "cmd-acp-multi":
+        from concurrent.futures import ThreadPoolExecutor
+        def reports(cid):
+            return {"session": cid, "panel": command("acp", cid), "cache": command("acp-cache", cid)}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            out["command_results"] = list(pool.map(reports, ("sess-a", "sess-b", "sess-a", "sess-new")))
+    else:
+        cid = "" if SCENARIO == "cmd-acp-no-session" else "sess-real"
+        out.update({
+            "cmd_acp": command("acp", cid) if ctx.commands else mod.acp_command(""),
+            "cmd_acp_cache": command("acp-cache", cid) if ctx.commands else mod.acp_cache_command(""),
         })
 elif SCENARIO.startswith("mitm-"):
     kind = SCENARIO[len("mitm-"):]
@@ -573,6 +671,8 @@ out.update({
     "health_probes": len(RECORDED["health"]),
     "refused": sorted(mod._state.get("refused") or []),
     "instance_id": mod._state.get("instance_id"),
+    "commands": {k: v["description"] for k, v in ctx.commands.items()},
+    "status_calls": RECORDED["status"],
 })
 server.shutdown()
 print(json.dumps(out))
@@ -600,6 +700,7 @@ interface DriverOut {
     spawn_env?: { lane?: string | null; token?: boolean; parent?: boolean } | null;
     yaml_ok?: boolean;
     win_headers?: Record<string, string> | null;
+    limits?: Array<string | null>;
     round1_none?: boolean;
     req_unmutated?: boolean;
     first_headers?: Record<string, string> | null;
@@ -612,6 +713,11 @@ interface DriverOut {
     mitm_kind?: string;
     mitm_domains?: string[];
     mitm_warnings?: string[];
+    commands?: Record<string, string>;
+    status_calls?: Array<Record<string, string>>;
+    cmd_acp?: string | null;
+    cmd_acp_cache?: string | null;
+    command_results?: Array<{ session: string; panel: string; cache: string }>;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -644,6 +750,10 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.toolsets, ["billion-context"]);
         assert.deepEqual(out!.middlewares, ["llm_request"]);
         assert.deepEqual(out!.hooks, ["pre_api_request"]);
+        assert.deepEqual(out!.commands, {
+            acp: "Show bili context-compression status for this session",
+            "acp-cache": "Prompt-cache reconciliation (same report as the acp_cache tool)",
+        });
         assert.equal(out!.round1_none, true);
         assert.equal(out!.req_unmutated, true);
         assert.equal(out!.env_https_proxy, out!.origin);
@@ -709,6 +819,32 @@ describe("python plugin runtime (subprocess)", () => {
         ]);
     });
 
+    // #3730: hermes persists the same host cache as a NESTED {"context_lengths": {...}} document;
+    // the pre-#3730 reader inspected the top level only and matched nothing, so the window never
+    // reached the proxy. Pin the nested-section read — the flat leg above stays green for legacy files.
+    test("attach-window-nested: hermes' nested context_lengths doc resolves the window (#3730)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach-window-nested");
+        assert.ok(out, err);
+        assert.equal(out!.env_https_proxy, out!.origin, "attached");
+        if (!out!.yaml_ok) {
+            console.warn("skip positive leg: no YAML backend on this host — the cache is unreadable and the feature fails open");
+            return;
+        }
+        const h = out!.win_headers!;
+        assert.equal(h["x-bili-plugin"], "hermes");
+        assert.equal(h["x-bili-plugin-conversation"], "sess-w");
+        assert.equal(h["x-bili-plugin-model"], "group/sol");
+        assert.equal(h["x-bili-plugin-context-window"], "500000", "nested context_lengths section must resolve the host's own window");
+        assert.equal(out!.req_unmutated, true);
+        assert.deepEqual(out!.runtime_info, [
+            { agent: "hermes", model: "group/sol", maxOutput: 4096, contextWindow: 500000, source: "hermes-native" },
+        ]);
+    });
+
     test("attach-window-ambiguous: conflicting per-upstream windows are not guessed (#3261)", () => {
         if (!PY) {
             console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
@@ -721,6 +857,18 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(h["x-bili-plugin"], "hermes");
         assert.equal(h["x-bili-plugin-context-window"], undefined, "same model mapped to different windows per upstream -> no guess");
         assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "amb", maxOutput: 4096, source: "hermes-native" }]);
+    });
+
+    test("output-limits: exact endpoint model, missing cap, upstream isolation and explicit budget", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("output-limits");
+        assert.ok(out, err);
+        assert.deepEqual(out.limits, ["393216", null, null, null, "8192", null, "4096"]);
+        assert.deepEqual(
+            out.runtime_info.map((r) => [r.model, r.maxOutput ?? null]).sort(),
+            [["group/sol", 393216], ["group/no-cap", null], ["sol", null], ["unknown", null],
+                ["group/sol", 8192], ["group/sol", null], ["group/sol", 4096]].sort(),
+        );
     });
 
     test("attach to a daemon proxy: 409 watcher refusal is silent and the session still starts", () => {
@@ -906,6 +1054,84 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, []);
         assert.equal(out!.env_https_proxy, null);
         assert.equal(out!.marker_left, false);
+    });
+});
+
+describe("in-session slash commands (#3697)", () => {
+    test("cmd-acp: uses the host session id for status and cache queries", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("cmd-acp");
+        assert.ok(out, err);
+        assert.equal(out.cmd_acp, "PANEL-TEXT");
+        assert.deepEqual(out.status_calls, [
+            { conversationId: "sess-real", fallback: "" },
+            { conversationId: "sess-real", fallback: "" },
+        ]);
+        assert.deepEqual(out.tool_calls, [{ conversationId: "sess-real", tool: "acp_cache", args: {} }]);
+        assert.equal(out.cmd_acp_cache, "compressed 3 blocks");
+    });
+
+    test("cmd-acp: switching sessions never uses another session or latest fallback", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("cmd-acp-multi");
+        assert.ok(out, err);
+        assert.deepEqual(out.command_results?.slice(0, 3).map((r) => r.panel), ["PANEL-sess-a", "PANEL-sess-b", "PANEL-sess-a"]);
+        assert.deepEqual(out.status_calls?.map((r) => `${r.conversationId}:${r.fallback}`).sort(),
+            ["sess-a", "sess-b", "sess-a", "sess-new"].flatMap((cid) => [`${cid}:`, `${cid}:`]).sort());
+        assert.deepEqual(out.tool_calls.map((r) => r.conversationId).sort(), ["sess-a", "sess-a", "sess-b"]);
+        assert.match(out.command_results![3].panel, /No model request yet/);
+        assert.match(out.command_results![3].cache, /No model request yet/);
+    });
+
+    test("cmd-acp: missing host session id refuses stale route and process ids", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("cmd-acp-no-session");
+        assert.ok(out, err);
+        assert.match(out.cmd_acp!, /current session ID/);
+        assert.match(out.cmd_acp_cache!, /current session ID/);
+        assert.deepEqual(out.status_calls, []);
+        assert.deepEqual(out.tool_calls, []);
+    });
+
+    test("cmd-acp: mismatched status cannot display or forward another conversation", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("cmd-acp-mismatch", {
+            BC_CMD_STATUS: '{"ok":true,"conversationId":"sess-other","panel":"OTHER-SESSION"}',
+        });
+        assert.ok(out, err);
+        assert.doesNotMatch(out.cmd_acp!, /OTHER-SESSION/);
+        assert.deepEqual(out.tool_calls, []);
+    });
+
+    test("cmd-acp-idle: armed-but-idle notice from the manifest; cache reports no ACP session", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("cmd-acp-idle", {
+            BC_CMD_STATUS: '{"ok":true,"conversationId":"sess-real","phase":"pre-first-request","panel":null}',
+            BC_CMD_TOOL_RESULT: '{"ok":false,"error":"no model request has arrived for this conversation"}',
+        });
+        assert.ok(out, err);
+        assert.match(out!.cmd_acp!, /^billion-context@test-1/);
+        assert.match(out!.cmd_acp!, /proxy connected, compression armed\. No model request yet; send one, then run \/acp again\./);
+        assert.equal(
+            out!.cmd_acp_cache,
+            "bili: no ACP session yet for this conversation (send a model request first, then run /acp-cache)",
+        );
+    });
+
+    test("cmd-acp-no-proxy: error text without any HTTP traffic", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("cmd-acp-no-proxy");
+        assert.ok(out, err);
+        assert.match(out!.cmd_acp!, /^bili: no proxy detected/);
+        assert.match(out!.cmd_acp_cache!, /^bili: no proxy detected/);
+        assert.deepEqual(out!.status_calls, []);
+        assert.deepEqual(out!.tool_calls, []);
     });
 });
 

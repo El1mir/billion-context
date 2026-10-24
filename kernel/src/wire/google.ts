@@ -1,5 +1,11 @@
 import { hashId } from "./util.js";
-import { ClusterCounter, deriveMessageId } from "./message-id.js";
+import { ClusterCounter } from "./message-id.js";
+import {
+  CANONICAL_IMAGE_TEXT,
+  canonicalToolArgs,
+  deriveCanonicalMessageId,
+  imageMediaFingerprint,
+} from "./identity.js";
 import type { BiliMessage } from "./bili-message.js";
 
 // Gemini native wire (`generativelanguage.googleapis.com`, /v1beta/models/<m>:
@@ -93,7 +99,8 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
   const unmatchedCalls = new Map<string, string[]>();
   const contents = Array.isArray(body.contents) ? body.contents : [];
 
-  for (const content of contents) {
+  for (const [contentIndex, content] of contents.entries()) {
+    const before = msgs.length;
     const parts = Array.isArray(content.parts) ? content.parts : [];
     const isModel = content.role === "model";
 
@@ -103,7 +110,20 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
     for (const part of parts) {
       const fr = part.functionResponse;
       if (!fr || typeof fr.name !== "string") continue;
-      const text = jsonText(fr.response ?? {});
+      // #3642: the canonical result text is the OUTPUT — a lone string
+      // `output` field is the dominant MCP-ish shape, and unwrapping it
+      // aligns google results with the other dialects (identical logical
+      // result ⇒ identical core text ⇒ identical id). Structured responses
+      // keep their compact-JSON text.
+      const response = fr.response ?? {};
+      const text =
+        response &&
+        typeof response === "object" &&
+        !Array.isArray(response) &&
+        Object.keys(response).length === 1 &&
+        typeof (response as { output?: unknown }).output === "string"
+          ? ((response as { output: string }).output)
+          : jsonText(response);
       const wireId = typeof fr.id === "string" ? fr.id : undefined;
       const queue = unmatchedCalls.get(fr.name);
       let paired: string | undefined;
@@ -115,8 +135,10 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
       } else if (queue && queue.length > 0) {
         paired = queue.shift();
       }
-      const base = deriveMessageId("tool", "tool-result", text, {
-        toolCallId: wireId ?? paired ?? "",
+      // #3642: canonical result identity = toolName + text. The wire id /
+      // pairing id stays on the toolCallId FIELD (pairing is untouched) but
+      // is out of the seed — it is transport plumbing, not content.
+      const base = deriveCanonicalMessageId("tool", "tool-result", text, {
         toolName: fr.name,
       });
       const id = clusters.next(base);
@@ -136,7 +158,11 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
     // 2. Thinking parts.
     for (const part of parts) {
       if (part.thought !== true || typeof part.text !== "string") continue;
-      const base = deriveMessageId("assistant", "reasoning", part.text);
+      const base = deriveCanonicalMessageId(
+        "assistant",
+        "reasoning",
+        part.text,
+      );
       msgs.push({
         id: clusters.next(base),
         role: "assistant",
@@ -147,16 +173,86 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
       });
     }
 
-    // 3. The content's own text/media core. A content made only of
-    //    functionResponse parts yields none (its parts ride on the tool
-    //    cores), so no empty user core is invented.
     const rest = parts.filter(isContentPart);
-    if (rest.length > 0) {
-      const text = textPartsOf(rest)
+    // 3. The content's own text/media cores — #3642 canonical granularity:
+    //    every part is its own core (the anthropic codec's model), so the
+    //    same logical conversation yields the same core array in every
+    //    protocol. Each text part is a text core seeded on its own bytes;
+    //    each media part (inlineData/fileData) is an image core carrying the
+    //    canonical "[image]" marker with the raw part as its byte-fidelity
+    //    sidecar. coreToGoogle's role-alternation accumulator merges the
+    //    same-side run back into one content whose parts array preserves the
+    //    part objects verbatim. A content made only of functionResponse
+    //    parts yields none (its parts ride on the tool cores).
+    let lastTextCore: BiliMessage | null = null;
+    let leftover: GooglePart[] = [];
+    for (const part of rest) {
+      if (typeof part.text === "string" && part.thought !== true) {
+        const base = deriveCanonicalMessageId(
+          isModel ? "assistant" : "user",
+          "text",
+          part.text,
+        );
+        lastTextCore = {
+          id: clusters.next(base),
+          role: isModel ? "assistant" : "user",
+          contentType: "text",
+          text: part.text,
+          rawGoogleParts: [part],
+          ...signatureField(
+            "googleThoughtSignature",
+            part.thoughtSignature,
+          ),
+        };
+        msgs.push(lastTextCore);
+        continue;
+      }
+      const inline = part.inlineData;
+      if (
+        inline &&
+        typeof inline.mimeType === "string" &&
+        typeof inline.data === "string"
+      ) {
+        const base = deriveCanonicalMessageId(
+          isModel ? "assistant" : "user",
+          "text",
+          CANONICAL_IMAGE_TEXT,
+          {
+            // #3751: payload-addressed ids — inlineData hashes its base64 payload.
+            mediaFingerprint: imageMediaFingerprint(inline.data),
+          },
+        );
+        msgs.push({
+          id: clusters.next(base),
+          role: isModel ? "assistant" : "user",
+          contentType: "text",
+          text: CANONICAL_IMAGE_TEXT,
+          imagePart: true,
+          imageMediaType: inline.mimeType,
+          imageBase64: inline.data,
+          rawGoogleParts: [part],
+        });
+        continue;
+      }
+      // Other opaque content parts (fileData, executableCode, …) attach to
+      // the PRECEDING text core's raw sidecar so the verbatim rebuild keeps
+      // them in place; with no text core to host them they wait, and a
+      // message with leftovers but no text core keeps the legacy fallback
+      // shape (one core, joined text — possibly "" — all leftovers raw).
+      if (lastTextCore) {
+        lastTextCore.rawGoogleParts = [
+          ...(lastTextCore.rawGoogleParts ?? []),
+          part,
+        ];
+      } else {
+        leftover = [...leftover, part];
+      }
+    }
+    if (leftover.length > 0) {
+      const text = textPartsOf(leftover)
         .map((p) => p.text ?? "")
         .join("\n");
-      const inline = inlineDataOf(rest);
-      const base = deriveMessageId(
+      const base = deriveCanonicalMessageId(
         isModel ? "assistant" : "user",
         "text",
         text,
@@ -166,15 +262,7 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
         role: isModel ? "assistant" : "user",
         contentType: "text",
         text,
-        ...(inline
-          ? { imageMediaType: inline.mimeType, imageBase64: inline.data }
-          : {}),
-        rawGoogleParts: rest,
-        ...signatureField(
-          "googleThoughtSignature",
-          textPartsOf(rest).find((p) => typeof p.thoughtSignature === "string")
-            ?.thoughtSignature,
-        ),
+        rawGoogleParts: leftover,
       });
     }
 
@@ -187,10 +275,16 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
       if (!fc || typeof fc.name !== "string") continue;
       const text = jsonText(fc.args ?? {});
       const wireId = typeof fc.id === "string" ? fc.id : undefined;
-      const base = deriveMessageId("assistant", "tool-call", text, {
-        toolCallId: wireId ?? "",
-        toolName: fc.name,
-      });
+      // #3642: canonical args in the seed (key-sorted, compact — the same
+      // normalization openai/anthropic/responses apply, so an identical
+      // logical call yields the same id in every protocol); the wire id
+      // stays on the toolCallId FIELD only.
+      const base = deriveCanonicalMessageId(
+        "assistant",
+        "tool-call",
+        canonicalToolArgs(text),
+        { toolName: fc.name },
+      );
       const id = clusters.next(base);
       const toolCallId = wireId ?? id;
       const queue = unmatchedCalls.get(fc.name);
@@ -206,6 +300,9 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
         rawGoogleParts: [part],
         ...signatureField("googleThoughtSignature", part.thoughtSignature),
       });
+    }
+    for (let k = before; k < msgs.length; k++) {
+      msgs[k]!.wireIndex = contentIndex;
     }
   }
 
@@ -249,7 +346,19 @@ export function normalizeGoogleUserPartOrder(parts: GooglePart[]): GooglePart[] 
  *  becomes a single `{"role":"user"}` content normalized by
  *  normalizeGoogleUserPartOrder (#3159: plain text leads, functionResponse
  *  parts trail). Mid-conversation system cores (host-synthetic; Gemini has no
- *  system role inside contents) ride on the user side as a text part. */
+ *  system role inside contents) ride on the user side as a text part.
+ *
+ *  Byte-stability contract (#3938 / #3939⑥): for alternating-role histories
+ *  (the only shape Gemini accepts), this function is PURE in the core array
+ *  — same shape, same bytes, every request; any drift breaks the upstream
+ *  prefix cache mid-session. The canonical part orders ARE the merge rules
+ *  above: model runs emit reasoning → text → tool-call; user runs emit
+ *  functionResponse parts then content parts, re-normalized by
+ *  normalizeGoogleUserPartOrder (#3159). Merging same-role runs into one
+ *  content is the required normalization (Gemini rejects non-alternating
+ *  roles), and its output order is the canonical one. Do not reorder this
+ *  emission without moving the pins in
+ *  kernel/tests/issue3939-wire-byte-stability.test.ts. */
 export function coreToGoogle(messages: BiliMessage[]): GoogleContent[] {
   const out: GoogleContent[] = [];
   let model: {
@@ -385,14 +494,15 @@ function contentParts(m: BiliMessage): GooglePart[] {
   const text = m.text ?? "";
   const raw = rawParts(m);
   if (raw.length === 0) {
-    const parts: GooglePart[] = text
-      ? [
-          {
-            text,
-            ...signatureField("thoughtSignature", m.googleThoughtSignature),
-          },
-        ]
-      : [];
+    const parts: GooglePart[] =
+      text && text !== CANONICAL_IMAGE_TEXT && !m.imagePart
+        ? [
+            {
+              text,
+              ...signatureField("thoughtSignature", m.googleThoughtSignature),
+            },
+          ]
+        : [];
     // The image sidecars are separate from the raw parts, so an image
     // survives even a core that lost its raw array (rebased/persisted).
     if (m.imageBase64 && m.imageMediaType)
@@ -403,14 +513,17 @@ function contentParts(m: BiliMessage): GooglePart[] {
   }
   const rawTexts = textPartsOf(raw);
   if (rawTexts.map((p) => p.text ?? "").join("\n") === text) return raw;
-  const parts: GooglePart[] = text
-    ? [
-        {
-          text,
-          ...signatureField("thoughtSignature", m.googleThoughtSignature),
-        },
-      ]
-    : [];
+  // #3642: the canonical "[image]" marker never re-renders as a text part —
+  // an image core's payload IS its raw non-text part(s)/sidecar bytes.
+  const parts: GooglePart[] =
+    text && text !== CANONICAL_IMAGE_TEXT && !m.imagePart
+      ? [
+          {
+            text,
+            ...signatureField("thoughtSignature", m.googleThoughtSignature),
+          },
+        ]
+      : [];
   for (const part of raw) {
     if (!rawTexts.includes(part)) parts.push(part);
   }
@@ -439,21 +552,6 @@ function isContentPart(part: GooglePart): boolean {
     return false;
   if (part.thought === true && typeof part.text === "string") return false;
   return true;
-}
-
-function inlineDataOf(
-  parts: GooglePart[],
-): { mimeType: string; data: string } | undefined {
-  for (const part of parts) {
-    const data = part.inlineData;
-    if (
-      data &&
-      typeof data.mimeType === "string" &&
-      typeof data.data === "string"
-    )
-      return data;
-  }
-  return undefined;
 }
 
 /** Gemini's signature field is `thoughtSignature` on the wire but

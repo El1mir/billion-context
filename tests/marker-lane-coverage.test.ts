@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { stripRawStage, type RawStripCounts } from "../src/marker/engine.ts";
 import { MARKER_SPECS, type MarkerId, type MarkerScope, type MarkerSpec, type MarkerStage } from "../src/marker/spec.ts";
 import { MARKER_INTEGRITY_NOTE } from "../src/marker/anchors.ts";
+import { buildVisibilityMarker } from "../src/loop/core.ts";
 
 // ── fixtures, one per MarkerId (raw stage) ────────────────────────────────
 const DIGEST = "sha256:" + "ab".repeat(32);
@@ -28,6 +29,7 @@ const STATUS_BODY_MESSAGE =
     "    b1 | m00001–m00003 | 63% saved\n" +
     "  BILLED INPUT 104,100 tok\n" +
     "prose after the report";
+const WRAPPED_STATUS = buildVisibilityMarker("acp_status", "Compressible ranges (1):\n  m00001–m00010 | synthetic stale range").trim();
 const MARKER_LINE_MESSAGE =
     "user prose stays\n📦 [ACP] Compressed m00001–m00110 → b7\n❌ [ACP] compress FAILED: range cannot be anchored\nand so does this";
 // #1357: a FOREIGN literal tag is user data — raw stage keeps it byte-intact
@@ -44,6 +46,8 @@ type Case = { name: string; text: string };
 const userCases: Case[] = [
     { name: "panel", text: PANEL_MESSAGE },
     { name: "status body", text: STATUS_BODY_MESSAGE },
+    { name: "wrapped status body", text: WRAPPED_STATUS },
+    { name: "orphaned status body", text: WRAPPED_STATUS.slice(WRAPPED_STATUS.indexOf("[acp-status]")) },
     { name: "marker lines", text: MARKER_LINE_MESSAGE },
     { name: "render tag", text: RENDER_TAG_PROSE },
     { name: "chain carrier", text: CHAIN_CARRIER },
@@ -58,6 +62,8 @@ function assertStripped(body: unknown, counts: RawStripCounts, label: string): v
     assert.ok(!json.includes("acp_status result:"), `${label}: status body head must be gone`);
     assert.ok(!json.includes("ACTIVE SURFACE"), `${label}: status body sections must be gone`);
     assert.ok(!json.includes("CONTEXT BREAKDOWN"), `${label}: status body sections must be gone (2)`);
+    assert.ok(!json.includes("synthetic stale range"), `${label}: wrapped and orphaned status bodies must be gone`);
+    assert.ok(!json.includes("[acp-status]"), `${label}: status wrappers must be gone`);
     assert.ok(!json.includes("Compressed m00001–m00110"), `${label}: confirmation marker line must be gone`);
     assert.ok(!json.includes("compress FAILED"), `${label}: failure marker line must be gone`);
     assert.ok(!json.includes(DIGEST), `${label}: chain carrier must be gone`);
@@ -191,7 +197,7 @@ test("engine: degraded slots become a space, never an empty string (#1542 zombie
 // put marker-shaped text INSIDE every signed slot and assert the walk leaves
 // the containing message byte-identical.
 test("engine: signed thinking slots are byte-invariant under the raw walk (KDD #10)", () => {
-    const poisoned = "model thought\n📦 [ACP] Compressed m00001–m00010 → b5\n\x3cacp tokens=\"9\" type=\"text\"\x3em00001\x3c/acp\x3e tail";
+    const poisoned = WRAPPED_STATUS + "\nmodel thought\n📦 [ACP] Compressed m00001–m00010 → b5\n\x3cacp tokens=\"9\" type=\"text\"\x3em00001\x3c/acp\x3e tail";
 
     // anthropic: {type:"thinking", thinking, signature} block — text field is
     // `.thinking`, and the explicit gate must hold even if a future shape
@@ -296,4 +302,30 @@ test("engine: a report pasted into the latest user message survives (paste guard
     const rc = stripRawStage(r, "responses");
     assert.equal(rc.statusBodies, 1, "responses: assistant echo consumed, current-turn paste kept");
     assert.ok(JSON.stringify(r).includes("ACTIVE SURFACE"), "responses: pasted body survives");
+});
+
+
+test("engine: wrapped current-user reports survive on every wire", () => {
+    for (const wire of ["openai", "anthropic", "responses", "google"] as const) {
+        const messages = [
+            { type: "message", role: "assistant", content: WRAPPED_STATUS },
+            { type: "message", role: "user", content: WRAPPED_STATUS },
+        ];
+        const body = wire === "google"
+            ? { contents: messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })) }
+            : wire === "responses" ? { input: messages } : { messages };
+        assert.equal(stripRawStage(body, wire).statusBodies, 1, wire);
+        assert.equal(JSON.stringify(body).split("synthetic stale range").length - 1, 1, `${wire}: only current paste survives`);
+    }
+});
+
+test("engine: wrapped-only assistant content becomes a space without rewriting tool calls", () => {
+    const toolCalls = [{ id: "t1", type: "function", function: { name: "write", arguments: JSON.stringify({ text: WRAPPED_STATUS }) } }];
+    for (const content of [WRAPPED_STATUS, WRAPPED_STATUS.slice(WRAPPED_STATUS.indexOf("[acp-status]"))]) {
+        const body = { messages: [{ role: "assistant", content, tool_calls: toolCalls }] };
+        const before = JSON.stringify(toolCalls);
+        assert.equal(stripRawStage(body, "openai").statusBodies, 1);
+        assert.equal(body.messages[0].content, " ");
+        assert.equal(JSON.stringify(body.messages[0].tool_calls), before);
+    }
 });

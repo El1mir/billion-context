@@ -12,8 +12,10 @@ import * as lck from "../scripts/test-suite-lock.mjs";
 // one machine corrupted each other (cores-1 concurrency x2 → every 15s readiness
 // watchdog false-red; shared ~/.local/state/billion-context port-zone drift) with
 // ZERO detection of a sibling run. This pins the suite-level counterpart of #2106:
-// the O_EXCL lock, liveness-only stale steal, fail-fast banner, force bypass, and
-// release-on-exit — both the imported primitives and the real CLI entry point.
+// the O_EXCL lock, age-bounded stale steal (#3406 item 10: dead pids AND
+// pid-reuse ghosts past the 30-min bound, never a fresh live suite), fail-fast
+// banner, force bypass, and release-on-exit — both the imported primitives and
+// the real CLI entry point.
 
 const SCRIPT = resolve(import.meta.dirname, "..", "scripts", "test-suite-lock.mjs");
 const NODE = process.execPath;
@@ -101,7 +103,7 @@ test("acquireLock: free path claims the lock with our pid", async () => {
     }
 });
 
-test("acquireLock: NEVER steals a live foreign holder (liveness-only rule)", async () => {
+test("acquireLock: NEVER steals a live FRESH holder (age-bounded liveness, #3103+#3406)", async () => {
     const dir = freshCacheDir();
     const f = liveForeign();
     try {
@@ -112,6 +114,30 @@ test("acquireLock: NEVER steals a live foreign holder (liveness-only rule)", asy
         assert.equal(res.holder?.pid, f.pid);
         // Our claim did not clobber the sibling's lock.
         assert.equal((await lck.readLock(p))?.pid, f.pid);
+    } finally {
+        f.kill();
+        rmrf(dir);
+    }
+});
+
+test("holderIsStale: boundary at STALE_LOCK_MS (#3406 item 10)", () => {
+    const now = Date.now();
+    assert.equal(lck.holderIsStale({ pid: 1, ts: now - lck.STALE_LOCK_MS - 1 }, now), true, "1ms past the bound is stale");
+    assert.equal(lck.holderIsStale({ pid: 1, ts: now - lck.STALE_LOCK_MS }, now), false, "exactly at the bound is still fresh");
+    assert.equal(lck.holderIsStale({ pid: 1, ts: now - 60_000 }, now), false);
+    assert.equal(lck.holderIsStale({ pid: 1, ts: now + 60_000 }, now), false, "clock-skewed future ts is never stale");
+});
+
+test("acquireLock: steals a STALE lock even when the pid looks alive — the pid-reuse ghost (#3406 item 10)", async () => {
+    const dir = freshCacheDir();
+    const f = liveForeign(); // a live unrelated process standing in for the reused pid
+    try {
+        const p = lockFile(dir);
+        writeFile(p, { pid: f.pid, ts: Date.now() - lck.STALE_LOCK_MS - 60_000, cmdline: "ghost" });
+        assert.equal(lck.isAlive(f.pid), true, "precondition: the ghost pid really looks alive");
+        const res = await lck.acquireLock(p, { pid: process.pid });
+        assert.equal(res.acquired, true, "stale lock must be stealable despite a live-looking pid");
+        assert.equal((await lck.readLock(p))?.pid, process.pid);
     } finally {
         f.kill();
         rmrf(dir);
@@ -232,6 +258,22 @@ test("CLI gate: BILI_TEST_FORCE=1 bypasses a live holder", async () => {
     try {
         writeFile(lockFile(dir), { pid: f.pid, ts: Date.now(), cmdline: "npm test" });
         assert.equal(gateCli(dir, { BILI_TEST_FORCE: "1" }).status, 0);
+    } finally {
+        f.kill();
+        rmrf(dir);
+    }
+});
+
+test("CLI gate: stale live-looking holder → exit 0 with the stale-reclaim warning (#3406 item 10)", async () => {
+    const dir = freshCacheDir();
+    const f = liveForeign();
+    try {
+        writeFile(lockFile(dir), { pid: f.pid, ts: Date.now() - lck.STALE_LOCK_MS - 5_000, cmdline: "ghost" });
+        const r = gateCli(dir);
+        assert.equal(r.status, 0, "a stale lock must not fail the pretest gate");
+        assert.match(r.stderr, /stale test-suite lock/i);
+        assert.ok(r.stderr.includes(`pid=${f.pid}`), "warning must name the ghost pid");
+        assert.match(r.stderr, /reclaiming the lock/i);
     } finally {
         f.kill();
         rmrf(dir);

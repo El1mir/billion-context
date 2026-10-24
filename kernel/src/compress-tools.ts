@@ -69,21 +69,29 @@ const COMPRESS_RANGE_OBJECT = {
 
 /** Shared parameter schema for every compress wire shape (anthropic
  *  `input_schema`, openai `function.parameters`, responses flat
- *  `parameters`). Contract (#374): a deliberate SUPERSET of what
- *  parseCompressArgs accepts — array content (line strings / range objects),
- *  string content (bare line form or JSON-encoded array), and the flat
- *  single-range form ({startId|startRef, endId|endRef, summary}, no content).
- *  Pre-validating hosts must never kill a call the kernel would honor; do not
- *  narrow this below the parser without re-checking parse-compress-input.ts.
+ *  `parameters`).
+ *
+ *  ADVERTISED FORM (#4252 decision): exactly one — content = ONE plain
+ *  string holding ALL ranges (line form). The parser keeps honoring the
+ *  legacy shapes (array content of line strings / range objects, the flat
+ *  single-range call, and summary-as-plain-text in content with top-level
+ *  refs), but the schema no longer teaches them: advertising several forms
+ *  is what led models to blend them into invalid hybrids.
+ *
+ *  Contract (#374, still holds): the schema must never kill a call the
+ *  kernel would honor. It stays an OPEN object schema — no top-level
+ *  `required`, no `additionalProperties: false` — so a flat single-range
+ *  call {startId, endId, summary} still validates even though those
+ *  properties are no longer declared. Do not add strictness here without
+ *  re-checking parse-compress-input.ts.
  *
  *  Wire-legality constraint (bili #1299, fixed after the #374 follow-up
  *  regressed it): the TOP LEVEL must stay a plain object schema — no
  *  `oneOf`/`allOf`/`anyOf`/`not`. Anthropic rejects tool input_schema with
  *  top-level combinators (400 on every request carrying the tool), so the
- *  content-vs-flat alternation lives in the descriptions and is enforced by
- *  parseCompressInput, never by a top-level combinator or `required` (a
- *  top-level `required: ["content"]` would let strict hosts kill the flat
- *  form). Copilot Gemini also needs scalar types and self-contained typed
+ *  content string-vs-array alternation lives in the `anyOf` under `content`
+ *  and is enforced by parseCompressInput, never by a top-level combinator.
+ *  Copilot Gemini also needs scalar types and self-contained typed
  *  alternatives; keep each nested object alternative's properties with it.
  */
 export const COMPRESS_PARAMETERS = {
@@ -95,7 +103,7 @@ export const COMPRESS_PARAMETERS = {
     },
     content: {
       description:
-        "One or more ranges to compress into separate summary blocks. PREFERRED (multi-range batch): ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Array form: one entry per range — a line-form string or an object {startId,endId,summary,topic?}. Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+        "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
       anyOf: [
         {
           type: "array",
@@ -120,36 +128,13 @@ export const COMPRESS_PARAMETERS = {
         { type: "string" },
       ],
     },
-    startId: {
-      type: "string",
-      description:
-        "Flat single-range form (no content): mNNNNN ref at the start of the range",
-    },
-    endId: {
-      type: "string",
-      description:
-        "Flat single-range form (no content): mNNNNN ref at the end of the range",
-    },
-    startRef: {
-      type: "string",
-      description: "Flat single-range form: alternate spelling of startId",
-    },
-    endRef: {
-      type: "string",
-      description: "Flat single-range form: alternate spelling of endId",
-    },
-    summary: {
-      type: "string",
-      description:
-        "Flat single-range form (no content): self-contained summary replacing the range",
-    },
   },
 };
 
 export const COMPRESS_TOOL = {
   name: COMPRESS_TOOL_NAME,
   description:
-    "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+    "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed.",
   input_schema: COMPRESS_PARAMETERS,
 };
 

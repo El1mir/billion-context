@@ -4,26 +4,97 @@ import { COMPRESS_TOOL_NAME } from "./compress-tools.js";
 import type { CompressionState, CoreMessage } from "./types.js";
 
 // Orphaned compress calls (no matching block — failed attempts, or historical
-// calls whose blocks predate compressCallId recording) keep their NEWEST two
-// call+result pairs visible: failures must stay observable or a deterministic
-// model re-issues the same no-op compress forever, pinned at a fixed point
-// (billion-context-pi issue #9: 3,849 identical calls over 5h13m under
-// KEEP_LAST_ORPHANED=0). Older orphans are hidden, so the residue is bounded
-// at two pairs regardless of session length — PR #18's unbounded accumulation
-// does not return (its own live check showed the cap: 10 in → 6 out).
-const KEEP_LAST_ORPHANED = 2;
+// calls whose blocks predate compressCallId recording) stay visible until a REAL
+// fold gives a cache-safe place to remove them (#3769). Failures must remain
+// observable or a deterministic model re-issues the same no-op compress forever
+// (billion-context-pi #9: 3,849 identical calls over 5h13m under keep=0), AND a
+// quiet turn must never move the cached prefix breakpoint forward just to delete
+// a few hundred chars of old failure residue — the old keep-last-two rotation did
+// exactly that (hid the oldest failure on EVERY turn, seam cost far exceeding the
+// bytes removed). Now: between folds nothing is swept; on a fold the node sweeps
+// orphans at/after the fold's earliest start ref onto the persistent
+// sweptOrphanCallIds set (they stay hidden forever), leaving orphans before it
+// visible. Residue is bounded by fold cadence, not a fixed pair count.
 
 export interface HideConsumedResult {
   messages: CoreMessage[];
   hidden: number;
-  /** Padded refs of the orphan compress call/result messages hidden by this
-   *  pass (orphans beyond the keep window). Consumed by boundary resolution to
-   *  snap a range endpoint onto a hidden-but-intact orphan (#396). */
+  /** Padded refs of ALL currently-hidden orphan compress call/result messages
+   *  (the persistent swept set, not just this pass). Consumed by boundary
+   *  resolution to snap a range endpoint onto a hidden-but-intact orphan (#396). */
   hiddenOrphanRefs: string[];
+  /** Orphan call ids newly swept by THIS pass (only when a fold was pending);
+   *  the node unions these into state.sweptOrphanCallIds. Empty on quiet turns. */
+  newlySweptCallIds: string[];
 }
 
 function rangeKey(startRef: string, endRef: string): string {
   return `${startRef}::${endRef}`;
+}
+
+// #3769: does this call's args quote the folded range of an ACTIVE block? Such a
+// re-sent pair IS that block's summary carrier — the host strips the in-place
+// anchor only while it rides the history (stripKernelSummaries, #1567/#2042) —
+// so the fold-gated sweep must leave it alone. Both arg shapes are accepted to
+// mirror the host index ({content:[…]} AND the flat {startId,endId} models emit
+// natively); parseCallText alone misses the flat form. Unparseable args fail
+// safe as NOT a carrier (under-sweep is safe, over-sweep is not).
+function quotesActiveBlock(
+  text: string | undefined,
+  activeRangeKeys: Set<string>,
+): boolean {
+  const raw = text ?? "";
+  const start = raw.indexOf("{");
+  if (start < 0) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.slice(start));
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object") return false;
+  const obj = parsed as Record<string, unknown>;
+  let entries: unknown[];
+  if (Array.isArray(obj.content)) {
+    entries = obj.content;
+  } else if (typeof obj.content === "string") {
+    try {
+      const inner: unknown = JSON.parse(obj.content);
+      entries = Array.isArray(inner) ? inner : [];
+    } catch {
+      return false;
+    }
+  } else {
+    entries = [obj];
+  }
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const s =
+      typeof e.startId === "string"
+        ? e.startId
+        : typeof e.messageId === "string"
+          ? e.messageId
+          : "";
+    const end =
+      typeof e.endId === "string"
+        ? e.endId
+        : typeof e.messageId === "string"
+          ? e.messageId
+          : "";
+    if (s && end && activeRangeKeys.has(rangeKey(s, end))) return true;
+  }
+  return false;
+}
+
+// Numeric position of a padded ref (mNNNNN -> NNNNN); null when unmapped/blocked
+// so the caller treats it as "position unknown" and never sweeps on a guess.
+// Exported: applyCompression derives the fold sweep marker from covered message
+// refs through the same helper so both sides agree on "unknown" (#3769).
+export function refNum(ref: string | undefined): number | null {
+  if (!ref || ref === BLOCKED_REF) return null;
+  const n = Number(ref.replace(/\D/g, ""));
+  return Number.isFinite(n) ? n : null;
 }
 
 // Named return type (not inline): with the object literal in the signature,
@@ -240,18 +311,17 @@ export function hideConsumedCompressCalls(
     },
   );
 
-  const lastOrphaned = new Set<string>();
-  for (
-    let i = messages.length - 1;
-    i >= 0 && lastOrphaned.size < KEEP_LAST_ORPHANED;
-    i--
-  ) {
-    const info = infos[i]!;
-    const callId = messages[i]!.toolCallId;
-    if (info.isCompressCall && callId && info.fate === "orphan") {
-      lastOrphaned.add(callId);
-    }
-  }
+  // #3769: orphans are removed only where a real fold already moved the cached
+  // breakpoint. sweptSet holds orphans removed on earlier folds (persistent +
+  // monotonic across turns/restarts/upgrades); pendingOrphanSweepMinRef carries
+  // this fold's earliest start ref so we additionally sweep orphans at/after it.
+  // Orphans before it sit in the still-cached prefix and stay visible; with no
+  // fold pending nothing new is swept, so a quiet turn never breaks the prefix.
+  // Orphans quoting an ACTIVE block's folded range are that block's summary
+  // carrier (#1567) and are exempt from the sweep (quotesActiveBlock).
+  const sweptSet = new Set(state.sweptOrphanCallIds ?? []);
+  const foldMinRef = state.pendingOrphanSweepMinRef;
+  const newlySweptCallIds: string[] = [];
 
   const keepCallIds = new Set<string>();
   const hiddenCallIds = new Set<string>();
@@ -259,14 +329,31 @@ export function hideConsumedCompressCalls(
     const info = infos[i]!;
     const callId = messages[i]!.toolCallId;
     if (!info.isCompressCall || !callId) continue;
-    if (
-      info.fate === "inactive" ||
-      (info.fate === "orphan" && !lastOrphaned.has(callId))
-    ) {
-      hiddenCallIds.add(callId);
-    } else {
-      keepCallIds.add(callId);
+    let hide = false;
+    if (info.fate === "inactive") {
+      hide = true;
+    } else if (info.fate === "orphan") {
+      const ref = state.messageRefs.byRaw[messages[i]!.id];
+      const rememberedHidden: string[] = state.hiddenOrphanRefs ?? [];
+      if (sweptSet.has(callId)) {
+        hide = true;
+      } else if (ref && rememberedHidden.includes(ref)) {
+        // Pre-#3769 states persisted the rotation's hidden set as message refs
+        // (hiddenOrphanRefs). Honor it on upgrade: resurrecting a pair the old
+        // kernel already removed would re-insert it mid-history and break the
+        // cached prefix again. The set self-perpetuates — rememberHiddenRef
+        // re-records these refs on every pass they stay hidden.
+        hide = true;
+      } else if (foldMinRef !== undefined && !quotesActiveBlock(messages[i]!.text, activeRangeKeys)) {
+        const num = refNum(ref);
+        if (num !== null && num >= foldMinRef) {
+          hide = true;
+          newlySweptCallIds.push(callId);
+        }
+      }
     }
+    if (hide) hiddenCallIds.add(callId);
+    else keepCallIds.add(callId);
   }
 
   const fateByCallId = new Map<string, Fate>();
@@ -349,5 +436,5 @@ export function hideConsumedCompressCalls(
     result.push(message);
   }
 
-  return { messages: result, hidden, hiddenOrphanRefs };
+  return { messages: result, hidden, hiddenOrphanRefs, newlySweptCallIds };
 }

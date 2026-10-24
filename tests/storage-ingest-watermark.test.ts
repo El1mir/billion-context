@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
@@ -447,6 +448,64 @@ test("watermark: rewound/re-derived tail falls back to full (no silent drops)", 
     }
 });
 
+test("watermark: every duplicate-identity tail shape falls back to full — corpus from #4182", () => {
+    const dir = tmpdir("bili-wm-resend-corpus-");
+    try {
+        const { shadow, store } = openShadow(dir);
+        try {
+            // The #4182 corpus: every shape whose NEW tail portion carries an
+            // already-stored identity (the delta planner cannot see stored
+            // identities, so its raw plan diverges from planIngest) must be
+            // refused by the store's strictly-append guard and fall back to
+            // the exact full path — final state equal to a pure full ingest,
+            // no extra rows. The no-duplicate control must still ride the
+            // delta (the guard must not over-refuse).
+            const shapes: { name: string; first: CoreMessage[]; second: CoreMessage[]; ridesDelta: boolean }[] = [
+                { name: "adjacent duplicate at the tip", first: [msg(0), msg(1), msg(2)], second: [msg(0), msg(1), msg(2), msg(2)], ridesDelta: false },
+                { name: "duplicate in the middle of the new tail", first: [msg(0), msg(1), msg(2)], second: [msg(0), msg(1), msg(2), msg(0), msg(2)], ridesDelta: false },
+                { name: "double duplicate (both prefix messages resent)", first: [msg(0), msg(1)], second: [msg(0), msg(1), msg(0), msg(1)], ridesDelta: false },
+                { name: "duplicate of an interior prefix message", first: [msg(0), msg(1), msg(2), msg(3)], second: [msg(0), msg(1), msg(2), msg(3), msg(1)], ridesDelta: false },
+                { name: "control: no duplicate", first: [msg(0), msg(1), msg(2)], second: [msg(0), msg(1), msg(2), msg(4)], ridesDelta: true },
+            ];
+            shapes.forEach((shape, k) => {
+                const id = `wm-corpus-${k}`;
+                const before = stats(shadow).deltaIngests;
+                shadow.record(mkLegacy(id, shape.first));
+                shadow.record(mkLegacy(id, shape.second));
+                assert.equal(stats(shadow).deltaIngests - before, shape.ridesDelta ? 1 : 0, `${shape.name}: ${shape.ridesDelta ? "must ride" : "must NOT ride"} the delta`);
+                // Oracle: what a pure full ingest of the same view writes.
+                const fullPlan = planIngest(mkLegacy(id, shape.second));
+                const expTail = (JSON.parse(fullPlan.session.tailJson) as { tailSeqs: number[] }).tailSeqs;
+                assert.equal(store.getMessages(id).length, fullPlan.messages.length, `${shape.name}: no extra rows for resent identities`);
+                assert.deepEqual(store.ingestWatermark(id), { seq: expTail[expTail.length - 1], tailSeqs: expTail }, `${shape.name}: watermark/tailSeqs equal the full ingest's`);
+                assert.deepEqual(view(store, id).lastMessages, shape.second, `${shape.name}: served view keeps every tail slot`);
+            });
+        } finally {
+            shadow.close();
+            store.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
+
+test("planner contract (#4182): duplicate-identity tail plans diverge BY DESIGN; the store guard compensates", () => {
+    const A = msg(0);
+    const B = msg(1);
+    const hB = createHash("sha256").update(JSON.stringify(B)).digest("hex");
+    const full = planIngest(mkLegacy("p-full", [A, B, A]));
+    assert.equal(full.messages.length, 2, "full plan dedups the resent identity onto its existing seq");
+    assert.deepEqual((JSON.parse(full.session.tailJson) as { tailSeqs: number[] }).tailSeqs, [0, 1, 0]);
+    const delta = planIngestDelta(mkLegacy("p-delta", [A, B, A]), 1, [0, 1], { msgId: B.id, contentHash: hB }, true);
+    assert.ok(delta, "the delta planner accepts the shape — it cannot see stored prefix identities");
+    assert.equal(delta!.messages.length, 1, "only the resent tail slot is emitted as a new row");
+    assert.equal(delta!.messages[0].msgId, A.id);
+    // THE #4182 divergence, pinned: the resend gets a FRESH seq here where
+    // planIngest above pointed the same slot at A's existing seq (…0 vs …2).
+    // Compensated at the store layer by the strictly-append guard.
+    assert.deepEqual((JSON.parse(delta!.session.tailJson) as { tailSeqs: number[] }).tailSeqs, [0, 1, 2]);
+});
+
 test("watermark: snapshot-bearing sessions stay on the full path", () => {
     const dir = tmpdir("bili-wm-snapshot-");
     try {
@@ -532,12 +591,15 @@ test("watermark: sampled verification still catches drift through the delta path
     }
 });
 
-test("watermark: v4 database migrates to v5 additively; newer user_version no-ops", async () => {
+test("watermark: v4 database migrates to v8 additively; newer user_version no-ops", async () => {
     const dir = tmpdir("bili-wm-migrate-");
     try {
         const dbPath = path.join(dir, "index.db");
         // Craft the v4 shape: the current fresh-install DDL minus the v5
-        // column, one live session with message rows, user_version=4.
+        // watermark column, one live session with message rows,
+        // user_version=4. Newer additive shapes still in the DDL (v6 orphans
+        // column, v7 media table) are presence-probed by the migration, so
+        // they re-land as no-ops.
         // created_at/updated_at must match mkLegacy: the sessions upsert
         // keeps created_at from the existing row (first-seen semantics), so
         // a mismatch would show up as sampled-verify drift, not a migration
@@ -558,7 +620,7 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 5, "open() migrates v4 → v5");
+            assert.equal(ver.user_version, 8, "open() migrates v4 → v8");
             const row = store.getSessionRow("v4-sess");
             assert.ok(row, "legacy session row survives the migration");
             assert.equal(row!.lastIngestedSeq, null, "legacy rows read back with a NULL watermark (≡ full ingest)");
@@ -585,16 +647,18 @@ test("watermark: v4 database migrates to v5 additively; newer user_version no-op
             store.close();
         }
 
-        // Version-gate no-op: a v5 DB rolled FORWARD past the code's target
+        // Version-gate no-op: a v7 DB rolled FORWARD past the code's target
         // (an older build opening a newer file) must open without error and
-        // leave user_version alone — the additive-column contract.
+        // leave user_version alone — the additive-column contract. The
+        // probe version sits ABOVE the current schema head (v7 + 1) so the
+        // no-op branch still exercises after future bumps.
         const fwd = new DatabaseSync(dbPath);
-        fwd.exec("PRAGMA user_version = 6");
+        fwd.exec("PRAGMA user_version = 8");
         fwd.close();
         const older = UnifiedStore.open(dbPath);
         try {
             const ver2 = (older as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver2.user_version, 6, "newer user_version is left untouched");
+            assert.equal(ver2.user_version, 8, "newer user_version is left untouched");
             assert.ok(older.getSessionRow("v4-sess"), "rows stay readable");
         } finally {
             older.close();

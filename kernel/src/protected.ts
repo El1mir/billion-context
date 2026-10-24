@@ -6,8 +6,117 @@ import type { Config, CoreMessage } from "./types.js";
  *  treats past compress calls as load-bearing metadata. acp_rule calls record
  *  persistent user rules that are re-injected every turn — compressing them
  *  away would silently lose what the rules state. Letting any of these be
- *  compressed away breaks decompress and the "summary is historical" contract. */
+ *  compressed away breaks decompress and the "summary is historical" contract.
+ *
+ *  #4289 exception: a compress exchange that applied ZERO ranges is refuse,
+ *  not metadata — no block carries its arguments and decompress never
+ *  consults it. Hosts render such results with a failed-compress receipt
+ *  prefix; see isFailedCompressResult. Those exchanges fold like ordinary
+ *  messages so a failing compress loop cannot permanently bloat context. */
 export const ALWAYS_PROTECTED_TOOLS = ["compress", "acp_rule"] as const;
+
+/** #4289: hosts render a compress tool-result that applied zero ranges with
+ *  one of these prefixes. "[Compression FAILED: …]" covers the refused /
+ *  errored / zero-block paths in src/stream.ts, src/external-summary-compress.ts
+ *  and the ACP tool lane; "[Compression refused: …]" covers the two refuse
+ *  gates whose draft parses fine but commits nothing (coverage regression, no
+ *  net shrink — src/stream.ts gate:coverage-regression / gate:no-net-shrink).
+ *  #4307: both classes leave zero blocks committed, so both are dead weight,
+ *  not metadata. Successful and partial receipts start with "[Compressed" and
+ *  stay protected — a partial fold's arguments still cover the ranges that
+ *  DID apply. */
+export const FAILED_COMPRESS_RESULT_PREFIXES = [
+  "[Compression FAILED",
+  "[Compression refused",
+] as const;
+
+/** True when toolName denotes a compress call in ANY hosted dialect (#4289):
+ *  the canonical bare "compress" plus whatever the host's isCompressTool
+ *  recognizer claims (MCP lanes expose mcp__bili__compress — #2578/#2970).
+ *  Union semantics, never narrower than bare: a host without the hook
+ *  behaves exactly as before. */
+export function isCompressToolName(
+  toolName: string | undefined,
+  config?: Pick<Config, "isCompressTool">,
+): boolean {
+  if (!toolName) return false;
+  return toolName === "compress" || !!config?.isCompressTool?.(toolName);
+}
+
+/** True for the tool-result half of a compress exchange that applied zero
+ *  ranges (#4289). Such an exchange is not load-bearing metadata: no block
+ *  carries its arguments, its summary draft is dead weight, and keeping it
+ *  permanently un-foldable turns a failing compress loop into permanent
+ *  context bloat (live incidents: 70 failed calls = 116KB of residue, #4289;
+ *  47 refused calls = ~117KB, #4307). Dialect-aware via config.isCompressTool
+ *  when given. */
+export function isFailedCompressResult(
+  msg: CoreMessage,
+  config?: Pick<Config, "isCompressTool">,
+): boolean {
+  const text = msg.text ?? "";
+  return (
+    msg.contentType === "tool-result" &&
+    isCompressToolName(msg.toolName, config) &&
+    FAILED_COMPRESS_RESULT_PREFIXES.some((prefix) => text.startsWith(prefix))
+  );
+}
+
+/** toolCallIds of failed compress exchanges (#4289). The tool-CALL half has
+ *  no outcome of its own — pass this set as isMessageProtected's optional
+ *  third argument so both halves drop their protection together. Computed
+ *  from the full message list, which every fold-side consumer already holds. */
+export function collectFailedCompressCallIds(
+  messages: readonly CoreMessage[],
+  config?: Pick<Config, "isCompressTool">,
+): Set<string> {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (isFailedCompressResult(m, config) && m.toolCallId) ids.add(m.toolCallId);
+  }
+  return ids;
+}
+
+/** #4348: compress exchanges stay exempt from folding only while they are
+ *  recent working memory. This many NEWEST compress exchanges keep the
+ *  hard-coded ALWAYS_PROTECTED_TOOLS exemption; older ones become foldable
+ *  like ordinary tool exchanges. Their receipts are machine exhaust
+ *  ("[Compressed mX-mY -> N block(s), ~K tokens saved]") and the summaries
+ *  the model wrote live on verbatim in the block anchors the pruned view
+ *  renders, so folding an aged exchange loses nothing decompress or search
+ *  relies on. The newest folds stay visible so the model can still see what
+ *  it just did (which refs are spent, which blocks exist). */
+export const COMPRESS_EXCHANGE_KEEP_RECENT = 3;
+
+/** Tool-call ids of compress exchanges OLD enough to fold (#4348): every
+ *  compress exchange except the newest COMPRESS_EXCHANGE_KEEP_RECENT ones.
+ *  `keepRecent` exists for tests. Dialect-aware via the same union recognizer
+ *  as the failed-exchange helpers (bare "compress" always counts, plus whatever
+ *  config.isCompressTool claims — #2970 MCP "mcp__bili__compress"). O(n); ids
+ *  are toolCallIds shared by both halves. */
+export function collectAgedCompressCallIds(
+  messages: CoreMessage[],
+  config: Pick<Config, "isCompressTool">,
+  keepRecent: number = COMPRESS_EXCHANGE_KEEP_RECENT,
+): Set<string> {
+  const recent: string[] = [];
+  for (const m of messages) {
+    if (m.contentType === "tool-call" && m.toolCallId && isCompressToolName(m.toolName, config)) {
+      const at = recent.indexOf(m.toolCallId);
+      if (at >= 0) recent.splice(at, 1);
+      recent.push(m.toolCallId);
+      if (recent.length > Math.max(0, keepRecent)) recent.shift();
+    }
+  }
+  const aged = new Set<string>();
+  const keep = new Set(recent);
+  for (const m of messages) {
+    if (m.contentType !== "tool-call" || !m.toolCallId) continue;
+    if (!isCompressToolName(m.toolName, config)) continue;
+    if (!keep.has(m.toolCallId)) aged.add(m.toolCallId);
+  }
+  return aged;
+}
 
 /** Tool results that must NEVER participate in the soft-protected recent zone
  *  (preserveRecentMessages / preserveRecentTokens / last user message).
@@ -201,11 +310,28 @@ export function virtualToolPathOf(
 
 export function isMessageProtected(
   msg: CoreMessage,
-  config: Pick<Config, "protectedTools" | "isToolProtected" | "isMessageProtected" | "messagePathOf">,
+  config: Pick<Config, "protectedTools" | "isToolProtected" | "isMessageProtected" | "messagePathOf" | "isCompressTool">,
+  failedToolCallIds?: ReadonlySet<string>,
 ): boolean {
   // Host-declared message-level protection (#2419): applies to ANY content
   // type and outranks everything below — the host owns the decision.
   if (config.isMessageProtected?.(msg)) return true;
+
+  // #4289: a compress exchange that applied ZERO ranges is refuse, not
+  // metadata — no block carries its arguments and decompress never consults
+  // it. Exempt both halves from EVERY built-in source below (ALWAYS table,
+  // protectedTools patterns, host tool-hooks): MCP-lane forms ride the
+  // injected isToolProtected hook and would otherwise stay pinned forever.
+  // The result half self-proves via its receipt prefix, the call half rides
+  // the failedToolCallIds set. Recognition is dialect-aware (isCompressTool
+  // union — bare always counts).
+  if (
+    isFailedCompressResult(msg, config) ||
+    (msg.toolCallId !== undefined &&
+      failedToolCallIds?.has(msg.toolCallId) === true)
+  ) {
+    return false;
+  }
 
   // tool-result carries the same toolName as its tool-call (the host projects
   // it), so checking toolName covers both sides of a tool exchange.
@@ -227,6 +353,7 @@ export function isMessageProtected(
   }
 
   // Hard-coded protection: ACP metadata tools are never compressible.
+  // (#4289 failed-compress exemption runs ABOVE all built-in sources.)
   if ((ALWAYS_PROTECTED_TOOLS as readonly string[]).includes(msg.toolName)) {
     return true;
   }
@@ -243,17 +370,22 @@ export function isMessageProtected(
 /** Build the set of toolCallIds whose tool-call is protected. Use this to also
  *  protect tool-results that lack a toolName (common when the host projects a
  *  tool-result with only toolCallId). Without it, the result half of a
- *  protected tool exchange leaks into compressible ranges. */
+ *  protected tool exchange leaks into compressible ranges.
+ *
+ *  #4289: failed compress calls are excluded (via the failed set passed into
+ *  isMessageProtected), so their results are not re-protected here through
+ *  pairing. Dialect-aware through config.isCompressTool. */
 export function collectProtectedToolCallIds(
   messages: CoreMessage[],
-  config: Pick<Config, "protectedTools" | "isToolProtected">,
+  config: Pick<Config, "protectedTools" | "isToolProtected" | "isCompressTool">,
 ): Set<string> {
   const ids = new Set<string>();
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   for (const m of messages) {
     if (
       m.contentType === "tool-call" &&
       m.toolCallId &&
-      isMessageProtected(m, config)
+      isMessageProtected(m, config, failedCompressCallIds)
     ) {
       ids.add(m.toolCallId);
     }
@@ -262,16 +394,20 @@ export function collectProtectedToolCallIds(
 }
 
 /** Like isMessageProtected, but also matches tool-results by toolCallId against
- *  the protected call set. Use when you have the full message list available. */
+ *  the protected call set. Use when you have the full message list available.
+ *  Pass the failed-compress set (#4289) as the fourth argument — without it
+ *  the call half of a failed exchange stays protected on this path. */
 export function isMessageProtectedWithPairing(
   msg: CoreMessage,
-  config: Pick<Config, "protectedTools" | "isToolProtected">,
+  config: Pick<Config, "protectedTools" | "isToolProtected" | "isCompressTool">,
   protectedCallIds: Set<string>,
+  failedToolCallIds?: ReadonlySet<string>,
 ): boolean {
-  if (isMessageProtected(msg, config)) return true;
+  if (isMessageProtected(msg, config, failedToolCallIds)) return true;
   if (
     msg.contentType === "tool-result" &&
     msg.toolCallId &&
+    !isFailedCompressResult(msg, config) && // #4289: a failed compress result is never re-protected via pairing
     protectedCallIds.has(msg.toolCallId)
   ) {
     return true;
@@ -378,6 +514,8 @@ interface MediaSidecar {
   rawOpenaiContent?: unknown;
   rawOpenaiContentParts?: unknown[];
   rawAnthropicBlock?: unknown;
+  rawAnthropicMessage?: unknown;
+  rawOpenaiMessage?: unknown;
   rawResponsesItem?: unknown;
   rawGoogleParts?: unknown[];
 }
@@ -402,6 +540,16 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
     if (Array.isArray(content))
       return content.some((p) => !isObjWith(p, "type", "text"));
   }
+  // #3410: unknown top-level block types (in the wild: document/PDF) ride the
+  // sidecar with their full payload — media like image, not text.
+  const abType = asObj(ab)?.type;
+  if (
+    typeof abType === "string" &&
+    abType !== "image" &&
+    abType !== "tool_result" &&
+    abType !== "redacted_thinking"
+  )
+    return true;
   const item = m.rawResponsesItem;
   if (isObjWith(item, "type", "input_image")) return true;
   if (item && typeof item === "object") {
@@ -426,6 +574,29 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
  *  spilled there". */
 export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
   const m = msg as CoreMessage & MediaSidecar;
+
+  // A verbatim anthropic system message carrying control-plane state (Pi's
+  // tool_addition deltas, message-level output_config): folding it would
+  // silently un-declare the tools it adds — never fold. Plain-text ones
+  // (Claude Code's environment note) fold like any text message.
+  if (m.rawAnthropicMessage != null)
+    return !isPlainTextSystemMessage(m.rawAnthropicMessage);
+
+  // #4166 (openai wire, mirror of #3992): a verbatim openai mid-history
+  // system message carrying structured parts (DSH tool_addition-style
+  // blocks) folds into a summary ONLY as flattened text — the block bytes
+  // are unrecoverable, so never fold. Plain-text ones fold like any text
+  // message. isPlainTextSystemMessage is wire-generic: role/content keys +
+  // string-or-all-text-parts content.
+  if (m.rawOpenaiMessage != null)
+    return !isPlainTextSystemMessage(m.rawOpenaiMessage);
+
+  // #4166 (responses wire): same rule for client mid-history
+  // system/developer items riding rawResponsesItem. Role-guarded: user
+  // cores also carry rawResponsesItem (their byte-fidelity sidecar) and
+  // must NOT become unfoldable by this branch.
+  if (m.role === "system" && m.rawResponsesItem != null)
+    return !isPlainTextResponsesSystemItem(m.rawResponsesItem);
 
   const roc = m.rawOpenaiContent;
   if (roc != null) {
@@ -462,7 +633,16 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
         }
       }
     }
-    // redacted_thinking etc. share this field — ignored, parity with hasMediaPayload
+    // #3410: unknown top-level block types (document/PDF ...) — the host
+    // archives no such payload to disk, so folding destroys it permanently.
+    if (
+      typeof ab.type === "string" &&
+      ab.type !== "image" &&
+      ab.type !== "tool_result" &&
+      ab.type !== "redacted_thinking"
+    )
+      return true;
+    // redacted_thinking shares this field — ignored, parity with hasMediaPayload
   }
 
   const item = asObj(m.rawResponsesItem);
@@ -509,6 +689,56 @@ function anthropicSourceArchivable(
   // A data: URL in the url source still carries its bytes inline.
   if (source.type === "url") return isInlineDataUrl(source.url);
   return false;
+}
+
+/** A mid-conversation anthropic `role:"system"` message whose whole payload
+ *  is text (blocks may carry cache_control) — nothing a fold would lose. */
+export function isPlainTextSystemMessage(raw: unknown): boolean {
+  const m = asObj(raw);
+  if (!m || Object.keys(m).some((k) => k !== "role" && k !== "content"))
+    return false;
+  if (typeof m.content === "string") return true;
+  return (
+    Array.isArray(m.content) &&
+    m.content.length > 0 &&
+    m.content.every((b) => {
+      const o = asObj(b);
+      return (
+        o?.type === "text" &&
+        Object.keys(o).every(
+          (k) => k === "type" || k === "text" || k === "cache_control",
+        )
+      );
+    })
+  );
+}
+
+/** #4166: plain-text responses system/developer item — content is a
+ *  string or an all-text parts array (input_text/output_text), so its bytes
+ *  live entirely in `text` and folding loses nothing structural. */
+function isPlainTextResponsesSystemItem(raw: unknown): boolean {
+  const m = asObj(raw);
+  if (
+    !m ||
+    Object.keys(m).some(
+      (k) => k !== "type" && k !== "role" && k !== "content",
+    )
+  )
+    return false;
+  if (typeof m.content === "string") return true;
+  return (
+    Array.isArray(m.content) &&
+    m.content.length > 0 &&
+    m.content.every((b) => {
+      const o = asObj(b);
+      return (
+        o != null &&
+        (o.type === "input_text" || o.type === "output_text") &&
+        typeof o.text === "string" &&
+        Object.keys(o).every((k) => k === "type" || k === "text")
+      );
+    })
+  );
 }
 
 function asObj(v: unknown): Record<string, unknown> | undefined {

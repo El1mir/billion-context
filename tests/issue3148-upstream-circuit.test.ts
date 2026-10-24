@@ -46,7 +46,10 @@ test("#3148: circuit opens after 3 consecutive pre-response failures and fast-fa
 
     const reason = upstreamCircuitBlockReason(URL_A);
     assert.ok(reason !== undefined, "blocked while open");
-    assert.ok(reason.includes("dead-host.invalid"), "reason names the host");
+    // #4254: the reason's free-text host follows the same masking rule as the
+    // embedded last-failure detail (non-public → <private-host>), so it no longer
+    // leaks the raw private hostname; the actionable endpoint rides upstreamFailure.host.
+    assert.ok(reason.includes("<private-host>"), "reason masks the private host consistently");
     assert.ok(reason.includes("consecutive pre-response failures"), "reason states the cause");
     assert.ok(reason.includes("next probe"), "reason gives the probe ETA");
     assert.equal(upstreamCircuitBlockReason(URL_B), undefined, "other hosts unaffected");
@@ -124,15 +127,14 @@ test("#3148 review: an UNCOUNTED probe failure (timeout/client abort) must not p
 });
 
 test("#3148: clampOutgoingOutput records the exact clamp event without changing the wire decision", () => {
-    const rebuilt: Record<string, unknown> = { max_tokens: 65536 };
+    const rebuilt: Record<string, unknown> = { max_tokens: 300_000 };
     let seen: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number } | undefined;
-    // Reproduces the reporter's exact numbers: floor 997348, window 1048576 →
-    // margin ceil(997348*0.05)=49868, cap floor(1048576-997348-49868)=1360 —
-    // then #3071's capability floor lifts the cap to max(1360, 4096)=4096
-    // (bounded by raw headroom floor(1048576-997348)=51228, so input+output
-    // <= window still holds). Pinned post-#3071; this expectation went stale
-    // when the two PRs landed in the same window — master push CI skips the
-    // test matrix, so the mismatch surfaced only on the next PR.
+    // The reporter's numbers (floor 997348, window 1048576 -> margin
+    // ceil(997348*0.05)=49868, cap floor(1048576-997348-49868)=1360, lifted to
+    // 4096 by #3071's capability floor bounded by raw headroom 51228) are kept;
+    // #3384 re-gated the floor, so the request is raised to 300K >=
+    // 0.25*1048576=262144 to take the giant-request ground and keep the hook
+    // path covered.
     clampOutgoingOutput(
         rebuilt,
         "max_tokens",
@@ -150,8 +152,34 @@ test("#3148: clampOutgoingOutput records the exact clamp event without changing 
         () => {},
         (info) => { seen = info; },
     );
-    assert.deepEqual(seen, { raw: 65536, capped: 4096, window: 1048576, planningInput: 997348, ledgerFloor: 997348 }, "exact clamp event captured");
+    assert.deepEqual(seen, { raw: 300_000, capped: 4096, window: 1048576, planningInput: 997348, ledgerFloor: 997348 }, "exact clamp event captured");
     assert.equal(rebuilt.max_tokens, 4096, "wire decision unchanged (same cap as before the hook)");
+
+    // #3384: the OLD expectation here (modest 65536 request against this same
+    // floor clamps to 4096) IS the starvation regression — below both gate
+    // lines the floor must not drive planning, or a healthy session (folded
+    // wire ~9% of the window) loses its output budget to bytes never sent.
+    const modest: Record<string, unknown> = { max_tokens: 65_536 };
+    let modestCalls = 0;
+    clampOutgoingOutput(
+        modest,
+        "max_tokens",
+        {
+            systemText: "",
+            tools: [],
+            processedMessages: [],
+            lastInputTokens: 97730,
+            lastInputTokensSource: "usage",
+            nativeWindow: 1048576,
+            imageTokens: 0,
+            ledgerFloorTokens: 997348,
+        },
+        "t",
+        () => {},
+        () => { modestCalls++; },
+    );
+    assert.equal(modestCalls, 0, "#3384: no clamp event — the floor is gated off for a modest request");
+    assert.equal(modest.max_tokens, 65_536, "#3384: budget untouched while the folded view is healthy");
 
     const healthy: Record<string, unknown> = { max_tokens: 65536 };
     let healthyCalls = 0;

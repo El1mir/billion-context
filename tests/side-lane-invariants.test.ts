@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultConfig, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME } from "acp-kernel";
 import { startServer, BILI_TOOL_NAMES } from "../src/server.ts";
+import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../src/compress-tool.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
@@ -309,12 +310,15 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
 // session state) that handle() consults for the restoreOutputBudget skip and
 // the side-lane reason label, same category as isSideRequest itself. #2503
 // adds isDshTitleRequest — same category: a pure dsh title-sidecar predicate
-// (no threshold, no session state) consulted only to set sideIntent.
+// (no threshold, no session state) consulted only to set sideIntent. #4438
+// adds isDshAutoReviewRequest — same category again: a pure dsh auto-review
+// shape predicate (no threshold, no session state) consulted to set sideIntent
+// and to keep stamped reviews off the |sub: fork path.
 test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isDshAutoReviewRequest", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;
@@ -343,13 +347,22 @@ test("(H) extracted relay module keeps the side-lane boundary (#1440 P2 cut 4)",
     );
 });
 
-// (#3293): absorb was removed from bili entirely — the kernel's absorb tool
-// name must no longer be bili-owned: any "absorb" tool in a request is
-// host/client-originated and vetoes side-lane demotion like any other foreign
-// tool. Lands alongside the src/server/side-request.ts edit per #2170
-// (lane logic moves ⇔ a dedicated side-lane suite moves with it).
-test("(I) post-#3293: the removed absorb tool name is no longer bili-owned", () => {
-    assert.ok(!BILI_TOOL_NAMES.has(ABSORB_TOOL_NAME), "absorb is out of the bili-owned set");
+// (#3293 removed absorb; #3402/#3422 revive it): the kernel's absorb tool name
+// is bili-owned again — a session-sidecar request carrying it is demoted by
+// #1897 like any other bili-owned tool. Lands alongside the
+// src/server/side-request.ts edit per #2170 (lane logic moves ⇔ a dedicated
+// side-lane suite moves with it).
+test("(I) revival (#3402): the absorb tool name is bili-owned again", () => {
+    assert.ok(BILI_TOOL_NAMES.has(ABSORB_TOOL_NAME), "absorb is back in the bili-owned set");
     assert.ok(BILI_TOOL_NAMES.has(RULE_TOOL_NAME), "rules tool still bili-owned");
     assert.ok(BILI_TOOL_NAMES.has(RETRIEVE_TOOL_NAME), "retrieve tool still bili-owned");
+});
+
+// (#3400): acp_read_original_image is bili's own context-management tool. A
+// session-sidecar request that leaks the armed tool set must still be demoted
+// by #1897, so the name joins the bili-owned set in side-request.ts — and per
+// #2170 the lane-logic move lands with its dedicated suite pinning the
+// membership (same discipline as (I) above for the absorb removal).
+test("(J) post-#3400: acp_read_original_image is bili-owned for #1897 demotion", () => {
+    assert.ok(BILI_TOOL_NAMES.has(READ_ORIGINAL_IMAGE_TOOL_NAME), "acp_read_original_image is in the bili-owned set");
 });

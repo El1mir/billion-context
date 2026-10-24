@@ -674,7 +674,7 @@ test("performSelfRestart: port taken over by another bili instance → parent ex
     }
 });
 
-test("performSelfRestart: a replacement that survives SIGTERM is escalated loudly (#3044)", { timeout: 30_000, skip: process.platform === "win32" ? "POSIX-only: Windows terminates on SIGTERM uncatchably, so a SIGTERM-surviving stub cannot be modeled (was a w24 CI red, #3182 family)" : false }, async () => {
+test("performSelfRestart: a replacement that ignores SIGTERM is reaped by the SIGKILL escalation (#3044/#3344)", { timeout: 30_000, skip: process.platform === "win32" ? "POSIX-only: Windows terminates on SIGTERM uncatchably, so a SIGTERM-surviving stub cannot be modeled (was a w24 CI red, #3182 family)" : false }, async () => {
     // #3182: same stolen-port retry as above (stub exit 91 = infra TOCTOU).
     const stubborn = path.join(root, "stub-stubborn.mjs");
     for (let attempt = 0; ; attempt++) {
@@ -683,8 +683,9 @@ test("performSelfRestart: a replacement that survives SIGTERM is escalated loudl
     const record: SpawnRecord = {};
     writeFileSync(stubborn, [
         // No listener by design: the stub models a replacement that never
-        // reaches readiness. It only ignores SIGTERM to force the loud
-        // escalation path (#3044).
+        // reaches readiness. It ignores SIGTERM to force the escalation path;
+        // #3344 escalates to SIGKILL, which it cannot ignore — so the orphan
+        // is reaped instead of left for manual cleanup (#3044).
         "process.on('SIGTERM', () => {});",
         "setInterval(() => {}, 1000);",
     ].join("\n"));
@@ -700,9 +701,13 @@ test("performSelfRestart: a replacement that survives SIGTERM is escalated loudl
         });
         assert.equal(result.ok, false, JSON.stringify(result));
         assert.equal(result.error, "replacement-not-ready");
-        // An unverified kill was how the orphans of #3044 survived their
-        // parent's timeout — the loud escalation is the point of this test.
-        assert.match(entries.join("\n"), /still alive after SIGTERM — manual cleanup required \(kill \d+\)/s);
+        // #3344: the SIGTERM-ignoring replacement is reaped by the SIGKILL
+        // escalation — no orphan survives its parent's timeout, so no
+        // manual-cleanup error is logged. (Pre-#3344 this stub stayed alive
+        // and the assertion matched the loud manual-cleanup message.)
+        assert.ok(record.child?.pid, "stub pid for the liveness check");
+        assert.equal(isPidAlive(record.child!.pid), false, "the SIGTERM-stubborn replacement was reaped by SIGKILL");
+        assert.doesNotMatch(entries.join("\n"), /manual cleanup required/s);
         assert.equal(await waitForListening(server), true, "service resumes regardless");
         break;
     } catch (e) {

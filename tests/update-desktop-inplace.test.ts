@@ -298,6 +298,72 @@ test("refreshDshDesktopCopy: manifest spec converges to the installed version, r
     }
 });
 
+test("refreshDshDesktopCopy converges the lockfile record along with the manifest (#3496)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-ledger-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildDesktopFixture(root, "0.1.180", "0.1.194");
+        const profileDir = path.join(fx.dshHome, "profiles", "desktop");
+        writeFileSync(path.join(profileDir, "package.json"), JSON.stringify({
+            name: "@dsh/profile-desktop",
+            dependencies: { "billion-context": "^0.1.180", "other-dep": "^1.2.3" },
+            dsh: { profile: { bundles: ["billion-context"] } },
+        }, null, 2) + "\n");
+        // The stale record the pre-#3496 self-heal used to leave behind: manifest
+        // and lockfile both still naming the old version after the copy swap.
+        const lockPath = path.join(profileDir, "pnpm-lock.yaml");
+        writeFileSync(lockPath, [
+            "lockfileVersion: '9.0'",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.180",
+            "        version: 0.1.180",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.180:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.180: {}",
+            "",
+        ].join("\n"));
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        stubRegistryFetch(fx.tgz, "https://registry.test/bc-0.1.194.tgz", "0.1.194", integrityField(fx.tgz));
+        await refreshDshDesktopCopy("0.1.194", captureLog().log, process.env);
+
+        assert.equal(await readDiskVersion(fx.flat), "0.1.194");
+        const manifest = JSON.parse(readFileSync(path.join(profileDir, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
+        assert.equal(manifest.dependencies?.["billion-context"], "^0.1.194");
+        const lockText = readFileSync(lockPath, "utf8");
+        assert.match(lockText, /specifier: \^0\.1\.194/, "the lockfile's declared-spec record must follow the in-place swap");
+        assert.match(lockText, /version: 0\.1\.194/, "the lockfile's resolved-version record must follow the in-place swap");
+        assert.ok(lockText.includes("billion-context@0.1.180:"), "store bookkeeping sections are pnpm's to reconcile — bili leaves them alone");
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
 test("syncDshProfileManifestSpec: style-preserving convergence, pins and odd specs respected (#2894)", () => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-spec-"));
     try {

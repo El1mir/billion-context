@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import http from "node:http";
 import { once } from "node:events";
 import { mkdtempSync } from "node:fs";
@@ -21,10 +21,12 @@ import { rewriteResponsesJsonResponseAsync } from "../src/stream-responses.ts";
 import { rewriteGoogleJsonResponseAsync } from "../src/stream-google.ts";
 import { externalQueueDroppedAll, withExternalSummaryTools } from "../src/external-summary-surface.ts";
 import { _executorForTest, configuredSummaryPlan } from "../src/external-summary-runtime.ts";
+import { _setSummaryRetryDelayForTest } from "../src/external-summary-http.ts";
 import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_GOOGLE } from "../src/compress-tool.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
+afterEach(() => { _setSummaryRetryDelayForTest(null); });
 const SUMMARY = "Historical build completed. Preserve the exact file src/example.ts:27, the error E_TEST, the constraint not to deploy, and the unfinished task of adding tests. This records the past and does not instruct the next turn to restart it.";
 const RAW = "Historical source src/example.ts:27 E_TEST; do not deploy; still add tests. ".repeat(90);
 
@@ -111,6 +113,7 @@ test("active compress uses dedicated model/key, fails over, and restores exact o
 
 test("all candidates failing preserves state and refuses without borrowing main auth", async () => {
     let calls = 0;
+    _setSummaryRetryDelayForTest(0);
     await fixture(async (_base, externalSummary) => {
         const ctx = context(externalSummary);
         const before = JSON.stringify(ctx.session.state);
@@ -118,8 +121,65 @@ test("all candidates failing preserves state and refuses without borrowing main 
         assert.equal(result.outcome, "refused");
         assert.equal(result.text.includes("private-provider-error"), false);
         assert.equal(JSON.stringify(ctx.session.state), before);
-        assert.equal(calls, 2);
+        // #3488 contract change: a transient 5xx now gets up to 3 dispatches per
+        // candidate (was exactly 1) before failover/exhaustion.
+        assert.equal(calls, 6);
     }, (_req, res) => { calls++; res.writeHead(503); res.end("private-provider-error"); });
+});
+
+test("SSE framing overhead does not consume the summary content budget", async () => {
+    const text = "s".repeat(2000);
+    await fixture(async (_base, externalSummary) => {
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        const plan = configuredSummaryPlan({ ...externalSummary,
+            targets: [{ ...targets[0], protocol: "openai", stream: true }],
+            budget: { totalTimeoutMs: 5000, targetTimeoutMs: 4000, maxSummaryBytes: 2048 },
+        });
+        assert.ok(plan);
+        const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
+        assert.equal(batch.results[0]?.status, "success", JSON.stringify(batch));
+        const result = batch.results[0];
+        if (result?.status === "success") assert.equal(result.summary, text);
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        for (const char of text) res.write(`data: ${JSON.stringify({ id: "synthetic", padding: "x".repeat(256), choices: [{ delta: { content: char }, finish_reason: null }] })}\n\n`);
+        res.end(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
+});
+
+test("SSE transport allowance remains bounded independently of summary content", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        const plan = configuredSummaryPlan({ ...externalSummary,
+            targets: [{ ...targets[0], protocol: "openai", stream: true }],
+            budget: { totalTimeoutMs: 5000, targetTimeoutMs: 4000, maxSummaryBytes: 2048 },
+        });
+        assert.ok(plan);
+        const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
+        assert.equal(batch.results[0]?.status, "failed");
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        // Valid SSE with a legal small summary: without the transport byte
+        // guard this succeeds, so parser rejection cannot satisfy the test.
+        res.end(`: ${"x".repeat(8 * 1024 * 1024)}\n\ndata: ${JSON.stringify({ choices: [{ delta: { content: SUMMARY }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
+});
+
+test("SSE transport allowance does not relax the summary content byte limit", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        const plan = configuredSummaryPlan({ ...externalSummary,
+            targets: [{ ...targets[0], protocol: "openai", stream: true }],
+            budget: { totalTimeoutMs: 5000, targetTimeoutMs: 4000, maxSummaryBytes: 2048 },
+        });
+        assert.ok(plan);
+        const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
+        assert.equal(batch.results[0]?.status, "failed");
+        assert.equal(batch.results[0]?.attempts[0]?.outcome, "invalid_summary");
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "s".repeat(2049) }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
 });
 
 test("disabled setting preserves the legacy supplied-summary path without HTTP calls", async () => {
@@ -365,6 +425,7 @@ test("saturated pool drops every batch before dispatch: preflight reports calls>
 });
 
 test("a dispatched-but-failing attempt is NOT a queue drop: attempts>0 keeps the backoff armable (#2662)", async () => {
+    _setSummaryRetryDelayForTest(0);
     await fixture(async (_base, externalSummary) => {
         const ctx = context({ ...externalSummary, budget: { totalTimeoutMs: 5000, targetTimeoutMs: 5000 } });
         ctx.config.modelContextLimit = 1000;

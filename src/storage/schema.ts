@@ -63,7 +63,7 @@
 //        index. Both directions compatible: an older build opening a v5
 //        file no-ops at the version gate (extra column ignored); a newer
 //        build upgrades a v4 file with one idempotent ALTER TABLE.
-const STORAGE_SCHEMA_VERSION = 5;
+const STORAGE_SCHEMA_VERSION = 8;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -87,10 +87,17 @@ export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
         "PRAGMA busy_timeout = 5000",
         "PRAGMA foreign_keys = ON",
         `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
+        // #3901/#3463: freed pages return to the pool incrementally so an
+        // archive/GC sweep actually shrinks the file going forward. Databases
+        // created before this pragma keep their original layout until a
+        // one-time full VACUUM (gc({vacuum:"full"}) / ?vacuum=full).
+        "PRAGMA auto_vacuum = INCREMENTAL",
     ];
 }
 
 export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
+
+import { identityOfStoredContent } from "./identity.js";
 
 const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
@@ -113,7 +120,8 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     kstate_json         TEXT NOT NULL DEFAULT '{}',
     tail_json           TEXT NOT NULL DEFAULT '{}',
     ccr_json            TEXT,
-    last_ingested_seq   INTEGER
+    last_ingested_seq   INTEGER,
+    orphans_json        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS content (
@@ -133,6 +141,8 @@ CREATE TABLE IF NOT EXISTS messages (
     role            TEXT NOT NULL,
     kind            TEXT NOT NULL DEFAULT 'message',
     content_hash    TEXT NOT NULL REFERENCES content(hash),
+    identity        TEXT NOT NULL DEFAULT '',
+    retired_at      INTEGER,
     PRIMARY KEY (session_id, seq),
     UNIQUE (session_id, msg_id, content_hash)
 );
@@ -243,6 +253,17 @@ CREATE TABLE IF NOT EXISTS kv_store (
     PRIMARY KEY (namespace, key)
 ) WITHOUT ROWID;
 
+-- #3762 media CAS: one row per (message, media blob) reference. The message
+-- content stores {"$media": hash} in the imageBase64 slot; the bytes live in
+-- the content CAS, refcounted by these mapping rows. Swept with the session
+-- (and on idempotent re-receipt undo, same discipline as messages.content).
+CREATE TABLE IF NOT EXISTS message_media (
+    session_id      TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    media_hash      TEXT NOT NULL REFERENCES content(hash),
+    PRIMARY KEY (session_id, seq, media_hash)
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(session_id, msg_id);
 CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id, ord);
@@ -254,7 +275,7 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, cr
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
     exec(sql: string): void;
-    prepare(sql: string): { get(...a: unknown[]): unknown; all(...a: unknown[]): unknown[] };
+    prepare(sql: string): { get(...a: unknown[]): unknown; all(...a: unknown[]): unknown[]; run(...a: unknown[]): unknown };
     transaction<T>(fn: () => T): T;
 }): { from: number; to: number } {
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
@@ -290,6 +311,12 @@ export function migrateSchema(db: {
             db.exec("CREATE TABLE IF NOT EXISTS session_ext (\n                session_id      TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (session_id, key)\n            ) WITHOUT ROWID");
             db.exec("CREATE TABLE IF NOT EXISTS kv_store (\n                namespace       TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (namespace, key)\n            ) WITHOUT ROWID");
         }
+        if (from < 7) {
+            // v7 media CAS (#3762): message→media mapping table. Idempotent
+            // CREATE — pre-v7 rows keep their inline bytes and read back
+            // verbatim (lazy: no backfill rehash).
+            db.exec("CREATE TABLE IF NOT EXISTS message_media (\n                session_id      TEXT NOT NULL,\n                seq             INTEGER NOT NULL,\n                media_hash      TEXT NOT NULL REFERENCES content(hash),\n                PRIMARY KEY (session_id, seq, media_hash)\n            ) WITHOUT ROWID");
+        }
         if (from < 5) {
             // v5 ingest watermark (#3133): additive NULLable column on
             // sessions. Probe first — same duplicate-column discipline as v2
@@ -298,6 +325,97 @@ export function migrateSchema(db: {
                 .map((c) => (typeof c?.name === "string" ? c.name : ""));
             if (!cols.includes("last_ingested_seq")) {
                 db.exec("ALTER TABLE sessions ADD COLUMN last_ingested_seq INTEGER");
+            }
+        }
+        if (from < 6) {
+            // v6 reap journal (#3841): nullable column holding the block
+            // contents of REAPED blocks (#2695 reap keeps blockContents
+            // while state.blocks loses the entry — the journal carries that
+            // content across restarts so reaped blocks never resurrect).
+            // NULL = the session has no reaped orphans (pre-v6 rows keep
+            // old behavior).
+            const cols = (db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!cols.includes("orphans_json")) {
+                db.exec("ALTER TABLE sessions ADD COLUMN orphans_json TEXT");
+            }
+        }
+        if (from < 8) {
+            // v8 position-independent identity + historian tombstones
+            // (#4390). identity: the cross-save JOIN key (stored-bytes
+            // serialization minus id/wireIndex) — content_hash stays the
+            // byte-faithful CAS key. retired_at: the authoritative-set sweep
+            // tombstones absent rows instead of deleting them (rewind/undo
+            // history survives; getMessages filters retired rows).
+            // Probe-first: dev-window builds whose DDL already carried the
+            // columns must not fail on duplicate ALTERs (v2 discipline).
+            const msgCols = (db.prepare("PRAGMA table_info(messages)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!msgCols.includes("identity")) {
+                db.exec("ALTER TABLE messages ADD COLUMN identity TEXT NOT NULL DEFAULT ''");
+            }
+            if (!msgCols.includes("retired_at")) {
+                db.exec("ALTER TABLE messages ADD COLUMN retired_at INTEGER");
+            }
+            db.exec("CREATE INDEX IF NOT EXISTS idx_messages_identity ON messages (session_id, msg_id, identity)");
+            // Backfill from stored bytes, healing the wireIndex-split
+            // generations the polluted formula minted: same (msg_id,
+            // identity) after the strip → keep the FIRST arrival (lowest
+            // seq), drop the later duplicates and hand their CAS refs back.
+            // Message bytes live in the content CAS (messages carry only the
+            // hash) — join in, decompress nothing (bytes are stored raw).
+            const rows = db
+                .prepare("SELECT m.session_id AS session_id, m.seq AS seq, m.msg_id AS msg_id, m.content_hash AS content_hash, c.bytes AS content FROM messages m JOIN content c ON c.hash = m.content_hash")
+                .all() as { session_id: string; seq: number; msg_id: string; content: string; content_hash: string }[];
+            const keep = new Map<string, { session_id: string; seq: number; content_hash: string }>();
+            const drop: { session_id: string; seq: number; content_hash: string }[] = [];
+            const rawByIdentityKey = new Map<string, string>();
+            for (const r of rows) {
+                // node:sqlite returns BLOB as Uint8Array — normalize to utf8
+                // before hashing (JSON.parse would coerce it to a comma list
+                // and silently hash the wrong input).
+                const raw = typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8");
+                const identity = identityOfStoredContent(raw);
+                rawByIdentityKey.set(`${r.session_id}\u0000${r.msg_id}\u0000${identity}`, raw);
+                const key = `${r.session_id}\u0000${r.msg_id}\u0000${identity}`;
+                const seen = keep.get(key);
+                if (seen === undefined) {
+                    keep.set(key, { session_id: r.session_id, seq: r.seq, content_hash: r.content_hash });
+                } else if (r.seq < seen.seq) {
+                    // an earlier arrival discovered late — swap the keeper
+                    drop.push({ session_id: seen.session_id, seq: seen.seq, content_hash: seen.content_hash });
+                    keep.set(key, { session_id: r.session_id, seq: r.seq, content_hash: r.content_hash });
+                } else {
+                    drop.push({ session_id: r.session_id, seq: r.seq, content_hash: r.content_hash });
+                }
+            }
+            const identityBySeq = new Map<string, string>();
+            for (const r of rows) {
+                const raw = rawByIdentityKey.get(`${r.session_id}\u0000${r.msg_id}\u0000${identityOfStoredContent(typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8"))}`) ?? (typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8"));
+                const identity = identityOfStoredContent(raw);
+                const key = `${r.session_id}\u0000${r.msg_id}\u0000${identity}`;
+                if (keep.get(key)?.seq === r.seq) identityBySeq.set(`${r.session_id}\u0000${r.seq}`, identity);
+            }
+            const upd = db.prepare("UPDATE messages SET identity = ? WHERE session_id = ? AND seq = ?");
+            for (const [k, identity] of identityBySeq) {
+                const [sessionId, seqStr] = k.split("\u0000");
+                upd.run(identity, sessionId, Number(seqStr));
+            }
+            // Duplicates: delete their media mappings + message rows and
+            // decrement CAS refcounts (delete referencing rows FIRST — the
+            // #4242 discipline; refcount may reach 0, the next gc run
+            // collects those content rows).
+            const decRef = db.prepare("UPDATE content SET refcount = refcount - 1 WHERE hash = ?");
+            const delMedia = db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
+            const mediaOf = db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
+            const delMsg = db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
+            for (const d of drop) {
+                for (const mm of mediaOf.all(d.session_id, d.seq) as { media_hash: string }[]) {
+                    decRef.run(mm.media_hash);
+                }
+                delMedia.run(d.session_id, d.seq);
+                delMsg.run(d.session_id, d.seq);
+                decRef.run(d.content_hash);
             }
         }
         db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);

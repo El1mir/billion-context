@@ -137,6 +137,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         const old = oldHistory();
         const pos = storedOf(old);
         const { plan } = planFor(old, codecSwitch(old), pos);
+        assert.equal(plan.pass0Desync, undefined, "aligned copy must not flag a desync");
         assert.equal(plan.byPos, 10, "every covered id claimed at its position");
         assert.equal(plan.byTool, 0, "rewritten toolCallId scheme defeats the tool pass — positional did the work");
         assert.equal(plan.byNorm, 0, "changed contentType literal defeats the norm pass — positional did the work");
@@ -284,6 +285,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         const { plan } = planFor(old, drifted, wrong);
         assert.equal(plan.byPos, 0, "misaligned copy must not claim");
         assert.ok(plan.unmatched.length > 0, "honest fallback to the legacy passes");
+        assert.equal(plan.pass0Desync, true, "#4390 p3: the silent Pass-0 degrade must be flagged for logging");
     });
 
     test("legacy plain-canon[] storage from the #2488 merge window still reconciles", () => {
@@ -389,12 +391,14 @@ describe("reconcileFoldCoverage positional wiring (#2480)", () => {
         const coveredNow = (session.state.blocks as { effectiveMessageIds: string[] }[])[0].effectiveMessageIds;
         const tailIds = compacted.slice(1).map((m) => m.id as string);
         for (const id of tailIds) assert.ok(coveredNow.includes(id), `tail id ${id} stays covered`);
-        // self-heal trajectory: the next full pass on the compacted history is
-        // steady for the tail; the compacted-away head ids stay missing and the
-        // #2193 drift streak starts counting toward its one error line
+        // #3641 doctrine: the compacted-away head is a sanctioned host-side
+        // deletion (summary + surviving tail = wire suffix-continuation of the
+        // previous order). The fold keeps the snapshot, no drift streak ever
+        // starts, and one benign truncation note is latched for the panel.
         const r2 = reconcileFoldCoverage(session, [...compacted, msg("post_1", "user", "resume")], opts("repair"));
         assert.equal(r2.byPos, 0);
-        assert.equal(session.metadata.foldDriftStreak, 1, "total-loss streak begins (existing machinery owns the landing)");
+        assert.equal(session.metadata.foldDriftStreak, undefined, "#3641: sanctioned compaction never starts the collapse streak");
+        assert.equal(session.metadata.foldTruncationNoted, true, "one benign truncation note is latched");
     });
 
     test("side-request-shaped passes take no positional evidence", () => {

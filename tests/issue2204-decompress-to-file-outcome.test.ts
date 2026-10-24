@@ -68,7 +68,7 @@ function foldCcr() {
     const config = applyCompressSettings(
         defaultConfig(200_000),
         200_000,
-        { ccr: { enabled: true, minToolTokens: 50 } },
+        { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 } },
     ) as Config;
     const session = getSession(`tfr2204-${Math.random().toString(36).slice(2)}`);
     storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });

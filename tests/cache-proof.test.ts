@@ -1015,6 +1015,12 @@ function runProof(wire: Wire, bodies: string[], urls: string[], ev: ProofEvents)
 }
 
 
+// #3400: pin legacy wire economics - the default-on acp_read_original_image tool
+// adds ~200 tokens per request, shifting this scenario's nudge timing so the
+// fold/rearm arithmetic moves by design. Fidelity here is compaction behavior,
+// not egress policy (tests/issue3400-image-rescale.test.ts covers that).
+process.env.BILI_IMAGE_RESCALE = "0";
+
 test("cache proof (openai chat wire): byte-stable growth, failure paths, param drift, folds", { timeout: 120_000 }, async () => {
     const { bodies, urls, ev } = await driveProof("chat", "proof-chat", 200_000);
     assert.ok(ev.retry.length === 1, "transport-retry scenario must have produced a resend pair");

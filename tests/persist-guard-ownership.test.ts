@@ -8,18 +8,16 @@ import type { Session } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
 import { rmrf } from "./tmp-rm.ts";
 
-function sleepSync(ms: number): void {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-// #3049: the stale-disk guard's ownership fast path. The guard protects the
-// shared sessions dir from counter rollback (#405/#2401); it used to re-read
+// #3049/#3406: the stale-disk guard's ownership fast path. The guard protects
+// the shared sessions dir from counter rollback (#405/#2401); it used to re-read
 // and re-parse the ENTIRE envelope on every save for two counters. In
 // shadow/full mode the fast path proves "no other writer committed since our
-// last build" with (unified-row counters === our token) + (envelope mtime not
-// newer than our build) and skips the read. These pins cover the collapse AND
-// the three escape hatches (cross-instance commit, foreign file write, legacy
-// exactness).
+// last landed write" with (unified-row counters === our token) + (envelope
+// still byte-identical to the post-write stamp: same size, mtime not newer —
+// #3406 replaced the old builtAtMs+1.5s grace window, which missed foreign
+// writes landing inside it) and skips the read. These pins cover the collapse
+// AND the escape hatches (cross-instance commit, foreign file write, the
+// #3406 in-window race, legacy exactness).
 
 function makeSession(id: string): Session {
     return {
@@ -44,12 +42,39 @@ function withMode(mode: "shadow" | "legacy", name: string, fn: (dir: string) => 
         const dir = mkdtempSync(join(tmpdir(), `bili-guard-own-${mode}-`));
         try {
             await fn(dir);
-        } finally {
-            rmrf(dir);
+        } catch (err) {
+            // A teardown EBUSY must never mask the real failure (windows win22-1
+            // #3498: the rmrf ladder's EBUSY replaced the actual error).
+            try { rmrf(dir); } catch { /* keep the original error */ }
             if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
             else process.env.BILI_STORAGE_UNIFIED = prev;
+            throw err;
         }
+        rmrf(dir);
+        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prev;
     }) as unknown as Promise<void>;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// Fixed sleep(150) budgets assumed the 25ms debounce + disk write always fit
+// in ~125ms of slack — loaded CI runners starve that (windows-22 shard red on
+// #3626's head: the fifth debounced save had not landed when the test read).
+// Poll for the landed state instead: same assertions, no time assumption.
+function landedRequests(dir: string, id: string): number {
+    try {
+        return (JSON.parse(readFileSync(envelopeFileOf(dir, id), "utf8")) as { payload: { stats: { requests: number } } }).payload.stats.requests;
+    } catch { return -1; } // envelope not written yet
+}
+
+async function waitForLanded(what: string, ok: () => boolean): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+        if (ok()) return;
+        if (Date.now() > deadline) throw new Error(`${what}: did not land within 5s`);
+        await sleep(25);
+    }
 }
 
 function envelopeFileOf(dir: string, id: string): string {
@@ -124,7 +149,7 @@ await withMode("shadow", "guard ownership: a sibling instance's commit is detect
     storeB.closeQuietly();
 });
 
-await withMode("shadow", "guard ownership: a foreign file write (legacy sibling / manual edit) trips the mtime check", async (dir) => {
+await withMode("shadow", "guard ownership: a foreign file write (legacy sibling / manual edit) trips the landed-write stamp check", async (dir) => {
     const warnings: string[] = [];
     const log = (level: string, msg: string): void => {
         if (level === "warn") warnings.push(msg);
@@ -134,9 +159,9 @@ await withMode("shadow", "guard ownership: a foreign file write (legacy sibling 
     s.stats.requests = 3;
     await store.writeNow(s);
 
-    // Push the foreign write outside the ownership grace window so the mtime
-    // check is deterministic in-test (1.5s slack for our own write latency).
-    sleepSync(1700);
+    // No sleep needed: the stamp ("written") records the size+mtime of OUR
+    // landed write, so ANY foreign bytes — regardless of when they land —
+    // mismatch the stamp and force the full read.
     const file = envelopeFileOf(dir, "foreign");
     const parsed = JSON.parse(readFileSync(file, "utf8")) as { payload: { stats: { requests: number }; metadata: Record<string, unknown> } };
     parsed.payload.stats.requests = 7; // a legacy sibling that never touches index.db
@@ -151,6 +176,100 @@ await withMode("shadow", "guard ownership: a foreign file write (legacy sibling 
     assert.equal(after.stats.requests, 7, "disk keeps the foreign fresher counter");
     assert.equal(after.metadata.lineage, "foreign-newer");
     assert.ok(warnings.some((w) => w.includes("rejected stale snapshot")), "foreign write detection still warns");
+    store.closeQuietly();
+});
+
+await withMode("shadow", "guard ownership: #3406 — a foreign write INSIDE the old grace window no longer clobbers the envelope", async (dir) => {
+    const warnings: string[] = [];
+    const log = (level: string, msg: string): void => {
+        if (level === "warn") warnings.push(msg);
+    };
+    const store = new SessionStore({ dir, debounceMs: 1, enabled: true, log });
+    const s = makeSession("in-window");
+    s.stats.requests = 3;
+    await store.writeNow(s);
+    const fullReadsBefore = store.__staleGuardFullReadsForTests();
+
+    // The #3406 item-2 race: a legacy-mode sibling (sidecar disabled, never
+    // touches index.db) writes a NEWER envelope milliseconds after ours —
+    // inside the 1.5s grace window the old #3286 fast path trusted blindly
+    // (mtime was only compared against BUILD time, and no counter moved), so
+    // the next save skipped the full read and clobbered the sibling's file.
+    const file = envelopeFileOf(dir, "in-window");
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { payload: { stats: { requests: number }; metadata: Record<string, unknown> } };
+    parsed.payload.stats.requests = 9;
+    parsed.payload.metadata.lineage = "sibling-newer";
+    writeFileSync(file, JSON.stringify(parsed));
+
+    // Same in-memory counters — only the landed-write stamp can catch it.
+    s.stats.requests = 3;
+    await store.writeNow(s);
+
+    assert.equal(store.__staleGuardFullReadsForTests(), fullReadsBefore + 1, "size mismatch vs the landed-write stamp forces the full read (fast path must NOT fire)");
+    const after = (JSON.parse(readFileSync(envelopeFileOf(dir, "in-window"), "utf8")) as { payload: { stats: { requests: number }; metadata: { lineage: string } } }).payload;
+    assert.equal(after.stats.requests, 9, "the sibling's fresher envelope survives — no clobber");
+    assert.equal(after.metadata.lineage, "sibling-newer");
+    assert.ok(warnings.some((w) => w.includes("rejected stale snapshot")), "the in-window foreign write still warns");
+    store.closeQuietly();
+});
+
+await withMode("shadow", "guard ownership: #3406 — DEBOUNCED saves stay stamped (host-owned debounce keeps the fast path live)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 25, enabled: true, log: () => {} });
+    const s = makeSession("deb-stamp");
+    const SAVES = 5;
+    for (let i = 1; i <= SAVES; i++) {
+        s.stats.requests = i;
+        store.scheduleSave(s);
+        await waitForLanded(`deb-stamp save ${i}`, () => landedRequests(dir, "deb-stamp") >= i);
+    }
+    const file = envelopeFileOf(dir, "deb-stamp");
+    const payload = (JSON.parse(readFileSync(file, "utf8")) as { payload: { stats: { requests: number } } }).payload;
+    assert.equal(payload.stats.requests, SAVES, "coalesced builds still persist the freshest state");
+    // Before the host-owned debounce, every debounced save landed through the
+    // kernel-internal write path WITHOUT a stamp → the fast path died on every
+    // per-turn save (full re-read of the envelope each time). The first save
+    // has no token yet and must full-read; every later one must collapse.
+    const fullReads = store.__staleGuardFullReadsForTests();
+    assert.ok(fullReads <= 2, `debounced saves must collapse to the first full read (got ${fullReads} for ${SAVES} saves)`);
+    store.closeQuietly();
+});
+
+await withMode("shadow", "guard ownership: #3406 — a foreign write between DEBOUNCED saves no longer clobbers the envelope", async (dir) => {
+    const warnings: string[] = [];
+    const log = (level: string, msg: string): void => {
+        if (level === "warn") warnings.push(msg);
+    };
+    const store = new SessionStore({ dir, debounceMs: 25, enabled: true, log });
+    const s = makeSession("deb-foreign");
+    s.stats.requests = 3;
+    store.scheduleSave(s);
+    // Gate on the LANDED-WRITE STAMP, not just file presence: the stamp is applied
+    // asynchronously after the write resolves (after the envelope is already on
+    // disk), so a foreign write slipping into that gap is adopted as ours by the
+    // stamp (#3406 residual gap) and the guard below never trips. Waiting only for
+    // the file landed raced ~1-in-4 under loaded CI runners (#3652); the stamp gate
+    // closes it deterministically.
+    await waitForLanded("deb-foreign first save", () => landedRequests(dir, "deb-foreign") >= 3 && store.__ownWriteStampedForTests("deb-foreign"));
+    const fullReadsBefore = store.__staleGuardFullReadsForTests();
+
+    // The #3406 item-2 race on the production per-turn lane: a legacy-mode
+    // sibling (never touches index.db) writes a NEWER envelope after ours.
+    const file = envelopeFileOf(dir, "deb-foreign");
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { payload: { stats: { requests: number }; metadata: Record<string, unknown> } };
+    parsed.payload.stats.requests = 9;
+    parsed.payload.metadata.lineage = "sibling-newer";
+    writeFileSync(file, JSON.stringify(parsed));
+
+    // Same in-memory counters — only the landed-write stamp can catch it.
+    s.stats.requests = 3;
+    store.scheduleSave(s);
+    await waitForLanded("deb-foreign guard pass", () => store.__staleGuardFullReadsForTests() >= fullReadsBefore + 1);
+
+    assert.equal(store.__staleGuardFullReadsForTests(), fullReadsBefore + 1, "size mismatch vs the landed-write stamp forces the full read (fast path must NOT fire)");
+    const after = (JSON.parse(readFileSync(envelopeFileOf(dir, "deb-foreign"), "utf8")) as { payload: { stats: { requests: number }; metadata: { lineage: string } } }).payload;
+    assert.equal(after.stats.requests, 9, "the sibling's fresher envelope survives — no clobber");
+    assert.equal(after.metadata.lineage, "sibling-newer");
+    assert.ok(warnings.some((w) => w.includes("rejected stale snapshot")), "the debounced-lane foreign write still warns");
     store.closeQuietly();
 });
 

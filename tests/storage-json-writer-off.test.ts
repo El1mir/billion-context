@@ -20,7 +20,7 @@ import { UnifiedStore } from "../src/storage/store.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 // Same hermeticity pin as the other storage suites: pin BOTH tiers so every
-// leg controls its own mode explicitly (absent now defaults to shadow).
+// leg controls its own mode explicitly (absent now defaults to full, #3818).
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jw-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(hermetic, "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "legacy";
@@ -115,7 +115,7 @@ test("jsonWriter=off (full): no envelope written, index-only session survives re
                 // Rollback story: replicas keep materializing JSON envelopes
                 // (restore writes through the kernel store directly) — a
                 // portable export even while the writer is off.
-                const cp = reopen.createReplica(session.id, { label: "json-writer-off-rollback" });
+                const cp = await reopen.createReplica(session.id, { label: "json-writer-off-rollback" });
                 const restored = await reopen.restoreReplica(cp.cp_id, { sessionId: session.id + "-rb" });
                 assert.equal(restored.restoredFrom, session.id);
                 const rb = envelopeFiles(dir).map((f) => path.basename(f));

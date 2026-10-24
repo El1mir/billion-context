@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { exportSession, renderSessionJsonlFromTables, renderSessionJsonlFromSession } from "../src/export.ts";
+import { SqliteBackend } from "../src/storage/backend.ts";
 import { buildStoredPlaceholder } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 
@@ -76,7 +77,7 @@ test("--jsonl renders from the unified tables: header, blocks, dead refs (folded
             const unified = UnifiedStore.open(path.join(dir, "folded", "index.db"));
             try {
                 assert.ok(unified.getSessionRow(session.id), "full mode must have ingested the session");
-                const lines = parseLines(renderSessionJsonlFromTables(unified, session.id, false));
+                const lines = parseLines(await renderSessionJsonlFromTables(new SqliteBackend(unified), session.id, false));
                 assert.equal(lines[0]!.type, "session");
                 assert.equal(lines[0]!.source, "unified");
                 assert.equal(lines[0]!.sessionId, session.id);
@@ -167,4 +168,37 @@ test("renderSessionJsonlFromSession dereferences via an injected content store",
     const lines = parseLines(renderSessionJsonlFromSession(session, false, null));
     const msg = lines.find((l) => l.type === "message") as { message: { text: string } };
     assert.equal(msg.message.text, "hello");
+});
+
+test("--jsonl enforces the backend selection at open time: the mysql stub fails with its documented error (#3932 review)", async () => {
+    await withMode("full", async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jsonl-backend-"));
+        try {
+            const session = await loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
+            const store = new SessionStore({ dir: path.join(dir, "folded"), debounceMs: 1, enabled: true });
+            await store.writeNow(session);
+            await store.flushAll(); // closes the unified handle (Windows: an open index.db blocks rmSync)
+            store.cancelAll();
+            assert.ok(fs.existsSync(path.join(dir, "folded", "index.db")), "full-mode corpus ingest must leave index.db behind");
+
+            // #3931 step 3: the backend selection binds at STORE construction —
+            // a store built under "mysql" without a DSN has no sqlite shadow at
+            // all (boot warns; the envelope is the only sink), so this leg
+            // ingests under the sqlite default and selects mysql only for the
+            // export call, which is the surface under test here.
+            process.env.BILI_STORAGE_BACKEND = "mysql";
+
+            await assert.rejects(
+                () => exportSession(session.id, { dir: path.join(dir, "folded"), jsonl: true }),
+                (err: unknown) => {
+                    const msg = String((err as Error).message);
+                    return msg.includes("mysql") && msg.includes("#3388");
+                },
+                "a deliberate mysql selection must fail at open time, not silently read sqlite",
+            );
+        } finally {
+            delete process.env.BILI_STORAGE_BACKEND;
+            try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows: an ephemeral stray handle must not fail CI */ }
+        }
+    });
 });

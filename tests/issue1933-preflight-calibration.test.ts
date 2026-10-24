@@ -40,6 +40,10 @@ function makeSession(): Session {
 test("normalizeUpstreamOrigin: URL forms collapse to origin, garbage degrades safely", () => {
     assert.equal(normalizeUpstreamOrigin("http://a:8080/v1/chat/completions?x=1"), "http://a:8080");
     assert.equal(normalizeUpstreamOrigin("https://a:8443"), "https://a:8443");
+    // #2645: a provider route's mitm:// config-lookup scheme must collapse to its
+    // https egress key, or it normalizes to the opaque "null" origin and can never
+    // match the https origin the egress path records (pck ablation / baseline compare).
+    assert.equal(normalizeUpstreamOrigin("mitm://a:8443/v1/chat"), "https://a:8443");
     assert.equal(normalizeUpstreamOrigin("  http://a  "), "http://a");
     assert.equal(normalizeUpstreamOrigin(""), undefined);
     assert.equal(normalizeUpstreamOrigin(undefined), undefined);

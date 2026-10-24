@@ -17,15 +17,15 @@ entries:
     default: "false"
     env: ACP_DUMP_BODY
     group: diagnostics
-    desc_en: "Dump full request/response bodies to the log for troubleshooting."
-    desc_zh: "把完整请求/响应体转储到日志用于排障。"
+    desc_en: "Dump full request/response bodies to the log for troubleshooting. Dumps are PLAINTEXT and may contain credentials — scrub before sharing (#4482)."
+    desc_zh: "把完整请求/响应体转储到日志用于排障。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。"
   - key: diagnostics.dumpReq
     type: boolean
     default: "true"
     env: ACP_DUMP_REQ
     group: diagnostics
-    desc_en: "Log outgoing upstream request metadata per call."
-    desc_zh: "逐次调用记录发往上游的请求元数据。"
+    desc_en: "Log outgoing upstream request metadata per call; with dumpBody on, also gates the plaintext body dumps (scrub before sharing, #4482)."
+    desc_zh: "逐次调用记录发往上游的请求元数据；开启 dumpBody 时同时是明文请求体转储的闸门（分享前必须清洗，#4482）。"
   - key: diagnostics.rawDumpDir
     type: string
     default: "<state dir>/raw"
@@ -38,8 +38,8 @@ entries:
     default: "false"
     env: BILI_DUMP_4XX
     group: diagnostics
-    desc_en: "Persist upstream 4xx responses to disk for post-mortem inspection."
-    desc_zh: "把上游 4xx 响应落盘以便事后检查。"
+    desc_en: "Persist upstream 4xx responses to disk for post-mortem inspection. Bodies are PLAINTEXT and may contain credentials — scrub before sharing (#4482)."
+    desc_zh: "把上游 4xx 响应落盘以便事后检查。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。"
   - key: diagnostics.dump4xxMaxBytes
     type: number
     default: "2097152 (floor 1024)"
@@ -68,6 +68,13 @@ entries:
     group: diagnostics
     desc_en: "Disable all ACP tag rendering (raw wire study mode)."
     desc_zh: "禁用所有 ACP 标签渲染（原始线路研究模式）。"
+  - key: diagnostics.invariantJudge
+    type: boolean
+    default: "true"
+    env: BILI_INVARIANT_JUDGE
+    group: diagnostics
+    desc_en: "Keep the I1/I2 outbound-invariant judge armed as an L1 advisory (#3938): every request's outbound bytes are reconciled against the client's inbound history; violations log at warn, clean verdicts at debug, traffic is never blocked. Set false or BILI_INVARIANT_JUDGE=0 to silence it."
+    desc_zh: "保持 I1/I2 出站不变量判官以 L1 advisory 形态开启（#3938）：每笔请求的出站字节都与客户端入站历史对账，违规以 warn 记录、干净判定以 debug 记录，绝不阻塞流量。设为 false 或 BILI_INVARIANT_JUDGE=0 可静默。"
   - key: diagnostics.noInjectTool
     type: boolean
     default: "false"

@@ -48,6 +48,33 @@ test("dshNativeCompactionWitness: dsh-bound + non-zero refusals => count; otherw
     assert.equal(dshNativeCompactionWitness(makeSession("g", { dshCompactionRefusals: 5 })), undefined);
 });
 
+test("dshNativeCompactionWitness: restart re-key (no shrinkage) must NOT attribute — flat-or-larger resend stays unannounced-rewrite (#3806/#3814)", () => {
+    const refused = makeSession("rekey", { pluginAgent: "dsh", dshCompactionRefusals: 375 });
+    // #3806 fingerprints: dsh restart re-keys resent ~the same message count under new ids —
+    // 2793 incoming vs 2814 known (99%), and the sibling session even GREW (395 vs 389, 102%).
+    // Nothing was compacted away, so the (stale, days-old) refusal counter must not upgrade
+    // the event to a confirmed native-compaction landing.
+    assert.equal(dshNativeCompactionWitness(refused, { incomingTotal: 2793, knownBefore: 2814 }), undefined);
+    assert.equal(dshNativeCompactionWitness(refused, { incomingTotal: 395, knownBefore: 389 }), undefined);
+    // boundary: exactly at the landing ratio ceiling is still a re-key, not a landing
+    assert.equal(dshNativeCompactionWitness(refused, { incomingTotal: 750, knownBefore: 1000 }), undefined);
+    assert.equal(dshNativeCompactionWitness(refused, { incomingTotal: 749, knownBefore: 1000 }), 375);
+    // degenerate evidence never blocks attribution
+    assert.equal(dshNativeCompactionWitness(refused, { incomingTotal: 300, knownBefore: 0 }), 375);
+});
+
+test("dshNativeCompactionWitness: real landing fingerprints still attribute (#2709 calibration)", () => {
+    const refused = makeSession("landed", { pluginAgent: "dsh", dshCompactionRefusals: 17 });
+    // #2709's real framing-absent landings: a landed client compaction folds the replayed
+    // region into one summary, so the first replay carries only the recent tail:
+    // 320/771 (41%) and 427/875 (49%) incoming/known. These MUST keep the attribution.
+    assert.equal(dshNativeCompactionWitness(refused, { incomingTotal: 320, knownBefore: 771 }), 17);
+    assert.equal(dshNativeCompactionWitness(refused, { incomingTotal: 427, knownBefore: 875 }), 17);
+    // no fingerprint passed (fold-reconcile total-loss-drift site has no rewrite counts):
+    // refusal counter alone decides — that site only fires after anchors FAILED.
+    assert.equal(dshNativeCompactionWitness(refused), 17);
+});
+
 test("inferred landing reaches the 'no second compressor' remediation, distinct from a rebuild promise (#2709)", () => {
     const s = makeSession("s");
     recordConflict(s, "native-compaction-inferred", "framing absent on replay; bili refused 17 client-native compaction call(s) this session (#1729/#2028) — attributed to client-native compaction [inferred] (140/320 incoming carry pre-turn refs of 771 known, #2709)");

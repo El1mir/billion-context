@@ -18,6 +18,24 @@
  *  (#3044): the marked process must bind-or-die on exactly the freed port. */
 export const UPGRADE_REPLACEMENT_ENV = "BILI_UPGRADE_REPLACEMENT";
 
+/** #3654: the exit code a twin-collision loser reports to its spawner. The
+ *  duplicate still LOSES (#3044 — it cannot bind the port the serving twin
+ *  holds), but the code says WHY it died: the spawner reads it as an adopt
+ *  signal and attaches to the serving twin instead of failing the bring-up —
+ *  closing the #3654 contradiction where discovery judged the holder dead
+ *  (busy) while the twin rule proved it alive. Every other listen failure
+ *  keeps exit 1. */
+export const TWIN_ADOPT_EXIT_CODE = 3;
+
+export type FailFastReason = "upgrade-replacement" | "strict-port" | "port-busy" | "twin-collision";
+
+/** Pure exit-code mapping for a terminal EADDRINUSE decision — extracted so
+ *  the server (which calls process.exit) and its tests share one definition
+ *  without booting a listener (#3654). */
+export function eaddrinuseExitCode(reason: FailFastReason | undefined): number {
+    return reason === "twin-collision" ? TWIN_ADOPT_EXIT_CODE : 1;
+}
+
 type EaddrinuseAction =
     | { kind: "wait-predecessor"; port: number }
     /** nextPort 0 = ask the OS for an ephemeral port (ladder exhausted). */
@@ -70,4 +88,16 @@ export function decideEaddrinuse(ctx: EaddrinuseContext): EaddrinuseAction {
  *  still-draining predecessor or a racing host respawn (#707/libuv#1360). */
 export function postBindCanLadder(hasLaunchToken: boolean, strictPort: boolean, upgradeReplacement: boolean): boolean {
     return hasLaunchToken && !strictPort && !upgradeReplacement;
+}
+
+/** Windows reports a bind collision with a listener held on ANOTHER address
+ *  family as WSAEACCES, not WSAEADDRINUSE: an IPv6 wildcard listener makes the
+ *  IPv4 bind of the same port fail with EACCES even though the port is well
+ *  above the privileged range. Left untreated, a launcher-spawned child dies
+ *  with the misleading "port N requires privileges. Use a port >= 1024" hint
+ *  instead of laddering off the squatted zone port (#1660). Privileged-port
+ *  EACCES (below 1024) stays a real permission error. */
+export function isPortBusyError(code: string | undefined, port: number, platform: NodeJS.Platform = process.platform): boolean {
+    if (code === "EADDRINUSE") return true;
+    return platform === "win32" && code === "EACCES" && port >= 1024;
 }

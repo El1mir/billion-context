@@ -84,10 +84,11 @@ test("openai: [text, file] round-trips the file part verbatim", () => {
   ]);
   const { msgs } = openaiToCore(body);
   assert.equal(msgs.length, 1);
-  // Pre-existing stringContent semantics: array entries join with "\n" and
-  // non-text entries contribute "" — same as today's [text, image] messages.
-  // The id derives from this text, so the shape must not change.
-  assert.equal(msgs[0]?.text, "what is in this file?\n");
+  // #3642 canonical granularity: the text part is its own core carrying the
+  // part's bytes verbatim (no "\n" joining anymore); the opaque file part
+  // rides the preceding text core's plural sidecar so the rebuild keeps the
+  // wire part order. The id derives from the part text.
+  assert.equal(msgs[0]?.text, "what is in this file?");
   assert.deepEqual(
     msgs[0]?.rawOpenaiContentParts,
     [FILE_PART],
@@ -107,6 +108,37 @@ test("openai: [text, file] round-trips the file part verbatim", () => {
     FILE_PART,
     "file part re-emitted verbatim",
   );
+});
+
+test("openai: [file, text, file] keeps every opaque part (#1205)", () => {
+  const fileA = { type: "file", file_id: "file-api-aaa" };
+  const fileB = { type: "file", file_id: "file-api-bbb" };
+  const body = bodyOf([
+    {
+      role: "user",
+      content: [
+        fileA,
+        { type: "text", text: "compare these files" },
+        fileB,
+      ],
+    },
+  ]);
+  const { msgs } = openaiToCore(body);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0]?.text, "compare these files");
+  // The leading-opaque flush must not clobber the part accumulated AFTER
+  // the text core: both ride the plural sidecar, relative order intact.
+  assert.deepEqual(msgs[0]?.rawOpenaiContentParts, [fileA, fileB]);
+
+  const content = rebuiltUserContent(
+    msgs,
+  ) as Array<Record<string, unknown>>;
+  assert.ok(Array.isArray(content));
+  assert.deepEqual(content, [
+    { type: "text", text: "compare these files" },
+    fileA,
+    fileB,
+  ]);
 });
 
 test("openai: lone [file] part survives with empty text", () => {
@@ -148,14 +180,22 @@ test("openai: single data-URL image keeps legacy singular sidecar shape", () => 
     },
   ]);
   const { msgs } = openaiToCore(body);
-  assert.ok(msgs[0]?.rawOpenaiContent, "singular sidecar preserved");
+  // #3642: [text, image] splits into a text core + an image core carrying
+  // the canonical "[image]" marker; the singular raw sidecar lives on the
+  // image core. The rebuild merges the run back into ONE message with the
+  // marker never re-rendered as a text part.
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0]?.text, "look");
+  assert.equal(msgs[0]?.rawOpenaiContent, undefined);
+  assert.equal(msgs[1]?.text, "[image]");
+  assert.ok(msgs[1]?.rawOpenaiContent, "singular sidecar preserved");
   assert.equal(
-    msgs[0]?.rawOpenaiContentParts,
+    msgs[1]?.rawOpenaiContentParts,
     undefined,
     "no plural sidecar for a lone image",
   );
-  assert.equal(msgs[0]?.imageBase64, IMG_DATA);
-  assert.equal(msgs[0]?.imageMediaType, "image/png");
+  assert.equal(msgs[1]?.imageBase64, IMG_DATA);
+  assert.equal(msgs[1]?.imageMediaType, "image/png");
 
   const content = rebuiltUserContent(msgs);
   assert.ok(Array.isArray(content));
@@ -177,7 +217,12 @@ test("openai: multi-image plural sidecar unchanged", () => {
     },
   ]);
   const { msgs } = openaiToCore(body);
-  assert.equal(msgs[0]?.rawOpenaiContentParts?.length, 2);
+  // #3642: each image is its own core with its singular raw sidecar; the
+  // rebuild merges the [text, image, image] run back into one message.
+  assert.equal(msgs.length, 3);
+  assert.equal(msgs[0]?.text, "two pics");
+  assert.ok(msgs[1]?.rawOpenaiContent);
+  assert.ok(msgs[2]?.rawOpenaiContent);
   const content = rebuiltUserContent(msgs);
   assert.ok(Array.isArray(content));
   assert.deepEqual(
@@ -959,5 +1004,35 @@ test("applyCompression keeps an unrecoverable media tool_result and its paired c
   assert.ok(
     result.result.warnings.some((w) => w.includes("tool call/result pair")),
     `pair-withdrawal warning present, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+});
+
+test("openai: non-array single-object content never throws (legacy empty-text core)", () => {
+  // #2824 corpus regression: some clients emit a lone content-part object
+  // instead of an array. Pre-#3642 this mapped to stringContent() === ""
+  // with no sidecars; the #3642 per-part rewrite iterated `m.content` and
+  // threw TypeError "m.content is not iterable" — a wire-tolerance break
+  // (buildIncomingImageIndex catches, but every other consumer would not).
+  // Contract: non-array non-string content degrades to the legacy empty-text
+  // core, byte-compatible with the old codec, and coreToOpenai still renders
+  // a round-trippable body.
+  const body = bodyOf([
+    {
+      role: "user",
+      content: {
+        type: "image_url",
+        image_url: { url: DATA_URL },
+      },
+    },
+  ]);
+  const { msgs } = openaiToCore(body);
+  assert.equal(msgs.length, 1, "one core, not a throw");
+  assert.equal(msgs[0]?.contentType, "text");
+  assert.equal(msgs[0]?.text, "", "legacy mapping: stringContent(object) === ''");
+  assert.equal(msgs[0]?.imageBase64, undefined, "no image sidecar from non-array content");
+  const back = coreToOpenai(msgs as Parameters<typeof coreToOpenai>[0]);
+  assert.ok(
+    Array.isArray(back) && back.length >= 1,
+    "round-trip renders",
   );
 });

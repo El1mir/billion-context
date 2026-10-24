@@ -31,6 +31,9 @@ interface ReportData {
     retrieveCalls?: number;
     retrieveHits?: number;
     retrieveMisses?: number;
+    wholeBlockRestores?: number;
+    wholeBlockRestoresPreciseAvailable?: number;
+    rangeRestores?: number;
     blockDetails?: Array<{ active?: boolean }>;
     ledger?: ({
         totals?: { newContent?: number; compRepay?: number; ttlRepay?: number; residual?: number; balanced?: boolean };
@@ -167,6 +170,7 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
     L.push("| output tokens | " + f.W(Number(d.outputTokens) || 0) + " |");
     L.push("| cache hit % | " + ((Number(d.inputTokens) > 0) ? ((Number(d.cachedTokens) || 0) / Number(d.inputTokens) * 100).toFixed(1) + "%" : f.none) + " |");
     if ((Number(d.retrieveCalls) || 0) > 0) L.push("| retrieve calls | " + d.retrieveCalls + " (hits " + (Number(d.retrieveHits) || 0) + " / misses " + (Number(d.retrieveMisses) || 0) + ") |");
+    if ((Number(d.wholeBlockRestores) || 0) > 0 || (Number(d.rangeRestores) || 0) > 0) L.push("| decompress | " + (Number(d.wholeBlockRestores) || 0) + " whole-block (" + (Number(d.wholeBlockRestoresPreciseAvailable) || 0) + " cheaper precise path) · " + (Number(d.rangeRestores) || 0) + " range |");
     L.push("");
     L.push("## " + t("det.trajectory"));
     L.push("");
@@ -309,6 +313,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
         [t("det.rpt_hit"), (Number(d.inputTokens) > 0) ? ((Number(d.cachedTokens) || 0) / Number(d.inputTokens) * 100).toFixed(1) + "%" : f.none, ACC]
     ]);
     if ((Number(d.retrieveCalls) || 0) > 0) noteLine("retrieve " + d.retrieveCalls + " (hits " + (Number(d.retrieveHits) || 0) + " / misses " + (Number(d.retrieveMisses) || 0) + ")");
+    if ((Number(d.wholeBlockRestores) || 0) > 0 || (Number(d.rangeRestores) || 0) > 0) noteLine("decompress " + (Number(d.wholeBlockRestores) || 0) + " whole-block (" + (Number(d.wholeBlockRestoresPreciseAvailable) || 0) + " precise) · " + (Number(d.rangeRestores) || 0) + " range");
     section(t("det.trajectory"));
     if (!lines.length) noteLine(t("det.trajectory_empty"));
     else {

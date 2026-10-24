@@ -9,8 +9,14 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-12",
+    "updated": "2026-10-21",
     "releases": [
+      {
+        "version": "0.1.203",
+        "date": "2026-10-21",
+        "tier": "critical",
+        "summary": "修复电脑休眠/会话重启/网络波动后重试请求 400:此前 dsh 重试不带会话身份,压缩状态丢失、整段历史裸发上游拒绝(#4082/#4101/#4094/#4116);修复上下文爆满/token 暴涨:超窗保险丝+超限请求不再裸发(#4090);修复 skill 目录保护失效导致的缓存 miss(#3799)。本版共 119 项变更,另修复 70+ 缺陷、新增 10+ 功能,完整清单见 https://github.com/ranxianglei/billion-context/releases/tag/v0.1.203 。升级到 ≥0.1.203 并重启一次 dsh。"
+      },
       {
         "version": "0.1.193",
         "date": "2026-10-12",

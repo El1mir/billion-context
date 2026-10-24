@@ -1,5 +1,6 @@
+import { pckKeyAbated } from "./pck-probe.js";
 import { isCodexClient } from "./codex-compact.js";
-import { isLoopbackAddress } from "./util.js";
+import { resolveWireClientProfile } from "./server/lane-decisions.js";
 
 export type ConversationIdentity = {
     value: string;
@@ -120,17 +121,20 @@ export function conversationHeaderSource(headers: Record<string, string | string
  * #1104, inverted).
  */
 export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
-    const turnMeta = headers["x-codex-turn-metadata"];
-    if (typeof turnMeta === "string" && turnMeta.trim().length > 0) return true;
-    // One definition of "codex traffic" process-wide (every other codex path in
-    // server.ts uses isCodexClient, #645). Its lenient fallback — a UA
-    // component starting with lowercase "codex" (#1641) — stays CASE-SENSITIVE
-    // precisely because a case-insensitive match would pull non-codex relays
-    // with "Codex"-shaped UAs back into the fingerprint and re-fork them
-    // mid-conversation (#1106); only known codex prefixes (incl. Codex
-    // Desktop, #1169) match case-insensitively.
-    if (isCodexClient(headers)) return true;
-    return conversationHeaderSource(headers)?.name === "x-claude-code-session-id";
+    // Detection only — the client-identity DECISION (who keys by
+    // instructions) lives in the lane-decisions wire-client registry
+    // (#3482 site 4): the header-name literals are registry data, not
+    // scattered comparisons. Signals are name-free observations here.
+    const headerNames = new Set<string>();
+    for (const [name, value] of Object.entries(headers ?? {})) {
+        const first = Array.isArray(value) ? value[0] : value;
+        if (typeof first === "string" && first.trim().length > 0) headerNames.add(name);
+    }
+    return resolveWireClientProfile({
+        headerNames,
+        conversationSourceName: conversationHeaderSource(headers)?.name,
+        codexUserAgent: isCodexClient(headers),
+    }).instructionsFingerprintKeyed;
 }
 
 /** #1916/#1307/#1314: whether the persona fingerprint (session id + system
@@ -217,43 +221,44 @@ export function affinityToken(identity: ConversationIdentity): string | undefine
 }
 
 /**
- * #2218: decide whether the proxy stamps `prompt_cache_key` into an outbound
- * OpenAI chat body on behalf of a plugin host (dsh desktop) whose ONLY
- * identity signal is the bili-internal x-bili-plugin-conversation header.
- * Body-keyed relays (the workbuddy panel reads the body only: metadata →
- * conversation_id → prompt_cache_key → content digest) cannot see any
- * header, so without the stamp every plugin-lane request falls to a content
- * digest and any account migration freezes the provider prefix cache.
- * sub2api's OpenAI wire reads headers first (x-session-id wins), which the
- * buildForwardTarget x-session-id fix already covers — the body stamp is
- * specifically for the body-only relay family.
+ * #2218/#2645: decide what to do with `prompt_cache_key` on an outbound
+ * OpenAI chat body.
  *
- * Returns true only when ALL of:
- *  - the plugin lane owns the identity (the winning conversation header is
- *    the bili-internal one, not a header the upstream could read itself);
- *  - the client sent no prompt_cache_key of its own (client value wins);
- *  - the destination is admin-configured (provider-rewritten route) or
- *    loopback — deliberate relay/local deployments. Strict direct APIs can
- *    400 unknown body params (#1403), so unrouted non-loopback forwards
- *    stay unstamped.
+ * "stamp" — the proxy writes its own conversation id into the field. Only the
+ * internal plugin lane qualifies (the winning conversation header is the
+ * bili-internal x-bili-plugin-conversation one — body-keyed relays such as
+ * the workbuddy panel read the body only and would otherwise fall to a
+ * content digest) and the client sent no key of its own (client value wins).
+ *
+ * #2645 probe-and-remember (replaces the old destination-shape gate): stamping
+ * is ON BY DEFAULT for every destination shape — loopback pools, docker/LAN/
+ * VPS pools, plain remote relays alike all keep their affinity signal (the
+ * static loopback/rewritten-route heuristics hurt the two big pool
+ * populations while trying to protect strict direct APIs). The protection now
+ * comes from the egress A/B seam (src/server/relay.ts + src/pck-probe.ts):
+ * when an egress carrying the key 400s, the identical request is re-sent once
+ * without it — accepted ⇒ causation confirmed and this exact origin+model
+ * pair stops being stamped for the process lifetime (in-memory, restart
+ * resets, surfaced via log/acp_status/web panel); still failing ⇒ inconc-
+ * lusive, nothing learned. Client-supplied keys pass through verbatim UNTIL
+ * their pair is A/B-ablated, after which they are withheld too (otherwise
+ * every turn re-paid the 400 round trip); that withholding is likewise
+ * in-memory and visible on the same surfaces.
  */
-export function shouldStampRelayAffinityPck(
+type RelayAffinityPckDecision = "stamp" | "keep-client" | "drop";
+
+export function resolveRelayAffinityPck(
     identityHeaderName: string | undefined,
     clientPck: unknown,
-    routeRewrittenUrl: string | undefined,
+    egressUrl: string | undefined,
     upstreamOrigin: string,
-): boolean {
-    if (identityHeaderName !== "x-bili-plugin-conversation") return false;
-    if (clientPck !== undefined) return false;
-    if (routeRewrittenUrl !== undefined) return true;
-    try {
-        const hostname = new URL(upstreamOrigin).hostname;
-        // "localhost" is loopback but not matched by isLoopbackAddress (127.x/::1
-        // only); a silent miss here would reproduce the zero-signal bug (#2218).
-        return hostname === "localhost" || isLoopbackAddress(hostname);
-    } catch {
-        return false;
-    }
+    modelId?: unknown,
+): RelayAffinityPckDecision {
+    const ablated = pckKeyAbated(egressUrl, upstreamOrigin, modelId);
+    const internalLane = identityHeaderName === "x-bili-plugin-conversation";
+    if (clientPck === undefined && internalLane && !ablated) return "stamp";
+    if (ablated) return "drop";
+    return "keep-client";
 }
 
 /**

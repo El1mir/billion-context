@@ -3,7 +3,33 @@ import assert from "node:assert/strict";
 import { createCore, createInitialState, defaultConfig, type CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { foldCoverage } from "../src/session.ts";
+import { responsesToCore } from "acp-kernel/wire";
 import { reconcileFoldCoverage, METADATA_DRIFT_ESCALATED, type FoldAnchor } from "../src/fold-reconcile.ts";
+
+test("projected short requests preserve real kernel folds until the main history returns", () => {
+    const { session, stableResend, coveredIds } = driftFixture();
+    const core = createCore();
+    const config = defaultConfig(200_000);
+    const opts = { mode: "repair" as const };
+    reconcileFoldCoverage(session, stableResend, opts);
+    const blockIds = session.state.blocks.map((b) => b.blockId);
+    const input = Array.from({ length: 6 }, (_, i) => ({
+        type: "message" as const, role: "user" as const,
+        content: Array.from({ length: 13 }, (_, j) => ({ type: "input_text" as const, text: `short utility ${i} part ${j}` })),
+    }));
+    const { msgs } = responsesToCore({ input });
+    assert.ok(msgs.length >= 10);
+    for (let i = 0; i < 4; i++) {
+        reconcileFoldCoverage(session, msgs, { ...opts, inboundMessageCount: input.length });
+        session.state = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 0 }).state;
+        assert.deepEqual(session.state.blocks.map((b) => b.blockId), blockIds, "sync may deactivate but must retain every fold");
+    }
+    reconcileFoldCoverage(session, stableResend, opts);
+    session.state = core.processTurn({ messages: stableResend, state: session.state, config, tokenCount: 0 }).state;
+    assert.deepEqual(session.state.blocks.map((b) => b.blockId), blockIds);
+    assert.ok(session.state.blocks.every((b) => b.active));
+    assert.deepEqual(session.state.blocks[0].effectiveMessageIds, coveredIds);
+});
 
 function makeSession(): Session {
     return {

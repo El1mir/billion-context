@@ -65,7 +65,11 @@ test("#847: acp_status lists only ranges that pass the submit gate (chars >= min
     assert.equal(sub.map((m) => m.text?.length ?? 0).reduce((a, b) => a + b, 0), 4400, "fixture sanity: whole span is sub-gate");
     const subReport = handleAcpStatus({}, subCtx).text;
     assert.ok(!subReport.includes("Compressible ranges"), "all-sub-gate session must NOT advertise any range");
-    assert.ok(!subReport.includes("m00001"), "sub-gate range must NOT be listed");
+    // #4331 (behavior change): the run is never OFFERED (gate discipline above
+    // unchanged), but the uncovered-history diagnostic NAMES it — visibility
+    // for mass that no offer will ever carry, explicitly not a fold suggestion.
+    assert.ok(subReport.includes("UNCOVERED HISTORY"), "sub-gate residue must be visible in the diagnostic section:\n" + subReport);
+    assert.ok(subReport.includes("m00001"), "the sub-gate run must be named in the diagnostic section");
 
     const big = [
         textMsg("raw_1", "assistant", "a".repeat(1700)),

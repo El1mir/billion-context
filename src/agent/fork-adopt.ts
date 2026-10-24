@@ -21,11 +21,14 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
  *
  * HASH PARITY CONTRACT: forkStableJson/forkIdentityHashOf/forkOrderHashOf
  * below are byte-for-byte replicas of src/plugin.ts stableJson/
- * forkMessageIdentityHash/forkOrderHash. The server's publicForkInputMatches
- * rejects the child's first request (409 FORK_PREFIX_CONFLICT) when the
- * replayed prefix does not hash-match the receipt, so any drift here poisons
- * the child conversation permanently. The parity is pinned by
- * tests/dsh-fork-adopt.test.ts against the exported plugin.ts hash.
+ * forkMessageIdentityHash/forkOrderHash. The server's publicForkInputCheck
+ * compares the replayed prefix against the receipt on the child's first
+ * request: a mismatch no longer rejects — it adopts with a classified warn
+ * and fold reconcile settles the inherited folds (#3741) — but the child
+ * loses the verified-prefix fast path (publicForkPrefix stays false, so the
+ * side-lane heuristics keep their say) and pays one unfolded first request.
+ * The parity is pinned by tests/dsh-fork-adopt.test.ts against the exported
+ * plugin.ts hash.
  *
  * RESPONSES PIPELINE PARITY CONTRACT: the forkResponses* functions below are
  * byte-for-byte replicas of the server's responses pre-projection pipeline

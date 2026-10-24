@@ -190,7 +190,7 @@ test("reviews 4+5: restore refuses live-id overwrite and materializes the CCR si
             await store.writeNow(session);
             store.cancelAll();
 
-            const replica = store.createReplica(session.id, { pinned: true, label: "safe copy" });
+            const replica = await store.createReplica(session.id, { pinned: true, label: "safe copy" });
 
             // Review 6 (HTTP half): caller-chosen id that already exists must
             // throw (admin maps to 409), never silently clobber a live session.

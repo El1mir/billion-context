@@ -91,6 +91,64 @@ test("#1870 spanNotes: strictly-newer entries, ascending (user-side diff), inval
     assert.deepEqual(spanNotes(ENTRIES, "garbage"), [], "invalid running version → empty (no crash)");
 });
 
+test("#3719 item4 parseReleaseNotesDoc: summaryZh/minVersion/maxVersion optional fields parse + validate", () => {
+    const doc = {
+        billionContextReleaseNotes: {
+            schema: 1,
+            releases: [
+                { version: "0.1.210", tier: "critical", summary: "en fix", summaryZh: "中文修复" },
+                { version: "0.1.211", tier: "critical", summary: "blank zh", summaryZh: "   " },
+                { version: "0.1.212", tier: "critical", summary: "bad min", minVersion: "not-semver" },
+                { version: "0.1.213", tier: "critical", summary: "inverted range", minVersion: "0.1.200", maxVersion: "0.1.100" },
+                { version: "0.1.214", tier: "critical", summary: "floored", minVersion: "0.1.205" },
+            ],
+        },
+    };
+    const parsed = parseReleaseNotesDoc(doc);
+    assert.equal(parsed.error, undefined);
+    assert.equal(parsed.entries.length, 3);
+    assert.equal(parsed.entries[0].summaryZh, "中文修复");
+    assert.equal(parsed.entries[1].summaryZh, undefined, "blank summaryZh is dropped, entry kept");
+    assert.ok(!parsed.entries.some((e) => e.version === "0.1.212"), "invalid minVersion skips the entry");
+    assert.ok(!parsed.entries.some((e) => e.version === "0.1.213"), "minVersion > maxVersion skips the entry");
+    assert.equal(parsed.entries[2].minVersion, "0.1.205");
+    assert.equal(parsed.entries[2].summaryZh, undefined, "summaryZh stays unset when absent");
+});
+
+test("#3719 item4 spanNotes: [minVersion, maxVersion] targeting on the RUNNING version — inclusive, bidirectional", () => {
+    const entries: ReleaseNoteEntry[] = [
+        { version: "0.1.210", tier: "critical", summary: "floored", minVersion: "0.1.205" },
+        { version: "0.1.211", tier: "critical", summary: "ceilinged", maxVersion: "0.1.204" },
+        { version: "0.1.212", tier: "critical", summary: "windowed", minVersion: "0.1.200", maxVersion: "0.1.203" },
+        { version: "0.1.213", tier: "critical", summary: "unbounded" },
+    ];
+    // running 0.1.203: below floor 0.1.205 → hidden; ceiling 0.1.204 above → visible; inside window → visible
+    assert.deepEqual(spanNotes(entries, "0.1.203").map((e) => e.version), ["0.1.211", "0.1.212", "0.1.213"]);
+    // running 0.1.204: below floor 0.1.205 → hidden; at ceiling → visible; outside window → hidden
+    assert.deepEqual(spanNotes(entries, "0.1.204").map((e) => e.version), ["0.1.211", "0.1.213"]);
+    // running 0.1.199: below floor → hidden; below window min → hidden
+    assert.deepEqual(spanNotes(entries, "0.1.199").map((e) => e.version), ["0.1.211", "0.1.213"]);
+    // boundaries are inclusive: running == minVersion still sees the entry
+    assert.ok(spanNotes(entries, "0.1.205").some((e) => e.version === "0.1.210"), "running == minVersion stays targeted");
+    assert.ok(spanNotes(entries, "0.1.200").some((e) => e.version === "0.1.212"), "running == window min stays targeted");
+    // compat negative control: bounds-free entries keep the historic reach for EVERY older version
+    assert.equal(spanNotes([{ version: "0.1.190", tier: "routine", summary: "legacy" }], "0.1.100").length, 1, "unset bounds = historic reach");
+});
+
+test("#3719 item4 updateBannerPayload: summaryZh rides the wire when the critical carries one; absent stays absent (compat)", () => {
+    _resetReleaseNotesWatcherForTest();
+    _setReleaseNotesStateForTest({ entries: [{ version: "0.1.210", tier: "critical", summary: "en", summaryZh: "中文" }] });
+    const payload = updateBannerPayload(getUpdateVisibility("0.1.209"));
+    assert.equal(payload?.kind, "available");
+    assert.equal(payload?.summary, "en");
+    assert.equal(payload?.summaryZh, "中文");
+    _setReleaseNotesStateForTest({ entries: [{ version: "0.1.210", tier: "critical", summary: "en" }], diskVersion: "0.1.210" });
+    const ready = updateBannerPayload(getUpdateVisibility("0.1.209"));
+    assert.equal(ready?.kind, "ready");
+    assert.equal(ready?.summaryZh, undefined, "legacy entries never grow the field");
+    _resetReleaseNotesWatcherForTest();
+});
+
 test("#1977 getUpdateVisibility: silent by default — only critical surfaces; pending restart alone is silent", () => {
     _resetReleaseNotesWatcherForTest();
     try {
@@ -303,5 +361,83 @@ test("#1977 /acp panel: one critical-update line BEFORE the footer, stripper-saf
     } finally {
         _resetReleaseNotesWatcherForTest();
         _resetSessionsForTest();
+    }
+});
+
+test("#4295 update action follows installed critical fixes, not pending restart alone", () => {
+    const entries: ReleaseNoteEntry[] = [
+        { version: "0.1.179", tier: "recommended", summary: "recommended" },
+        { version: "0.1.180", tier: "critical", summary: "first fix" },
+        { version: "0.1.181", tier: "routine", summary: "routine" },
+        { version: "0.1.182", tier: "critical", summary: "second fix" },
+        { version: "0.1.183", tier: "routine", summary: "future routine" },
+    ];
+    const cases = [
+        { disk: undefined, kind: "available", version: "0.1.180", summary: "first fix", pending: false },
+        { disk: "bad", kind: "available", version: "0.1.180", summary: "first fix", pending: false },
+        { disk: "0.1.177", kind: "available", version: "0.1.180", summary: "first fix", pending: false },
+        { disk: "0.1.178", kind: "available", version: "0.1.180", summary: "first fix", pending: false },
+        { disk: "0.1.179", kind: "available", version: "0.1.180", summary: "first fix", pending: true },
+        { disk: "0.1.180", kind: "available", version: "0.1.182", summary: "second fix", pending: true },
+        { disk: "0.1.181", kind: "available", version: "0.1.182", summary: "second fix", pending: true },
+        { disk: "0.1.182", kind: "ready", version: "0.1.182", summary: "second fix", pending: true },
+        { disk: "0.1.184", kind: "ready", version: "0.1.184", summary: "second fix", pending: true },
+    ] as const;
+    try {
+        for (const c of cases) {
+            _resetReleaseNotesWatcherForTest();
+            _setReleaseNotesStateForTest({ entries, ...(c.disk === undefined ? {} : { diskVersion: c.disk }) });
+            const v = getUpdateVisibility("0.1.178");
+            assert.equal(v.pendingRestart, c.pending, String(c.disk));
+            assert.deepEqual(updateBannerPayload(v), { kind: c.kind, version: c.version, summary: c.summary }, String(c.disk));
+            const line = describeUpdateReady(v);
+            assert.ok(line.startsWith(c.kind === "ready"
+                ? `Critical update ready: ${c.version} — restart to finish.`
+                : `Critical update available: ≥ ${c.version} —`), line);
+            assert.ok(line.includes(c.summary), line);
+            assert.equal(line, describeUpdateReady(v), "stable repeated rendering");
+        }
+        _setReleaseNotesStateForTest({ entries: entries.filter((e) => e.tier !== "critical"), diskVersion: "0.1.184" });
+        assert.equal(updateBannerPayload(getUpdateVisibility("0.1.178")), null, "routine/recommended updates stay silent");
+    } finally {
+        _resetReleaseNotesWatcherForTest();
+    }
+});
+
+test("#4295 status and panel agree when only some critical updates are installed", async () => {
+    const { handleAcpStatus } = await import("../src/acp-status.ts");
+    const { handlePluginStatus } = await import("../src/plugin.ts");
+    const { getSession, _resetSessionsForTest } = await import("../src/session.ts");
+    const next3 = semver.inc(NEXT2, "patch")!;
+    const next4 = semver.inc(next3, "patch")!;
+    _resetSessionsForTest();
+    getSession("upd-sess", { protocol: "anthropic", label: "UPD" });
+    const entries: ReleaseNoteEntry[] = [
+        { version: NEXT, tier: "recommended", summary: "recommended" },
+        { version: NEXT2, tier: "critical", summary: "first fix" },
+        { version: next3, tier: "critical", summary: "second fix" },
+        { version: next4, tier: "routine", summary: "future routine" },
+    ];
+    try {
+        for (const disk of [NEXT, NEXT2, next3]) {
+            _resetReleaseNotesWatcherForTest();
+            _setReleaseNotesStateForTest({ entries, diskVersion: disk });
+            const ready = disk === next3;
+            const version = disk === NEXT ? NEXT2 : next3;
+            const status = handleAcpStatus({}, makeCtx12()).text;
+            assert.ok(status.includes(ready
+                ? `CRITICAL UPDATE READY (instance-level): ${disk} downloaded`
+                : "CRITICAL UPDATE AVAILABLE (instance-level):"), status);
+            assert.equal(status.includes("UPDATE READY"), ready, "restart must deliver the critical fixes");
+            const res = mockRes();
+            handlePluginStatus("never-seen", res.res, { core: createCore(), config: defaultConfig(200000), log: () => {} }, true);
+            const body = JSON.parse(res.body) as { panel: string };
+            assert.ok(body.panel.includes(ready
+                ? `Critical update ready: ${disk} — restart to finish.`
+                : `Critical update available: ≥ ${version} —`), body.panel);
+        }
+    } finally {
+        _resetSessionsForTest();
+        _resetReleaseNotesWatcherForTest();
     }
 });

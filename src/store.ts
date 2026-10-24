@@ -58,6 +58,27 @@ export function ccrEnabled(session: Session | undefined): boolean {
     return effectiveCcr(session)?.enabled === true;
 }
 
+// #3400: per-request stamp of the acp_read_original_image TOOL registration gate.
+// The rescale PASS itself runs on every lane (governed by the BILI_IMAGE_RESCALE
+// knob); only the manifest registration and the annotation's invocation entry
+// follow this stamp — codex/plugin lanes get size-only notes.
+const EFFECTIVE_IMAGE_RESCALE_KEY = "effectiveImageRescale";
+
+/** Stamp whether acp_read_original_image may be registered for this session's
+ *  lane (per-request; mirrors the storeEffectiveCcr site). */
+export function storeEffectiveImageRescale(session: Session, armed: boolean | undefined): void {
+    // Absent == not armed (imageRescaleToolArmed reads === true). Writing only the
+    // armed state keeps non-armed lanes' metadata byte-identical to pre-#3400
+    // (storage-render digests pin that shape).
+    if (armed === true) session.metadata[EFFECTIVE_IMAGE_RESCALE_KEY] = true;
+    else delete session.metadata[EFFECTIVE_IMAGE_RESCALE_KEY];
+}
+
+/** Read back the #3400 tool-registration stamp. */
+export function imageRescaleToolArmed(session: Session | undefined): boolean {
+    return session?.metadata[EFFECTIVE_IMAGE_RESCALE_KEY] === true;
+}
+
 /** Model-facing retrieve tool name for this session: the config `ccr.toolName`
  *  override when set, else the kernel default. */
 export function retrieveToolName(session: Session | undefined): string {

@@ -3,6 +3,7 @@ import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { applyRanges, runJsonRewrite, runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./stream.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
+import { effectiveAbsorbConfig } from "./absorb.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 
 export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
@@ -53,7 +54,7 @@ function* rewriteOpenaiJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
     // Absorb signature in whole text (m00885): drop only when the request
     // actually instructed the model about absorb — the shape check alone
     // cannot tell an emission from a user-quoted fragment.
-    const absorbArmed = false;
+    const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
     const requestText = JSON.stringify(ctx.messages);
     if (existingText && (containsRenderTagText(existingText) || containsMarkerLineText(existingText) || containsBiliInternalText(existingText) || (absorbArmed && containsToolCallEmissionText(existingText)))) {
         ctx.log(`[tag-echo] stripped: non-stream openai output ACP echo (render tags/markers/internal artifacts): ${existingText.slice(0, 120).replace(/\n/g, " ")}`);

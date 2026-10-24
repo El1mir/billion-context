@@ -40,7 +40,11 @@ on:
     types: [closed]
     branches: [master]
   workflow_dispatch:
-    inputs: {}
+    inputs:
+      fast:
+        description: "EMERGENCY fast publish: skip the full-CI dispatch/gate and the full npm test. Keeps every version guard + npm ci + typecheck + build. Owner-owned risk (opened 2026-10-17 to unblock v0.1.199 when CI flakes stall the normal channel)."
+        type: boolean
+        default: false
 
 concurrency:
   group: bugfix-release
@@ -67,9 +71,10 @@ jobs:
               exit 0
             fi
             case "$BRANCH" in
-              bugfix-release/*) ;;
+              bugfix-v*) ;; # current patch lane (dual-lane model)
+              bugfix-release/*) ;; # legacy one-off carve-out
               *)
-                echo "::notice::head branch '$BRANCH' is not a bugfix-release/* carve-out branch — nothing to publish"
+                echo "::notice::head branch '$BRANCH' is not a patch lane (bugfix-v*) or a legacy bugfix-release/* carve-out — nothing to publish"
                 exit 0
                 ;;
             esac
@@ -121,6 +126,14 @@ jobs:
           [ -z "$SHA" ] && SHA="$(git rev-parse HEAD)"
           echo "::notice::Publishing carve-out from '$REF' @ ${SHA:0:12} -> v$V (master NOT involved)"
 
+      - name: Check plugin manifest versions (#4449)
+        # Same gate as release.yml: the carve-out PR head is a frozen tree
+        # (last tag + fix + bump), so it must ALREADY carry the synced plugin
+        # manifests — drift fails fast here instead of shipping a release whose
+        # marketplace update detection never fires. See reference/release.md.
+        if: steps.resolve.outputs.proceed == 'true'
+        run: node scripts/sync-codex-plugin-version.mjs --check
+
       - name: Publish guard (monotonic + not-already-live)
         if: steps.resolve.outputs.proceed == 'true'
         run: |
@@ -170,7 +183,11 @@ jobs:
         # head sha (path-filtered pull_request triggers) — dispatch only what
         # has no run there (idempotent); the Full CI gate after the pre-flight
         # blocks publish until green.
-        if: steps.resolve.outputs.proceed == 'true'
+        # EMERGENCY fast mode (owner 2026-10-17): dispatch is already a
+        # human-picked ref; with fast=true the human explicitly owns skipping
+        # this lane matrix — version guards and the build sanity below still
+        # run.
+        if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -180,9 +197,9 @@ jobs:
           export GITHUB_REF_NAME="${{ steps.resolve.outputs.branch }}"
           node scripts/release-ci-gate.mjs --dispatch
 
-      - name: Pre-flight gate
+      - name: Pre-flight gate (full suite)
         # keep the claude-native live e2e subtests in this pre-publish gate (#1248)
-        if: steps.resolve.outputs.proceed == 'true'
+        if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
         env:
           ACP_TEST_CLAUDE_NATIVE: "1"
         run: |
@@ -191,12 +208,23 @@ jobs:
           npm test
           npm run build
 
+      - name: Pre-flight gate (fast mode — build sanity only)
+        # EMERGENCY fast mode: keep the cheap sanity (install/typecheck/build)
+        # so a broken tree still fails loudly, but skip the full npm test —
+        # the lane matrix above was skipped by explicit human choice.
+        if: steps.resolve.outputs.proceed == 'true' && inputs.fast == true
+        run: |
+          echo "::warning::FAST MODE — full CI lanes and the full npm test were SKIPPED by an explicit human choice (workflow_dispatch fast=true). Publish sanity = version guards + npm ci + typecheck + build only."
+          npm ci
+          npm run typecheck
+          npm run build
+
       - name: Full CI gate (all lanes green at this sha)
         # Hard precondition for publish: lanes dispatched above (plus the PR's
         # own lane runs at the head sha) ran in parallel with the pre-flight;
         # wait them out now. Any red lane or timeout ⇒ release fails, nothing
         # is published.
-        if: steps.resolve.outputs.proceed == 'true'
+        if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CI_GATE_TIMEOUT_MIN: "60"
@@ -269,3 +297,13 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/releases" \
             -d @"$RUNNER_TEMP/release.json"
+
+      - name: Close the patch-lane cycle (notice — the state is derived, nothing to clear)
+        # Dual-lane model: lanes are DERIVED from the latest tag — after this
+        # publish creates vNEXT, the NEXT 'backport' label cuts a fresh
+        # lane bugfix-vNEXT from that tag automatically. No stored pointer,
+        # nothing to reset.
+        if: steps.resolve.outputs.proceed == 'true'
+        run: |
+          BRANCH="${{ steps.resolve.outputs.branch }}"
+          echo "::notice::shipped '$BRANCH' — the fresh tag closes this patch-lane cycle by derivation; the next 'backport' label cuts a fresh lane from it"

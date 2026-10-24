@@ -21,6 +21,7 @@ import {
 import { simhashHex } from "../src/affinity-simhash.ts";
 import { defaultCountTokens } from "acp-kernel";
 import type { CoreMessage } from "acp-kernel";
+import { responsesToCore, openaiToCore, anthropicToCore, googleToCore } from "acp-kernel/wire";
 import type { Session } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { conflictEventsOf } from "../src/conflict-watch.js";
@@ -331,7 +332,7 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         }
         const errs = errorLines(logs);
         assert.equal(errs.length, 1, "exactly ONE error for the whole episode");
-        assert.match(errs[0].msg, /compression substrate appears destroyed/);
+        assert.match(errs[0].msg, /fold epoch confirmation required/);
         assert.match(errs[0].msg, /host-native compaction/);
         assert.match(errs[0].msg, /#2193/);
         // #2297: the per-pass warn now STOPS once the episode escalated —
@@ -451,7 +452,7 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
             reconcileFoldCoverage(session, freshPass(`p${pass}`), opts);
         }
         assert.equal(errorLines(logs).length, 1, "real destruction still escalates on its own streak");
-        assert.match(errorLines(logs)[0].msg, /compression substrate appears destroyed/);
+        assert.match(errorLines(logs)[0].msg, /fold epoch confirmation required/);
     });
 
     // #2709: at the destruction point the refusal-ledger witness turns the
@@ -601,18 +602,23 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.equal(JSON.stringify(session.metadata[METADATA_FOLD_COVERAGE]), covBefore, "coverage records untouched");
         assert.equal(JSON.stringify(session.metadata.foldAnchors), anchorsBefore, "anchors untouched");
         assert.equal(JSON.stringify(session.metadata.foldAnchorOrder), orderBefore, "backbone untouched");
-        // The next conversation-sized total-loss pass escalates on its own merit
-        // AND completes the #2695 zombie streak (z was 2 before the side pass;
-        // h3 makes it 3): the block is reaped — removed from state.blocks, the
-        // loss recorded as a conflict event, blockContents semantics preserved
-        // by the reap helper (kept, so derived decompress still works).
+        // The next full pass reaches the epoch-confirm gate. That gate must
+        // retain the fold snapshot, including on later foreign-history passes.
         const h3 = reconcileFoldCoverage(session, filler("h3"), opts);
         assert.equal(logs.filter((l) => l.level === "error").length, 1);
-        assert.equal(h3.reaped, 1, "third consecutive majority-loss pass reaps the zombie block");
-        assert.equal(session.state.blocks.length, 0, "reaped block removed from state.blocks");
-        assert.ok(!covOf(session)["blk3"], "coverage record for the reaped block dropped");
-        const conflict = (session.metadata.conflictEvents as Array<{ kind: string }>)[0];
-        assert.equal(conflict?.kind, "orphan-reap");
+        assert.equal(h3.reaped, 0, "epoch confirmation takes priority over zombie reaping");
+        assert.equal(session.metadata.foldEpochConfirmPending, true);
+        for (let i = 4; i <= 6; i++) {
+            assert.equal(reconcileFoldCoverage(session, filler(`h${i}`), opts).reaped, 0);
+        }
+        assert.equal(session.state.blocks.length, 1, "pending confirmation retains the original fold");
+        assert.ok(covOf(session)["blk3"], "coverage evidence survives for recovery");
+        assert.equal(conflictEventsOf(session).filter((e) => e.kind === "orphan-reap").length, 0);
+        assert.equal(logs.filter((l) => l.level === "error").length, 1, "one epoch warning per episode");
+        const recovered = reconcileFoldCoverage(session, originals, opts);
+        assert.equal(recovered.missing, 0);
+        assert.notEqual(session.metadata.foldEpochConfirmPending, true);
+        assert.equal(session.state.blocks[0].blockId, "blk3");
     });
 
     test("majority-reasoning span survives a sanctioned thinking drop (no false reap, #2732)", () => {
@@ -650,6 +656,72 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.equal(session.state.blocks.length, 0, "real substrate loss still reaps after 3 passes");
         const conflict = (session.metadata.conflictEvents as Array<{ kind: string }>)[0];
         assert.equal(conflict?.kind, "orphan-reap");
+    });
+
+    test("short wire requests expanded into many cores never reap main folds", () => {
+        const ids = Array.from({ length: 12 }, (_, i) => `main${i}`);
+        const session = blockSession("main-fold", ids);
+        const originals = ids.map((id, i) => msg(id, "user", `main conversation evidence ${i}`));
+        reconcileFoldCoverage(session, originals, makeOpts());
+        const before = JSON.stringify({ state: session.state, metadata: session.metadata });
+        // A short Responses input can project to dozens of cores. The wire
+        // shape, rather than projection granularity, decides whether its
+        // missing history can be treated as evidence of owner deletion.
+        const input = Array.from({ length: 6 }, (_, i) => ({
+            type: "message" as const, role: "user" as const,
+            content: Array.from({ length: 13 }, (_, j) => ({ type: "input_text" as const, text: `utility ${i} part ${j}` })),
+        }));
+        const { msgs } = responsesToCore({ input });
+        assert.ok(msgs.length >= 10, `fixture must defeat the core-count guard, got ${msgs.length}`);
+        const opts = { ...makeOpts(), inboundMessageCount: input.length };
+        const passes = Array.from({ length: 4 }, () => {
+            const result = reconcileFoldCoverage(session, msgs, opts);
+            return { result, snapshot: JSON.stringify({ state: session.state, metadata: session.metadata }) };
+        });
+        assert.equal(session.state.blocks.length, 1, "four short wire passes must retain the main fold");
+        for (const [i, { result, snapshot }] of passes.entries()) {
+            assert.equal(result.kind, "noop", `short wire pass ${i + 1} takes no deletion evidence`);
+            assert.equal(result.reaped, 0);
+            assert.equal(snapshot, before);
+        }
+        const next = reconcileFoldCoverage(session, originals, makeOpts());
+        assert.equal(next.missing, 0);
+        assert.equal(session.state.blocks[0].blockId, "main-fold");
+    });
+
+    test("sibling-wire short multi-part passes never reap main folds (#3844 openai/anthropic/google)", () => {
+        const textParts = (n: number, tag: string) =>
+            Array.from({ length: n }, (_, j) => ({ type: "text" as const, text: `${tag} part ${j} words` }));
+        const wires = [
+            { name: "openai", raw: 3, msgs: openaiToCore({ messages: Array.from({ length: 3 }, (_, i) => ({ role: "user" as const, content: textParts(5, `oai-${i}`) })) }).msgs },
+            { name: "anthropic", raw: 3, msgs: anthropicToCore({ messages: Array.from({ length: 3 }, (_, i) => ({ role: "user" as const, content: textParts(5, `ant-${i}`) })) }).msgs },
+            { name: "google", raw: 3, msgs: googleToCore({ contents: Array.from({ length: 3 }, (_, i) => ({ role: "user", parts: Array.from({ length: 5 }, (_, j) => ({ text: `ggl-${i} part ${j} words` })) })) }).msgs },
+        ];
+        for (const w of wires) {
+            assert.ok(w.msgs.length >= 10, `${w.name}: fixture must defeat the core-count guard, got ${w.msgs.length}`);
+            const ctrlIds = Array.from({ length: 5 }, (_, i) => `c${i}`);
+            const ctrl = blockSession("main-fold", ctrlIds);
+            const ctrlOriginals = ctrlIds.map((id, i) => msg(id, "user", `control evidence ${i}`));
+            reconcileFoldCoverage(ctrl, [...ctrlOriginals, ...filler("control")], makeOpts());
+            for (let i = 0; i < 4; i++) reconcileFoldCoverage(ctrl, w.msgs, makeOpts());
+            assert.equal(ctrl.state.blocks.length, 0, `${w.name}: uncounted expanded short passes feed deletion evidence and reap the main fold (pre-fix behavior)`);
+            const ids = Array.from({ length: 12 }, (_, i) => `main${i}`);
+            const session = blockSession("main-fold", ids);
+            const originals = ids.map((id, i) => msg(id, "user", `main conversation evidence ${i}`));
+            reconcileFoldCoverage(session, originals, makeOpts());
+            const before = JSON.stringify({ state: session.state, metadata: session.metadata });
+            const opts = { ...makeOpts(), inboundMessageCount: w.raw };
+            for (let i = 0; i < 4; i++) {
+                const result = reconcileFoldCoverage(session, w.msgs, opts);
+                assert.equal(result.kind, "noop", `${w.name}: short wire pass ${i + 1} takes no deletion evidence`);
+                assert.equal(result.reaped, 0);
+                assert.equal(JSON.stringify({ state: session.state, metadata: session.metadata }), before);
+            }
+            assert.equal(session.state.blocks.length, 1, `${w.name}: four short wire passes retain the main fold`);
+            const next = reconcileFoldCoverage(session, originals, makeOpts());
+            assert.equal(next.missing, 0);
+            assert.equal(session.state.blocks[0].blockId, "main-fold");
+        }
     });
 
     test("short passes do not skew the next pass's alignment", () => {
@@ -693,11 +765,13 @@ describe("reconcileFoldCoverage owner-deletion drift (#2297)", () => {
         Array.from({ length: n }, (_, i) => msg(`${tag}${i}`, "assistant", `${tag} fresh tail turn ${i} padding words`));
 
     test("missing counts only ACTIVE block coverage; dead-lineage ids drop out", () => {
-        // #2293 shape: the host truncated its own history; syncBlocks has
-        // already deactivated the old blocks (active=false) but their
-        // effectiveMessageIds persist in state — they can never re-anchor and
+        // #2293 shape: the host decompressed these blocks and they died —
+        // syncBlocks keeps them inactive (expanded=true) while their
+        // effectiveMessageIds persist in state; they can never re-anchor and
         // must not sit in `missing` forever. Pre-seeded anchors simulate the
-        // persisted state from when those blocks were still live.
+        // persisted state from when those blocks were still live. (#4050
+        // refined the split: VIEW-deactivated inactive blocks are recovery
+        // candidates again — see the #4050 describe below.)
         const liveIds = Array.from({ length: 12 }, (_, i) => `live${i}`);
         const deadIds = Array.from({ length: 50 }, (_, i) => `dead${i}`);
         const seedAnchors: Record<string, FoldAnchor> = {};
@@ -705,8 +779,8 @@ describe("reconcileFoldCoverage owner-deletion drift (#2297)", () => {
         const session = {
             state: { blocks: [
                 { active: true, effectiveMessageIds: liveIds },
-                { active: false, effectiveMessageIds: deadIds.slice(0, 40) },
-                { active: false, effectiveMessageIds: deadIds.slice(40) },
+                { active: false, expanded: true, effectiveMessageIds: deadIds.slice(0, 40) },
+                { active: false, expanded: true, effectiveMessageIds: deadIds.slice(40) },
             ]},
             metadata: { foldAnchors: seedAnchors, foldAnchorOrder: [...deadIds, ...liveIds] },
         } as unknown as Session;
@@ -779,6 +853,180 @@ describe("reconcileFoldCoverage owner-deletion drift (#2297)", () => {
         assert.equal(session.metadata["foldDriftStreak"], 8, "the streak keeps counting across the restart");
     });
 });
+
+describe("reconcileFoldCoverage view-deactivated recovery (#4050)", () => {
+    type LogLine = { level: string; msg: string };
+    const makeOpts = (logs: LogLine[]): ReconcileOptions & { mode: "repair" } =>
+        ({ sessionId: "s4050", mode: "repair", log: (level: string, m: string) => logs.push({ level, msg: m }) });
+    const errorLines = (logs: LogLine[]) => logs.filter((l) => l.level === "error");
+    // A live fold plus a fold deactivated by the LAST view skipping its span
+    // (kernel syncBlocks after a short request) — inactive, NOT expanded.
+    function dualSession(): Session {
+        const liveIds = Array.from({ length: 12 }, (_, i) => `l${i}`);
+        const viewIds = Array.from({ length: 5 }, (_, i) => `v${i}`);
+        const seedAnchors: Record<string, FoldAnchor> = {};
+        for (const id of [...liveIds, ...viewIds]) seedAnchors[id] = anchorOf(msg(id, "user", `seed text ${id} words`));
+        return {
+            state: {
+                blocks: [
+                    { blockId: "live-block", active: true, effectiveMessageIds: liveIds },
+                    { blockId: "view-block", active: false, effectiveMessageIds: viewIds },
+                ],
+            },
+            metadata: { foldAnchors: seedAnchors, foldAnchorOrder: [...liveIds, ...viewIds] },
+        } as unknown as Session;
+    }
+    const liveMsgs = Array.from({ length: 12 }, (_, i) => msg(`l${i}`, "user", `live turn ${i} payload words`));
+    const viewMsgs = Array.from({ length: 5 }, (_, i) => msg(`v${i}`, "user", `view span ${i} content words`));
+    const tailMsgs = Array.from({ length: 10 }, (_, i) => msg(`t${i}`, "assistant", `tail turn ${i} padding words`));
+
+    test("canonical-equivalent id churn re-keys the view-deactivated fold", () => {
+        // The reported shape: a short request deactivates the fold, then the
+        // main history returns with every id re-minted over canonical-equivalent
+        // bytes (whitespace churn). Pre-fix covered.size saw only active blocks
+        // and the stale v-ids could never re-anchor → permanent coverage loss.
+        const session = dualSession();
+        const opts = makeOpts([]);
+        assert.equal(reconcileFoldCoverage(session, [...liveMsgs, ...viewMsgs, ...tailMsgs], opts).kind, "resend");
+        const churned: CoreMessage[] = [
+            ...liveMsgs.map((m, i) => msg(`L${i}`, m.role, m.text!.replaceAll(" ", "  "))),
+            ...viewMsgs.map((m, i) => msg(`V${i}`, m.role, m.text!.replaceAll(" ", "  "))),
+            ...tailMsgs.map((m, i) => msg(`T${i}`, m.role, m.text!.replaceAll(" ", "  "))),
+        ];
+        const result = reconcileFoldCoverage(session, churned, opts);
+        assert.equal(result.kind, "reanchored");
+        assert.equal(result.claims, 17, "every churned cell corroborates and claims");
+        assert.equal(result.unmatched, 0);
+        assert.deepEqual(
+            (session.state.blocks[0] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            Array.from({ length: 12 }, (_, i) => `L${i}`),
+            "the live fold re-keys under the churned ids",
+        );
+        assert.deepEqual(
+            (session.state.blocks[1] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            Array.from({ length: 5 }, (_, i) => `V${i}`),
+            "the view-deactivated fold re-keys too — syncBlocks re-activates it on the next pipeline run",
+        );
+        assert.equal((session.state.blocks[1] as { active: boolean }).active, false,
+            "reconcile only re-keys; reactivation stays the kernel sync's job (no blind flag flip)");
+    });
+
+    test("sanctioned head-truncation of a verified span is never reaped", () => {
+        // The client truncated its own head history (the #2627/#3641/#3724
+        // sanctioned-deletion class): every absent id has zero word evidence
+        // and the wire still continues from the witness tail → structurally
+        // absent, so the #2695 streak must stay at zero even for a verified
+        // (e===1) view-deactivated fold. The snapshot IS the session's memory
+        // of that span and must survive indefinitely.
+        const session = dualSession();
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        assert.equal(reconcileFoldCoverage(session, [...liveMsgs, ...viewMsgs, ...tailMsgs], opts).kind, "resend");
+        session.metadata[METADATA_FOLD_COVERAGE] = { "view-block": { p: 5, r: 0, t: 5, e: 1 } };
+        // Head truncation cuts the OLDEST ids first: everything up to and
+        // including both folded spans is gone, the wire keeps its clean tail
+        // (same ids, re-serialized bytes) plus a fresh continuation — the
+        // common set is a contiguous suffix of the witness, which is what
+        // makes this the sanctioned class (a mid-span cut would stay honest
+        // drift instead). Alien vocabulary keeps the word-evidence census at
+        // zero deterministically.
+        const alienTail = Array.from({ length: 10 }, (_, i) => msg(`t${i}`, "assistant", `tail message ${String.fromCharCode(97 + i)} continuation context`));
+        const appended = [msg("n0", "user", "fresh continuation question here"), msg("n1", "assistant", "fresh continuation answer now")];
+        const truncated = [...alienTail, ...appended]; // l0..l11 + v0..v4 gone
+        for (let pass = 0; pass < 3; pass++) {
+            const result = reconcileFoldCoverage(session, truncated, opts);
+            assert.equal(result.reaped, 0, `pass ${pass + 1}: truncation-suppressed span is never reaped`);
+            assert.equal((session.metadata[METADATA_FOLD_COVERAGE] as Record<string, FoldBlockCoverage>)["view-block"].z, 0,
+                `pass ${pass + 1}: structural absence keeps the streak at zero`);
+        }
+        assert.deepEqual(
+            (session.state.blocks[1] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            viewMsgs.map((m) => m.id!),
+            "no corroboration → no re-key, the stale ids are kept for honest loss",
+        );
+        assert.equal(session.state.blocks.length, 2, "the snapshot survives the truncation");
+        assert.equal(errorLines(logs).length, 0, "continuity explains the absence — no drift escalation");
+        assert.equal(session.metadata["foldDriftEscalated"], undefined, "no escalation latch set");
+    });
+
+    test("a mid-history edit of a verified span accrues honest drift (same #2695 lifecycle as active folds)", () => {
+        // A genuine in-session rewrite of folded content breaks wire contiguity
+        // BY DESIGN (mid-history edits are not the sanctioned-truncation class),
+        // so the verified span accrues its zombie streak exactly like an active
+        // fold would: z climbs per pass and the third pass completes the #2695
+        // reap. Two passes here pin the accrual without triggering the removal
+        // (the reap itself is pinned by the #2695 tests against active folds).
+        const session = dualSession();
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        assert.equal(reconcileFoldCoverage(session, [...liveMsgs, ...viewMsgs, ...tailMsgs], opts).kind, "resend");
+        session.metadata[METADATA_FOLD_COVERAGE] = { "view-block": { p: 5, r: 0, t: 5, e: 1 } };
+        const edited: CoreMessage[] = [
+            ...liveMsgs,
+            ...Array.from({ length: 5 }, (_, i) => msg(`V${i}`, "user", `alien rewrite ${["alpha", "beta", "gamma", "delta", "epsilon"][i]} omega`)),
+            ...tailMsgs,
+        ];
+        for (let pass = 0; pass < 2; pass++) {
+            const result = reconcileFoldCoverage(session, edited, opts);
+            assert.equal(result.unmatched, 5, `pass ${pass + 1}: the rewritten cells stay honestly unmatched`);
+            assert.equal(result.reaped, 0, `pass ${pass + 1}: not yet ripe`);
+            assert.equal((session.metadata[METADATA_FOLD_COVERAGE] as Record<string, FoldBlockCoverage>)["view-block"].z, pass + 1,
+                `pass ${pass + 1}: honest streak accrual for the genuinely-gone verified span`);
+        }
+        assert.deepEqual(
+            (session.state.blocks[1] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            viewMsgs.map((m) => m.id!),
+            "no corroboration → no re-key while the span is still accounted for",
+        );
+    });
+
+    test("consumed child ids dedupe against the surviving parent — no exclusion needed", () => {
+        // A merged-away (consumed) block keeps its pre-merge ids, a subset of
+        // the parent's ids. Both blocks ride the same claim: the Set dedupes,
+        // the claim applies once, and BOTH id lists get re-keyed. If someone
+        // later adds a consumed-exclusion here, this test catches the lost
+        // child re-key.
+        const parentIds = Array.from({ length: 5 }, (_, i) => `x${i}`);
+        const childIds = parentIds.slice(2);
+        const seedAnchors: Record<string, FoldAnchor> = {};
+        for (const id of parentIds) seedAnchors[id] = anchorOf(msg(id, "user", `merged turn ${id} words`));
+        const session = {
+            state: {
+                blocks: [
+                    { blockId: "parent", active: true, effectiveMessageIds: parentIds },
+                    { blockId: "child", active: false, effectiveMessageIds: childIds },
+                ],
+            },
+            metadata: { foldAnchors: seedAnchors, foldAnchorOrder: [...parentIds] },
+        } as unknown as Session;
+        const opts = makeOpts([]);
+        const tail = Array.from({ length: 6 }, (_, i) => msg(`z${i}`, "assistant", `dedupe tail ${i} words`));
+        const originals = [
+            ...Array.from({ length: 5 }, (_, i) => msg(`x${i}`, "user", `merged turn x${i} words`)),
+            ...tail,
+        ];
+        assert.equal(reconcileFoldCoverage(session, originals, opts).kind, "resend");
+        const churned: CoreMessage[] = [
+            msg("x0", "user", "merged turn x0 words"),
+            msg("x1", "user", "merged turn x1 words"),
+            ...Array.from({ length: 3 }, (_, i) => msg(`X${i + 2}`, "user", `merged turn x${i + 2}  words\r\n`)),
+            ...tail,
+        ];
+        const result = reconcileFoldCoverage(session, churned, opts);
+        assert.equal(result.claims, 3, "each unique id claimed once despite two blocks listing it");
+        assert.equal(result.unmatched, 0);
+        assert.deepEqual(
+            (session.state.blocks[0] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            ["x0", "x1", "X2", "X3", "X4"],
+        );
+        assert.deepEqual(
+            (session.state.blocks[1] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            ["X2", "X3", "X4"],
+            "the consumed child re-keys alongside its parent",
+        );
+    });
+});
+
 describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
     // MAX_ANCHORS (src/fold-reconcile.ts) pinned at 16384 — hardcoded here on
     // purpose so a constant move breaks the pin loudly instead of sliding it.
@@ -822,7 +1070,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");

@@ -24,6 +24,7 @@ import { isToolMessage } from "./message-kind.js";
 import { coveredMessageIds, isLiveCheckpointCarrier } from "./state.js";
 import { SUMMARY_HEADER } from "./prune.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasUnrecoverableMediaPayload,
@@ -33,8 +34,10 @@ import {
 } from "./protected.js";
 import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
+import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
+import { BoundaryNotFoundError } from "./boundaries.js";
 import type { UnitProjection } from "./unit-projection.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -191,6 +194,58 @@ export function computeProtectedRefs(
 
 // ─── 2. Build Compressible + Protected Ranges ────────────────────────────────
 
+/** Numeric part of a message ref ("m00005" → 5); null for non-m refs. */
+function refNumber(ref: string): number | null {
+  const m = /^m(\d+)$/i.exec(ref);
+  return m ? Number(m[1]) : null;
+}
+
+/** True when a recorded-dead ref sits STRICTLY between two live ref numbers —
+ *  the endpoints themselves are live (a dead endpoint can't be a compressible
+ *  message), so only interior holes matter (#3192/#3205). */
+function hasDeadRefBetween(
+  deadRefNums: ReadonlySet<number>,
+  lo: number,
+  hi: number,
+): boolean {
+  for (const n of deadRefNums) if (n > lo && n < hi) return true;
+  return false;
+}
+
+interface NoMergeTarget {
+  startRef: string;
+  endRef: string;
+  startIndex?: number;
+  endIndex?: number;
+  noMergeBefore?: boolean;
+}
+
+/** #3192/#3205: tag every range that opens right after a dead-ref hole so the
+ *  position-based mergers (mergeRangesToThreshold, formatRanges) cannot bridge
+ *  across it — a dropped message leaves no array slot, so the hole has no index
+ *  gap and position adjacency alone would re-emit one doomed span bracketing the
+ *  dead ref. Runs over compressible + protected together so cross-type
+ *  boundaries are covered too. */
+function markNoMergeAcrossDeadHoles(
+  ranges: NoMergeTarget[],
+  deadRefNums: ReadonlySet<number>,
+): void {
+  if (deadRefNums.size === 0 || ranges.length < 2) return;
+  const startPos = (r: NoMergeTarget): number =>
+    r.startIndex ?? refNumber(r.startRef) ?? 0;
+  const order = [...ranges].sort((a, b) => startPos(a) - startPos(b));
+  for (let i = 1; i < order.length; i++) {
+    const prevEnd = refNumber(order[i - 1]!.endRef);
+    const curStart = refNumber(order[i]!.startRef);
+    if (prevEnd === null || curStart === null) continue;
+    const lo = Math.min(prevEnd, curStart);
+    const hi = Math.max(prevEnd, curStart);
+    if (hi - lo > 1 && hasDeadRefBetween(deadRefNums, lo, hi)) {
+      order[i]!.noMergeBefore = true;
+    }
+  }
+}
+
 /**
  * Build compressible and protected range groups from the message list.
  *
@@ -239,6 +294,10 @@ export function buildCompressibleRanges(
   // Pairing: a tool-result may carry only toolCallId (no toolName). Collect the
   // callIds of protected tool-calls first, then protect matching results too.
   const protectedCallIds = collectProtectedToolCallIds(messages, config);
+  // #4289: failed compress exchanges (zero ranges applied) must be advertised
+  // as compressible like ordinary messages — without this set their call half
+  // stays "protected" here while assignRefs already gave it a foldable ref.
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   // Latest-only protected calls: their results are covered by the pairing
   // union; the calls themselves need the explicit check below (pairing only
   // matches tool-results).
@@ -255,6 +314,15 @@ export function buildCompressibleRanges(
   let skipSinceCompressible = false;
   let skipSinceProtected = false;
   let msgIndex = -1;
+  // #3192/#3205: numeric set of recorded-dead refs. A dropped message leaves a
+  // hole in the ref map that array-adjacency segmentation bridges, so we break
+  // groups at those holes (checked right before each compressible push below).
+  const deadRefNums = new Set<number>(
+    (state.deadRefs ?? [])
+      .map((ref) => refNumber(ref))
+      .filter((n): n is number => n !== null),
+  );
+  let lastCompressibleRefNum: number | null = null;
 
   for (const msg of messages) {
     msgIndex++;
@@ -292,7 +360,12 @@ export function buildCompressibleRanges(
     }
 
     if (
-      isMessageProtectedWithPairing(msg, config, protectedCallIds) ||
+      isMessageProtectedWithPairing(
+        msg,
+        config,
+        protectedCallIds,
+        failedCompressCallIds,
+      ) ||
       isMessageLatestProtected(msg, latest)
     ) {
       protectedMsgs.push({
@@ -313,6 +386,21 @@ export function buildCompressibleRanges(
       continue;
     }
 
+    // #3192/#3205: break the group at a dead-ref hole between this message and
+    // the previous compressible one (a dropped message leaves no array slot, so
+    // no earlier gap flag fires). Same level as covered/pruned/carrier gaps.
+    const curRefNum = refNumber(ref);
+    if (
+      deadRefNums.size > 0 &&
+      curRefNum !== null &&
+      lastCompressibleRefNum !== null
+    ) {
+      const lo = Math.min(curRefNum, lastCompressibleRefNum);
+      const hi = Math.max(curRefNum, lastCompressibleRefNum);
+      if (hi - lo > 1 && hasDeadRefBetween(deadRefNums, lo, hi)) {
+        skipSinceCompressible = true;
+      }
+    }
     compressibleMsgs.push({
       id: msg.id,
       ref,
@@ -323,6 +411,7 @@ export function buildCompressibleRanges(
       isUser: msg.role === "user",
       index: msgIndex,
     });
+    if (curRefNum !== null) lastCompressibleRefNum = curRefNum;
     skipSinceCompressible = false;
     skipSinceProtected = true;
   }
@@ -426,6 +515,8 @@ export function buildCompressibleRanges(
   }
   if (pcur) protectedRanges.push(pcur);
 
+  markNoMergeAcrossDeadHoles([...compressible, ...protectedRanges], deadRefNums);
+
   return {
     compressible: compressible.filter((g) => g.tokens > 0),
     protected: protectedRanges,
@@ -458,6 +549,10 @@ function mergeBatch(batch: CompressibleRange[]): CompressibleRange {
   if (batch.some((r) => r.dangerous === true)) {
     merged.dangerous = true;
   }
+  // #3192/#3205: carry the leading dead-hole boundary forward so downstream
+  // position-based merging (formatRanges) still sees it after this batch is
+  // re-emitted as a single range.
+  if (first.noMergeBefore === true) merged.noMergeBefore = true;
   return merged;
 }
 
@@ -500,6 +595,9 @@ export function mergeRangesToThreshold(
     }
   };
   for (const r of ranges) {
+    // #3192/#3205: hard boundary at a dead-ref hole — never bridge across it,
+    // even though the hole carries no array-index gap (see noMergeBefore).
+    if (r.noMergeBefore) closeBatch();
     const prev = batch[batch.length - 1];
     // A physical array-index gap between the previous range and this one marks
     // a block / protected / pruned boundary (buildCompressibleRanges leaves a
@@ -520,9 +618,10 @@ export function mergeRangesToThreshold(
   if (batch.length > 0 && result.length > 0) {
     const prev = result[result.length - 1]!;
     const contiguous =
-      prev.endIndex === undefined ||
-      batch[0]!.startIndex === undefined ||
-      batch[0]!.startIndex <= prev.endIndex + 1;
+      !batch[0]!.noMergeBefore &&
+      (prev.endIndex === undefined ||
+        batch[0]!.startIndex === undefined ||
+        batch[0]!.startIndex <= prev.endIndex + 1);
     if (contiguous) {
       result[result.length - 1] = mergeBatch([prev, ...batch]);
     } else if (batchChars >= minChars) {
@@ -565,15 +664,46 @@ export function screenRecommendedUnits(
         preExistingCoverage: coverage,
         protectedMessageIds: protectedRefs,
       });
-    } catch {
+    } catch (err) {
       // Endpoints that cannot resolve on this array class (dead/consumed)
-      // must never be advertised.
+      // must never be advertised. BoundaryNotFoundError is that expected
+      // case (#3371 screens consumed units through here routinely) and stays
+      // silent; any OTHER exception is a programming error being swallowed
+      // into a silent demotion — the unit vanished with no trace at all
+      // (#3406 item 9). Surface it as a diagnostic (same channel as the
+      // config-validation warn in processTurn); behavior is unchanged —
+      // still return false, the unit is never advertised.
+      if (!(err instanceof BoundaryNotFoundError)) {
+        console.warn(
+          `[acp-kernel] screenRecommendedUnits dropped unit ${unit.startRef}..${unit.endRef} after projection error: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
       return false;
     }
     if (!projection || projection.fatal !== null) return false;
     if (
       projection.filteredIds.length === 0 &&
       projection.consumedBlockIds.length === 0
+    ) {
+      return false;
+    }
+    // #3371: the apply lane's livelock guard (compress.ts, pi#199) throws on
+    // a message-ref range that owns nothing new and only consumes active
+    // block(s) — UNLESS the shared refold verdict (evaluateRefold) classifies
+    // it a genuine in-place refold (#398: every in-span block restored-inline
+    // with a fully restored ancestor chain). Screen that exact shape through
+    // the SAME evaluateRefold (refold.ts — extracted from compress.ts for
+    // this) so an advertised unit can never be a guaranteed apply-time
+    // throw; real refolds stay advertised. Block-boundary units (bN..bM,
+    // promote/merge) take apply's explicit block route and are exempt, same
+    // as the apply-side guard.
+    if (
+      projection.filteredIds.length === 0 &&
+      projection.consumedBlockIds.length > 0 &&
+      !projection.isBlockBoundary &&
+      evaluateRefold(state, unit).kind !== "refold"
     ) {
       return false;
     }

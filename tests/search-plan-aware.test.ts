@@ -55,7 +55,7 @@ type Folded = { core: ReturnType<typeof createCore>; config: Config; session: Re
 
 function foldBlocks(ccr: boolean): Folded {
     const core = createCore();
-    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { ccr: { enabled: ccr, minToolTokens: 50 } }) as Config;
+    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: ccr, minToolTokens: 50 } }) as Config;
     const session = getSession(`sp-${Math.random().toString(36).slice(2)}`);
     if (ccr) storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
     const turn = core.processTurn({ messages: makeMsgs(40), state: session.state, config, tokenCount: 9999, renderTags: "text-only" });

@@ -13,7 +13,7 @@
 //   2. ordinary passthrough POST (title-gen shape, marker string only mentioned
 //      mid-text) → byte-identical verbatim relay (no false positive);
 //   3. gzip-encoded marker body → still refused (decode-then-sniff path);
-//   4. allowDshCompaction:true → passthrough compaction relays (opt-out honored);
+//   4. legacy allowDshCompaction opt-in (file/env) → STILL refused (#3666 removed it);
 //   5. unparseable body → verbatim relay (fail-open);
 //   6. GET passthrough (e.g. /models) → untouched (method gate).
 import assert from "node:assert/strict";
@@ -41,7 +41,7 @@ interface Captured {
     method: string;
 }
 
-async function startHarness(allowDshCompaction = false): Promise<{ proxyPort: number; upstreamPort: number; captured: Captured[]; close(): Promise<void> }> {
+async function startHarness(): Promise<{ proxyPort: number; upstreamPort: number; captured: Captured[]; close(): Promise<void> }> {
     const captured: Captured[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -74,7 +74,6 @@ async function startHarness(allowDshCompaction = false): Promise<{ proxyPort: nu
         promptCache: { routing: "auto" },
         compress: { injectTool: false, injectNudge: false },
         sessionHeader: "x-acp-session",
-        allowDshCompaction,
         log: false,
         debug: false,
         passthrough: false,
@@ -124,8 +123,8 @@ test("#2709: passthrough compaction call is refused 422, never forwarded", async
         assert.equal(resp.status, 422);
         const text = await resp.text();
         assert.match(text, /dsh_compaction_refused/);
-        // the refusal must carry the #2028 opt-out instructions like the pipeline guard
-        assert.match(text, /allowDshCompaction/);
+        // the refusal must state the unconditional contract like the pipeline guard (#3666)
+        assert.match(text, /unconditional/);
         // upstream saw NOTHING — the call must not land
         assert.equal(h.captured.length, 0);
         // process-level count (no session ledger on this lane)
@@ -171,20 +170,24 @@ test("#2709: gzip-encoded compaction body is still refused (decode path)", async
     }
 });
 
-test("#2709: allowDshCompaction:true lets the passthrough compaction relay (opt-out honored)", async () => {
-    const h = await startHarness(true);
+test("#2709/#3666: the removed allowDshCompaction opt-in no longer relays (legacy env ignored)", async () => {
+    process.env.BILI_ALLOW_DSH_COMPACTION = "1";
     try {
-        const body = compactionBody();
-        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-bili-passthrough": "1" },
-            body,
-        });
-        assert.equal(resp.status, 200);
-        assert.equal(h.captured.length, 1);
-        assert.equal(h.captured[0].body, body);
+        const h = await startHarness();
+        try {
+            const body = compactionBody();
+            const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-bili-passthrough": "1" },
+                body,
+            });
+            assert.equal(resp.status, 422, "legacy env opt-in is ignored — refusal stands");
+            assert.equal(h.captured.length, 0, "still nothing reaches upstream");
+        } finally {
+            await h.close();
+        }
     } finally {
-        await h.close();
+        delete process.env.BILI_ALLOW_DSH_COMPACTION;
     }
 });
 

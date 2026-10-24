@@ -10,6 +10,7 @@ import * as K from "acp-kernel";
 import { defaultConfig } from "acp-kernel";
 import { handlePluginManifest } from "../src/plugin.ts";
 import {
+    ABSORB_TOOL_RESPONSES,
     BILI_ACP_READONLY_TOOLS_RESPONSES,
     BILI_ACP_TOOLS_ANTHROPIC,
     BILI_ACP_TOOLS_GOOGLE,
@@ -124,6 +125,7 @@ function buildBiliGolden(): Record<string, unknown> {
             decompressGoogle: BILI_DECOMPRESS_TOOL_GOOGLE,
         },
         synthesized: {
+            absorbResponses: ABSORB_TOOL_RESPONSES,
             ruleAnthropic: RULE_TOOL,
             ruleOpenAi: RULE_TOOL_OPENAI,
             ruleResponses: RULE_TOOL_RESPONSES,
@@ -154,6 +156,6 @@ export function buildGoldens(): GoldenSpec[] {
         { name: "kernel.json", layer: "acp-kernel exports (pinned)", build: buildKernelGolden },
         { name: "bili.json", layer: "bili-built surfaces (compress-tool.ts)", build: buildBiliGolden },
         { name: "manifest-default.json", layer: "plugin manifest, default config", build: () => captureManifest(defaultConfig(100_000)) },
-        { name: "manifest-optin.json", layer: "plugin manifest, rules+ccr enabled", build: () => captureManifest({ ...defaultConfig(100_000), rules: { enabled: true }, ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } }) },
+        { name: "manifest-optin.json", layer: "plugin manifest, absorb+rules+ccr enabled", build: () => captureManifest({ ...defaultConfig(100_000), absorb: { ...K.DEFAULT_ABSORB_CONFIG, enabled: true }, rules: { enabled: true }, ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } }) },
     ];
 }

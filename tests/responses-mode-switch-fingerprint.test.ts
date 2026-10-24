@@ -271,21 +271,43 @@ test("self-heal degrade-to-proxy re-projects mid-history developer items without
     const before = caps[6]!; // t7 — last request prepared in plugin mode
     assert.ok(sysDevTexts(before.body).some((t) => t.includes(SYS)), "head developer block forwarded");
     assert.ok(!sysDevTexts(before.body).some((t) => t.includes(NOTIF) && t.includes(SYS)), "mid-history NOTIF must stay OUT of the front block in plugin mode");
-    assert.equal(sysDevTexts(before.body).filter((t) => t.includes(NOTIF)).length, 1, "NOTIF re-emitted in place (plugin position-preservation #1638)");
+    assert.equal(sysDevTexts(before.body).filter((t) => t.includes(NOTIF)).length, 1, "NOTIF re-emitted in place (codec-native position preservation #4166)");
+    // #4166: position preservation is codec-native and MODE-INVARIANT now —
+    // the degrade-to-proxy switch no longer re-projects mid-history items
+    // (the #1085 proxy hoist is gone). t8/t9 keep NOTIF in place, the front
+    // block stays head-only, and the switch itself no longer counts as a
+    // projection event because the projection shape never changes.
     for (const idx of [7, 8]) { // t8/t9 — degraded proxy prepares
         const texts = sysDevTexts(caps[idx]!.body);
         const front = texts[0] ?? "";
-        assert.ok(front.includes(SYS) && front.includes(NOTIF), "degraded front block must hoist mid-history NOTIF (#1085)");
-        assert.equal(texts.filter((t) => t.includes(NOTIF)).length, 1, "NOTIF appears exactly once (hoisted, no in-place copy)");
+        assert.ok(!front.includes(NOTIF), "mid-history NOTIF stays OUT of the front block in degraded proxy mode");
+        assert.equal(texts.filter((t) => t.includes(SYS)).length, 1, "client system message rides in place exactly once (degraded proxy #4166)");
+        assert.equal(texts.filter((t) => t.includes(NOTIF)).length, 1, "NOTIF still rides in place (mode-invariant position preservation #4166)");
     }
+    // The resent prefix must survive the plugin->proxy degrade byte-for-byte:
+    // t7's items are a byte-identical prefix of t8's (t8 only appends a turn).
+    const inputItems = (c: { body: unknown }): Array<Record<string, unknown>> =>
+        (Array.isArray((c.body as { input?: unknown })?.input) ? ((c.body as { input: Array<Record<string, unknown>> }).input) : []);
+    const itemText = (i: Record<string, unknown>): string =>
+        typeof i.content === "string" ? i.content : JSON.stringify(i.content ?? "");
+    const resentPrefix = (items: Array<Record<string, unknown>>): Array<Record<string, unknown>> => {
+        // The trailing per-turn efficiency nudge is re-computed every request
+        // (token counts move) — it is bili's own dynamic tail, not resent
+        // history. Compare everything BEFORE it.
+        const nudgeIdx = items.findIndex((i) => itemText(i).includes("efficiency nudge"));
+        return nudgeIdx === -1 ? items : items.slice(0, nudgeIdx);
+    };
+    const t7 = resentPrefix(inputItems(caps[6]!));
+    const t8 = resentPrefix(inputItems(caps[7]!));
+    assert.ok(t8.length >= t7.length, "t8 must keep t7's resent history under its new turn");
+    assert.deepEqual(t8.slice(0, t7.length), t7, "mode switch must not rewrite a single resent byte (#4166 mode-invariant projection)");
     for (const c of caps) assert.ok(!c.raw.includes("__bili_inplace_sysdev"), "internal marker must never leak onto the wire");
 
-    // The one re-projection re-billed cold and was attributed to the proxy's
-    // own mode switch — never to a host rewrite.
-    assert.ok(md.includes("PROJECTION SWITCHES"), "dedicated projection section expected:\n" + md);
-    const projLine = md.match(/projection switch:[^\n]*\((\d+)\)/);
-    assert.ok(projLine, "invalidation line with count expected");
-    assert.ok(Number(projLine![1]) >= 1, "at least one projection switch event expected");
+    // With the projection shape mode-invariant, the mode switch is no longer
+    // a cache-invalidation event at all: no projection switches, no prompt
+    // (host-rewrite) switches — the self-heal degrade happens without
+    // re-billing the session.
+    assert.ok(!md.includes("PROJECTION SWITCHES"), "no projection switch expected under mode-invariant projection (#4166):\n" + md);
     assert.ok(!md.includes("PROMPT SWITCHES"), "no host-rewrite section for an unchanged incoming history:\n" + md);
     assert.ok(md.match(/prompt rewrite:[^\n]*\(0\)/), "prompt invalidation bucket must stay empty");
 });

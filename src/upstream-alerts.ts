@@ -13,6 +13,7 @@
 
 import { log as loggerLog } from "./logger.js";
 import { classifyUpstreamFailure, hintWithSkippedProxy, redactedSkippedProxy, type SkippedProxyInfo, type UpstreamFailureKind } from "./upstream-fail.js";
+import { maskHostPortForLog } from "./log-mask.js";
 
 export interface UpstreamAlert {
     kind: UpstreamFailureKind;
@@ -152,6 +153,9 @@ interface CircuitEntry {
     /** True while the single half-open probe is in flight — concurrent
      *  requests fail fast instead of stacking parallel probes. */
     probeInFlight: boolean;
+    /** #4254: timestamp of the last emitted per-request fail-fast [warn], used by
+     *  noteCircuitFailFastLog to bound the OPEN-state log storm to one line/window. */
+    lastFailFastLogAt: number;
 }
 
 let circuits = new Map<string, CircuitEntry>();
@@ -161,7 +165,11 @@ function blockReasonText(c: UpstreamCircuit, now: number): string {
         ? ` · last failure ${c.lastFailure.kind}${c.lastFailure.detail ? ` (${c.lastFailure.detail})` : ""} @ ${new Date(c.lastFailure.at).toISOString()}`
         : "";
     const waitS = Math.max(0, Math.ceil(((c.nextProbeAt ?? now) - now) / 1000));
-    return `${c.host}: ${c.consecutiveFailures} consecutive pre-response failures since ${new Date(c.openedAt ?? now).toISOString()}${lf}; next probe ${new Date(c.nextProbeAt ?? now).toISOString()} (~${waitS}s) — endpoint unreachable, stop resending full context`;
+    // #4254: the host follows the SAME masking rule as the embedded last-failure
+    // detail (both non-public → <private-host>), so one free-text message never
+    // mixes a raw "127.0.0.1:7864" next to a masked <private-host>. The actionable
+    // endpoint still reaches clients via the structured upstreamFailure.host field.
+    return `${maskHostPortForLog(c.host)}: ${c.consecutiveFailures} consecutive pre-response failures since ${new Date(c.openedAt ?? now).toISOString()}${lf}; next probe ${new Date(c.nextProbeAt ?? now).toISOString()} (~${waitS}s) — endpoint unreachable, stop resending full context`;
 }
 
 /** Consult before sending to `url`. Returns undefined when the request may
@@ -175,6 +183,56 @@ export function upstreamCircuitBlockReason(url: string, now: number = Date.now()
     if (entry.probeInFlight) return blockReasonText(c, now);
     entry.probeInFlight = true;
     return undefined;
+}
+
+/** #3776 sub-defect 3: the kind of the last failure that opened a host's
+ *  circuit, so the egress can surface WHY requests are failing fast (the same
+ *  kind the user must fix). undefined when no open circuit / no recorded failure. */
+export function upstreamCircuitLastFailureKind(url: string): string | undefined {
+    const entry = circuits.get(hostOf(url));
+    if (!entry || entry.state.openedAt === null) return undefined;
+    return entry.state.lastFailure?.kind;
+}
+
+// #4254: while a circuit stays OPEN, every blocked request would otherwise re-log
+// the full errno/url/hint pair. Cap the per-request fail-fast [warn] at one line
+// per window per host; state flips (OPEN/CLOSED/probe, logged at their own sites)
+// stay visible, so the outage signal survives without re-amplifying the storm.
+const FAIL_FAST_LOG_INTERVAL_MS = 60_000;
+
+/** Returns true when the caller should emit the per-request fail-fast [warn] for
+ *  `url` now (at most once per window per open host), false when it was already
+ *  logged recently and this request's copy can stay silent. */
+export function noteCircuitFailFastLog(url: string, now: number = Date.now()): boolean {
+    const entry = circuits.get(hostOf(url));
+    if (!entry || entry.state.openedAt === null) return true;
+    if (now - entry.lastFailFastLogAt >= FAIL_FAST_LOG_INTERVAL_MS) {
+        entry.lastFailFastLogAt = now;
+        return true;
+    }
+    return false;
+}
+
+/** #4254: seconds until the next half-open probe for an OPEN circuit (undefined
+ *  when closed / no scheduled probe) — feeds the egress Retry-After header so
+ *  compliant hosts back off instead of resending full context. */
+export function upstreamCircuitRetryAfterSeconds(url: string, now: number = Date.now()): number | undefined {
+    const entry = circuits.get(hostOf(url));
+    if (!entry || entry.state.openedAt === null) return undefined;
+    const np = entry.state.nextProbeAt;
+    if (np === null) return undefined;
+    return Math.max(0, Math.ceil((np - now) / 1000));
+}
+
+/** #4254: truncate to `max` chars WITHOUT cutting inside a token — back off to the
+ *  last whitespace before the cap so a pasted diagnostic never ends mid-word
+ *  ("hint=TCP re…"). Falls back to a hard cut when there is no boundary in range. */
+function truncateAtBoundary(s: string | undefined, max: number): string {
+    if (!s) return "";
+    if (s.length <= max) return s;
+    const head = s.slice(0, max);
+    const lastSpace = head.lastIndexOf(" ");
+    return `${lastSpace > 0 ? head.slice(0, lastSpace) : head}…`;
 }
 
 /** Record one FINAL pre-response transport failure (the error escaped the
@@ -205,11 +263,11 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
             }
             if (oldestKey !== undefined) circuits.delete(oldestKey);
         }
-        entry = { state: { host, consecutiveFailures: 0, openedAt: null, nextProbeAt: null, lastFailure: null }, probeInFlight: false };
+        entry = { state: { host, consecutiveFailures: 0, openedAt: null, nextProbeAt: null, lastFailure: null }, probeInFlight: false, lastFailFastLogAt: 0 };
         circuits.set(host, entry);
     }
     const c = entry.state;
-    const shortDetail = detail && detail.length > 240 ? detail.slice(0, 240) + "…" : (detail ?? "");
+    const shortDetail = truncateAtBoundary(detail, 240);
     if (c.openedAt !== null) {
         // Open: the half-open probe just finished without a response — release
         // the slot and re-arm the cooldown regardless of kind (see above).

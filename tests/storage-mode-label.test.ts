@@ -35,9 +35,10 @@ function withHermeticConfig(fn: () => void): void {
 test("storage mode label: env matrix matches the store's effective resolution", () => {
     withHermeticConfig(() => {
     withEnv({ BILI_STORAGE_UNIFIED: undefined, BILI_ENCRYPTION_KEY: undefined }, () => {
-        // absent everywhere now resolves to the shadow DEFAULT (#2815 rollout
-        // flip) — the label must say so
-        assert.equal(storageStatusLabel(), "storage: shadow (dual-write dry-run → index.db)");
+        // absent everywhere now resolves to the FULL default (#3818 flip of
+        // the #2815 rollout) — the label must say so; explicit shadow stays
+        // reachable in the rows below
+        assert.equal(storageStatusLabel(), "storage: full (unified-first reads, dual-write)");
     });
     for (const v of ["1", "true", "shadow"]) {
         withEnv({ BILI_STORAGE_UNIFIED: v, BILI_ENCRYPTION_KEY: undefined }, () => {

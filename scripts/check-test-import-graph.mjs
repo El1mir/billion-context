@@ -35,6 +35,7 @@ const root = process.cwd();
 const ENTRY_FILES = new Set([
     "src/index.ts",
     "src/mcp.ts",
+    "src/claude-mcp-entry.ts",
     "src/claude-native-bootstrap.ts",
     "src/agent/pi.ts",
     "src/agent/pi-native.ts",
@@ -44,6 +45,7 @@ const ENTRY_FILES = new Set([
     "src/agent/opencode-native.ts",
     "src/agent/dsh-acp.ts",
     "src/agent/dsh-native.ts",
+    "src/agent/dsh-compaction-gate.ts",
     "src/kimi/native-mcp.ts",
     "src/kimi/bootstrap-hook.ts",
     "src/zcode/mcp-entry.ts",
@@ -55,6 +57,7 @@ const ENTRY_FILES = new Set([
 const WHITELIST = new Map([
     ["src/marker/spec.ts", "test-only registry: marker-lane coverage contract (tests/marker-lane-coverage.test.ts); no runtime behavior is routed through it"],
     ["src/exit-matrix.ts", "test-only registry: wire exit-code truth table (tests/wire-exit-matrix.test.ts); header says 'registry only: no runtime behavior is routed through it'"],
+    ["src/agent/pi-host-stub.ts", "build-time-only: esbuild alias target for @earendil-works/pi-coding-agent (tsup.config.ts), unreachable by static imports; pinned by tests/pi-host-stub.test.ts (#3936)"],
 ]);
 
 function trackedFiles(dir) {

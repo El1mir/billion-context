@@ -386,10 +386,11 @@ test("PUT /__bili/config refuses to overwrite a config file that does not parse"
     const root = path.join(tmpdir(), `bili-put-broken-${process.pid}-${Date.now()}`);
     mkdirSync(root, { recursive: true });
     const biliConfig = path.join(root, "billion-context.json");
-    // Hand-edited file with a trailing comma — JSON.parse fails, the loader
-    // sees {}. A PUT must NOT rebuild from {} (that would silently drop the
-    // user's modelContextLimit etc.); it must 409 until the syntax is fixed.
-    writeFileSync(biliConfig, '{"providers":{},"modelContextLimit":333000,}\n', "utf8");
+    // Hand-edited file with REAL corruption (a value cut off mid-key) — unparseable even as
+    // JSONC, so the loader sees {}. A PUT must NOT rebuild from {} (that would silently drop
+    // the user's modelContextLimit etc.); it must 409 until fixed by hand. (A bare trailing
+    // comma is no longer such corruption: #3572 makes it valid JSONC that parses normally.)
+    writeFileSync(biliConfig, '{"providers":{},"modelContextLimit":\n', "utf8");
     const prevConfig = process.env.BILI_CONFIG_FILE;
     process.env.BILI_CONFIG_FILE = biliConfig;
     const opts: ProxyOptions = {

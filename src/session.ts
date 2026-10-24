@@ -4,10 +4,14 @@ import { log as loggerLog } from "./logger.js";
 import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
+import { configFileEpoch, loadConfigFile } from "./config.js";
+import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
+import { isResponsesTurnSeparatorId } from "./turn-separator.js";
+import type { FoldReconcileResult } from "./fold-reconcile.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -333,6 +337,36 @@ export type Session = {
          *  usage report (one-shot, per the #554 contract) and on compression
          *  reset. Absent on legacy session files → treated as no arm. */
         overflowArmTokens?: number;
+        /** #3450: completion-channel reservation PROVEN by an upstream-stated
+         *  overflow ("N in the completion" billed against the same wall) —
+         *  preflight folds against window − reserve because the foldable
+         *  quantity is MESSAGES. Set alongside the overflow arm; cleared on
+         *  native-compaction reset like the arm itself. Absent/zero → no
+         *  reservation (legacy behavior). */
+        overflowArmCompletionReserve?: number;
+        /** #3450: one-time mismatch warning already emitted for this session
+         *  (upstream-stated window ≠ window in use). Provenance only. */
+        overflowArmMismatchWarned?: boolean;
+        /** #3450 follow-up: same completion-share proof as
+         *  overflowArmCompletionReserve, on a PROVIDER lifetime — the arm retires
+         *  on the next usage report (#1110), "this endpoint bills max_tokens
+         *  inside the window" does not stop being true when one turn recovers.
+         *  Scoped to the origin+model that stated it; read via
+         *  provenCompletionReserve(). Absent/zero → no proof. */
+        provenCompletionWall?: number;
+        /** normalizeUpstreamOrigin() of the upstream that stated the proof. */
+        provenCompletionWallOrigin?: string;
+        /** Model on the rejected request that stated the proof. */
+        provenCompletionWallModel?: string;
+        /** #4124: per-origin learned per-prompt image-count caps, from upstream
+         *  rejections ("Too many images in request: N > M"). Key =
+         *  normalizeUpstreamOrigin(url) — the same origin stamping as the token
+         *  overflow arm (#2313), because the cap belongs to the ROUTE, not the
+         *  session. Separate from overflowArmTokens by construction: that channel
+         *  rejects sub-1000 numbers and drives TOKEN-space shrink; an image cap
+         *  is a count. Persisted with the session; no TTL — a stale (too low) cap
+         *  can only over-shed, never under-shed. */
+        imageCountCaps?: Record<string, number>;
         /** Tokens compressed THIS turn whose fold has not yet materialized in
          *  an upstream usage report (the post-compress re-request re-sends the
          *  UNFOLDED history for prefix-cache reasons, so its usage report
@@ -482,6 +516,14 @@ export type Session = {
      *  prefer promoting a stable field into `meta` or `stats` once it's clear. */
     metadata: Record<string, unknown>;
     state: CompressionState;
+    /** #4316 layer 3 PR3/3: refs → raw ids that CHANGED HANDS in this
+     *  process's one-time ledger re-stamp (cold-load alignment). Process-
+     *  lifetime only — it exists precisely for the window where a resent
+     *  in-flight compress call still cites pre-restart numbers; a call citing
+     *  a superseded number is honestly rejected (never silently folded onto
+     *  the message that now owns the number). A fresh process that never
+     *  re-stamped has no map and every ref behaves normally. */
+    restampSuperseded?: Map<string, string>;
     createdAt: number;
     lastSeen: number;
     /** Original content of compressed blocks, captured at compress time when
@@ -512,6 +554,11 @@ export type Session = {
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3301: original message decompositions supplied by an external state
+     *  converter (e.g. opencode-acp migration) at import time. Transient
+     *  import payload: consumed once by the unified ingest (rows land in the
+     *  index for fold re-anchor backfill) and never written back to records. */
+    decompositionLog?: CoreMessage[];
     /** In-memory only (NOT persisted — buildRecord omits it): monotone counter
      *  bumped by markDirty after every mutation. Keys the fork-revision cache
      *  below so status polling skips re-hashing the whole history (#2017). */
@@ -620,10 +667,50 @@ export function storeEffectiveConfig(session: Session, config: Config): void {
         if (typeof cloneSafe[key] === "function") delete cloneSafe[key];
     }
     session.metadata["effectiveConfig"] = cloneSafe;
+    // #2960⑥: identity of the config source this snapshot was resolved from.
+    // effectiveConfig() refuses the snapshot when the source has moved on
+    // (file edited, different BILI_CONFIG_FILE lane) — see the reader below.
+    session.metadata["effectiveConfigEpoch"] = configFileEpoch();
+}
+
+/** True when the session's effectiveConfig stamp was resolved from a config
+ *  source that no longer matches the live file (file edited since the last
+ *  wire request, or a different lane's file whose content diverged — the
+ *  epoch is a content hash, so byte-identical files validate across
+ *  instances). Stamps without an epoch predate the guard and keep the legacy
+ *  behavior (stamp wins). */
+function staleEffectiveStamp(session: Session | undefined): boolean {
+    const stamped = session?.metadata?.["effectiveConfigEpoch"];
+    return typeof stamped === "string" && stamped !== configFileEpoch();
+}
+
+/** Re-resolve the FILE tier of the config (compress.* incl. externalSummary at
+ *  the global level) onto `base` from the live file. Used when a stale stamp is
+ *  refused: the fallback (`deps.config` / opts.kernelConfig) is a bare default
+ *  Config without file settings, so returning it naked would drop every file
+ *  knob between the edit and the session's next wire request. Provider/model
+ *  cascade levels need the request URL and are deliberately NOT re-resolved
+ *  here — the next wire request re-stamps the full cascade. */
+function liveFileOverlayConfig(base: Config): Config {
+    const compress = loadConfigFile().compress;
+    if (!compress || !hasCompressSettings(compress)) return base;
+    const limit = resolveContextLimitValue(compress.modelContextLimit, base.modelContextLimit);
+    return applyCompressSettings(base, limit, compress, {});
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
     const stored = session?.metadata["effectiveConfig"];
+    // #2960⑥ stale-stamp guard: the snapshot was resolved from a config source
+    // that has since changed (edited file / foreign lane). Serving it would
+    // execute retired settings — the October externalSummary incident ran a
+    // user-disabled summary chain for days off one such stamp. Refuse the
+    // snapshot and resolve the live file tier onto the fallback instead.
+    if (staleEffectiveStamp(session)) {
+        const live = liveFileOverlayConfig(fallback);
+        const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
+        const classifier = lane ? durableMessageToolPaths[lane] : undefined;
+        return classifier && !live.messagePathOf ? withDurableProtection(live, classifier) : live;
+    }
     const base = stored && typeof stored === "object" ? { ...fallback, ...(stored as Partial<Config>) } : fallback;
     // #2446 follow-up (CI regression): the per-lane durable classifier is a
     // FUNCTION and must never be persisted into session.metadata — fork-adoption
@@ -635,6 +722,43 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const classifier = lane ? durableMessageToolPaths[lane] : undefined;
     return classifier && !base.messagePathOf ? withDurableProtection(base, classifier) : base;
+}
+
+// #4383: a positive usage-grade anchor below this share of the billing-caliber
+// estimate of the last main send (contextEstimateTokens) cannot describe the
+// payload this conversation actually carries — it measured a different,
+// smaller request under the same session id (title-gen/probe sidecar) or
+// predates a growth burst. 0.25 sits just inside the estimator's own error
+// band (uncalibrated chars/4 over-counts ASCII up to ~3.5× ⇒ a legitimate
+// same-payload sample lands ≈0.29× the estimate and survives; sidecar samples
+// are typically <10% and get caught), matching the k̂ clamp floor (0.25–4).
+const STALE_ANCHOR_RATIO = 0.25;
+
+/** #4383: stale-small usage-anchor guard shared by every input-baseline reader
+ *  (statusInputBaseline, effectiveTokenCount). Returns the replacement reading
+ *  — the calibrated local estimate itself (#1595's promised "ride local
+ *  estimates until a usage-grade sample lands" fallback) — when BOTH hold:
+ *   - `anchor` is below STALE_ANCHOR_RATIO × `stats.contextEstimateTokens`
+ *     (magnitude-inconsistent with what this conversation actually sends);
+ *   - `contextTokensSource === "estimate"`, i.e. a MAIN SEND has occurred
+ *     since the last settled usage report (the relay chokepoint stamps it per
+ *     send, settleUsageReport flips it back to "usage"). That freshness gate
+ *     is what separates a STALE sidecar sample (superseded by later larger
+ *     main sends) from a FRESH small one (the current send's own report,
+ *     which keeps its #1820 authority over the post-rebuild anchor).
+ *  One-directional by design: anchors ABOVE the estimate keep their #1839
+ *  precedence (fail-closed direction); only too-small poison is demoted.
+ *  Absent/non-positive estimate (legacy sessions, no main send yet) → null,
+ *  byte-identical legacy behavior. */
+export function staleSmallAnchorFallback(
+    stats: Pick<Session["stats"], "contextEstimateTokens" | "contextTokensSource">,
+    anchor: number,
+): number | null {
+    const est = stats.contextEstimateTokens;
+    return stats.contextTokensSource === "estimate"
+        && anchor > 0 && typeof est === "number" && Number.isFinite(est) && est > 0 && anchor < STALE_ANCHOR_RATIO * est
+        ? est
+        : null;
 }
 
 /** #2029: provenance-aware baseline for STATUS readers — acp_status nudge
@@ -658,12 +782,36 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
  * sentinel. Never clamps: a REAL over-window usage report must still read
  * >100%. The JSON observation contract (contextTokens/contextTokensSource,
  * #2017) is deliberately separate — it expresses unknown explicitly rather
- * than as 0. */
+ * than as 0. On top of that, BOTH #4383 guards apply: cycle-stale
+ * (usageAnchorCycleStale — see its header below) and stale-small
+ * (staleSmallAnchorFallback — an anchor below 25% of the billing-caliber
+ * local estimate AND superseded by a later main send measured a different
+ * request under the same session id). */
+/** #4383: a usage-grade anchor is CYCLE-STALE when the freshest per-send
+ *  evidence postdates the last settle: the relay send chokepoint re-stamps
+ *  contextTokens/contextTokensSource="estimate" on every main-lane send
+ *  (noteOutboundContextEstimates, cache-ledger.ts) and only a real usage
+ *  settle flips them back to "usage" (settleUsageReport). At decision time
+ *  (prepare runs before this cycle's send) contextTokensSource ===
+ *  "estimate" therefore proves the last completed cycle ended WITHOUT a
+ *  usage report — the anchor may be arbitrarily old (#4383: anchor frozen at
+ *  4733 while the outbound grew past 300K; nudge idle 154 consecutive turns,
+ *  zero folds over four hours). Requires a live per-send estimate, else there
+ *  is nothing fresher to ride and the anchor remains the last real
+ *  measurement. overflow-arm never qualifies: the arm is itself a per-send
+ *  measurement, window-bounded (#1839). */
+export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
+    if (stats.lastInputTokensSource !== "usage" || stats.contextTokensSource !== "estimate") return false;
+    return (stats.localInputEstimate ?? 0) > 0;
+}
+
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
-    return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
+    if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
+    const baseline = stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
         ? stats.lastInputTokens
         : stats.lastUsageGradeTokens ?? 0;
+    return staleSmallAnchorFallback(stats, baseline) ?? baseline;
 }
 
 /** #2117: the honest best reading of "how full is this context right now" for
@@ -709,54 +857,14 @@ export function displayContextBest(session: {
     return null;
 }
 
-/** Mirror of acp-kernel's resolveAdaptiveGrowth (not exported by the kernel):
- *  min(growthCap, max(growthFloor, round(modelContextLimit × growthRatio))).
- *  The per-request config stamped by storeEffectiveConfig is the same object
- *  the kernel decided with this turn, so the margin matches the kernel's own
- *  cadence exactly — including owner-flattened compress.nudgeGrowthTokens. */
-function nudgeGrowthInterval(config?: Config): number {
-    const c = config ?? defaultConfig(1);
-    return Math.min(c.nudge.growthCap, Math.max(c.nudge.growthFloor, Math.round(c.modelContextLimit * c.nudge.growthRatio)));
-}
-
-/** #1595: retire a stale-high kernel nudge reference when a REAL usage-grade
- *  sample lands far below it.
- *
- * The kernel's own downward re-anchor (nudgeNode) compares the incoming token
- * count against the BASELINE only, but its growth decision prefers
- * lastNudgeShownTokens whenever that is non-zero. When an estimate-grade
- * reading (armFailureShrink window feeding effectiveTokenCount's #1492
- * fall-through) pins lastNudgeShownTokens at a phantom-high level and real
- * usage then settles within one interval of the low baseline, the kernel never
- * self-resets and every later growth calculation runs against the phantom —
- * permanently negative, blocking the tier cadence until context regrows past
- * the phantom level or a compression resets the references.
- *
- * Called from every usage-grade settle site (plugin SSE pipes via
- * applyUsageSample, proxy streaming loops via recordUsage, non-streaming JSON)
- * AFTER lastInputTokens has been written from the real report. Fires only for
- * drops of more than one full growth interval below the current reference
- * (lastNudgeShownTokens, else baseline) — estimates never trigger it. On fire
- * it mirrors the kernel's drift-reset trio: baseline := real value,
- * lastNudgeShownTokens := 0, lastShownByTier := {} — so the next prepare
- * measures growth from reality with a full interval of cadence headroom. */
-export function reanchorNudgeOnUsageDrop(session: Session): void {
-    // Partial-session literals (test fixtures, pre-kernel shapes) may lack
-    // state/stats fields entirely — no-op rather than crash.
-    const nudge = session.state?.nudge;
-    const value = session.stats.lastInputTokens;
-    if (!nudge || typeof value !== "number" || value <= 0) return;
-    const ref = nudge.lastNudgeShownTokens > 0 ? nudge.lastNudgeShownTokens : nudge.lastPerMessageNudgeTokens;
-    if (ref <= 0) return;
-    const stored = session.metadata?.["effectiveConfig"];
-    const margin = nudgeGrowthInterval(stored && typeof stored === "object" ? (stored as Config) : undefined);
-    if (!(value < ref - margin)) return;
-    nudge.lastPerMessageNudgeTokens = value;
-    nudge.lastNudgeShownTokens = 0;
-    nudge.lastShownByTier = {};
-    markDirty(session);
-    loggerLog("info", `[${session.id}] nudge reference re-anchored ${ref} -> ${value} after usage-grade drop (margin ${margin}) — stale high reference retired (#1595)`);
-}
+/** #1595 (retired by #3674): the host-side nudge re-anchor used to retire a
+ *  stale-high kernel reference when a usage-grade sample landed a full growth
+ *  interval below it. The kernel's references are now LOW-WATER marks — both
+ *  lastPerMessageNudgeTokens and lastNudgeShownTokens ride down with every
+ *  observed sample — so the kernel self-corrects on the next reading at any
+ *  grade, and this host mirror is strictly subsumed. The #1595 regression
+ *  scenario (estimate-grade overshoot pinning the shown reference) lives on
+ *  as a kernel test. */
 
 /** #1595: name the third no-usage shape — an upstream SUCCESS that completes
  *  without reporting input usage. Transport failures and upstream 5xx already
@@ -825,6 +933,25 @@ const sessions = new Map<string, Session>();
 let MAX_SESSIONS = knobMaxSessions();
 let MAX_RESIDENT_BYTES = sessionResidentMaxBytes();
 const residentWeights = new WeakMap<Session, { revision: number; bytes: number }>();
+
+// #3918: last-known LIVE weight of evicted sessions, stamped at eviction time.
+// The live weight (transient message caches included) is only measurable while
+// the object is resident — a disk reload carries persisted state alone and
+// under-measures by exactly the mass that made the eviction necessary. The map
+// is advisory (it only shapes refusal wording), never load-bearing; bounded so
+// a long-lived process cannot accumulate unbounded entries.
+const evictedWeights = new Map<string, number>();
+const EVICTED_WEIGHT_CAP = 256;
+
+function stampEvictedWeight(id: string, bytes: number): void {
+    if (evictedWeights.has(id)) evictedWeights.delete(id);
+    evictedWeights.set(id, bytes);
+    while (evictedWeights.size > EVICTED_WEIGHT_CAP) {
+        const oldest = evictedWeights.keys().next().value;
+        if (oldest === undefined) break;
+        evictedWeights.delete(oldest);
+    }
+}
 
 /** Estimate retained objects without serializing a second giant copy. Include
  * originals and last-message caches; counting files alone misses both. */
@@ -926,6 +1053,42 @@ function residentBytes(): number {
     let bytes = 0;
     for (const session of sessions.values()) bytes += sessionWeight(session);
     return bytes;
+}
+
+/** #3918: can this session's message view survive BETWEEN model requests? The
+ * empty-view compress refusal (#3126) self-heals on the next model request ONLY
+ * when the reloaded session stays resident afterwards. When the session's
+ * last-known live weight plus the other residents exceeds the byte budget,
+ * every request cycle ends with it evicted again (releaseInFlight discharge)
+ * and the refusal repeats identically forever — the incident's 444 MiB image
+ * session ping-ponged against an 87.5 MiB peer under the 512 MiB default.
+ * Returns the measured pressure so the refusal receipt says so plainly instead
+ * of promising a heal that will not come. */
+interface ResidentPressure {
+    /** True when retrying cannot restore a usable view under the CURRENT pool state. */
+    permanent: boolean;
+    /** Last-known LIVE weight of this session (eviction-time measurement; falls
+     * back to its resident weight when it is resident now). Undefined = unknown. */
+    weightBytes?: number;
+    /** Resident bytes held by all OTHER sessions (this one excluded). */
+    otherBytes: number;
+    residentBytes: number;
+    budgetBytes: number;
+}
+
+export function residentPressure(id: string): ResidentPressure {
+    const resident = sessions.get(id);
+    const self = resident ? sessionWeight(resident) : 0;
+    const total = residentBytes();
+    const known = evictedWeights.get(id);
+    const weightBytes = known !== undefined ? Math.max(known, self) : resident ? self : undefined;
+    return {
+        permanent: weightBytes !== undefined && weightBytes + (total - self) > MAX_RESIDENT_BYTES,
+        weightBytes,
+        otherBytes: total - self,
+        residentBytes: total,
+        budgetBytes: MAX_RESIDENT_BYTES,
+    };
 }
 
 function makeResidentRoom(incoming = 0): void {
@@ -1245,6 +1408,11 @@ export function resetSessionCompression(session: Session): void {
     // longer bounds this session; drop it so the guard falls back to the
     // declared window instead of clamping to a stale ceiling.
     delete session.stats.overflowArmTokens;
+    // #3450: same boundary — the proven completion reservation described the
+    // pre-compaction payload lineage, and the rebuilt conversation re-arms the
+    // one-time mismatch warning.
+    delete session.stats.overflowArmCompletionReserve;
+    delete session.stats.overflowArmMismatchWarned;
     // #728: the pre-compaction outbound payload is gone — the old estimate
     // (measured against the pre-compaction wire) would read high and blind
     // the nudge fallback early; let the next prepare* re-measure.
@@ -1381,6 +1549,14 @@ export function applyCompactionArchive(
     }
 
     const { byRaw, byRef } = session.state.messageRefs;
+    // #4131: name what the prune costs — ref(s) about to be dropped that still
+    // sit under some block's coverage, so silent coverage loss is auditable.
+    const droppedIds = new Set(Object.keys(byRaw).filter((id) => id !== REF_FLOOR_RAW_ID && !liveRawIds.has(id)));
+    let coverageNote = "";
+    if (droppedIds.size > 0) {
+        const affectedBlocks = session.state.blocks.filter((b) => (b.effectiveMessageIds ?? []).some((id) => droppedIds.has(id))).map((b) => b.blockId);
+        coverageNote = `; ${droppedIds.size} ref(s) dropped${affectedBlocks.length > 0 ? `, covering block(s) ${affectedBlocks.join(", ")}` : ""}`;
+    }
     pruneRefsToLiveIds(session, liveRawIds, byRaw, byRef);
 
     session.metadata.compactionBoundary = {
@@ -1390,7 +1566,7 @@ export function applyCompactionArchive(
         archivedBlocks: deactivated,
     };
     markDirty(session);
-    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${liveRawIds.size} live raw id(s)`);
+    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${liveRawIds.size} live raw id(s)${coverageNote}`);
 }
 
 /** Prune the ref maps to `liveRawIds` in place (same maps, not new objects:
@@ -1413,11 +1589,25 @@ function pruneRefsToLiveIds(
     }
     if (highestBefore > highestUsedIndex({ byRaw: prunedByRaw, byRef: {} })) prunedByRaw[REF_FLOOR_RAW_ID] = indexToRef(highestBefore);
     const prunedByRef: Record<string, string> = {};
+    const droppedRefs: string[] = [];
     for (const [ref, rawId] of Object.entries(byRef)) {
         if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
+        else droppedRefs.push(ref);
     }
     session.state.messageRefs.byRaw = prunedByRaw;
     session.state.messageRefs.byRef = prunedByRef;
+    if (droppedRefs.length > 0) {
+        // #3302: tombstone the freed numbers so the kernel classifies a later
+        // citation as dead (snap-to-neighbor / honest "content gone") instead
+        // of unknown ("typo or wrong session") — the mislabel that sent models
+        // probing upward for a valid number after every native-compaction
+        // prune. I6 invariant: deadRefs stays unique and numerically sorted
+        // ascending; empty ⇒ undefined.
+        const merged = new Set(session.state.deadRefs ?? []);
+        for (const ref of droppedRefs) merged.add(ref);
+        const sorted = [...merged].sort((a, b) => Number(a.replace(/^m/, "")) - Number(b.replace(/^m/, "")));
+        session.state.deadRefs = sorted.length > 0 ? sorted : undefined;
+    }
 }
 
 /** #2695: remove fold blocks whose covered substrate the client demonstrably
@@ -1488,12 +1678,19 @@ interface RewriteDetection {
     knownBefore: number;
     incomingTotal: number;
     knownIncoming: number;
+    /** #4131: the ratio collapse was explained by this pass's fold-reconcile
+     *  finding EVERY covered id on the wire (present or re-anchored, zero
+     *  unmatched) — bili's own sanctioned id churn across builds (#3642 D1),
+     *  not a client rewrite. The destructive boundary is suppressed and
+     *  callers record an adoption event instead of marking one. */
+    churnExplained: boolean;
 }
 
 export function detectUnannouncedHistoryRewrite(
     session: Session,
     knownRefsBefore: ReadonlySet<string>,
     liveRawIds: Iterable<string>,
+    reconcile?: Pick<FoldReconcileResult, "kind" | "unmatched"> | null,
 ): RewriteDetection {
     const knownBefore = knownRefsBefore.size - (knownRefsBefore.has(REF_FLOOR_RAW_ID) ? 1 : 0);
     let incomingTotal = 0;
@@ -1502,14 +1699,28 @@ export function detectUnannouncedHistoryRewrite(
         incomingTotal++;
         if (knownRefsBefore.has(id)) knownIncoming++;
     }
-    const detected =
+    const rawDetected =
         knownBefore >= REWRITE_MIN_KNOWN_REFS &&
         session.state.blocks.length > 0 &&
         incomingTotal >= REWRITE_MIN_INCOMING_TOTAL &&
         knownIncoming > 0 &&
         knownIncoming / incomingTotal < REWRITE_MAX_KNOWN_RATIO &&
         knownIncoming / knownBefore < REWRITE_MAX_KNOWN_RATIO;
-    return { detected, knownBefore, incomingTotal, knownIncoming };
+    // #4131: order-centric doctrine — no single dimension may veto the
+    // multi-evidence verdict. When this pass's fold-reconcile found EVERY
+    // covered id on the wire (kind reanchored/resend, unmatched === 0), the
+    // hash-identity collapse is explained churn: bili's own cross-build id
+    // re-mint (#3642 D1 accepted exactly this once-per-upgrade mass churn,
+    // promising the reconcile ladder would absorb it). Marking the destructive
+    // compaction boundary here instead tombstones hundreds of still-cited
+    // refs (#4131 incident). Off/noop verdicts (reconcile disabled, side-request
+    // skip) carry no evidence either way → legacy behavior unchanged; partial
+    // claims (unmatched > 0) keep the legacy escalation path.
+    const churnExplained = rawDetected
+        && reconcile !== undefined && reconcile !== null
+        && (reconcile.kind === "reanchored" || reconcile.kind === "resend")
+        && reconcile.unmatched === 0;
+    return { detected: rawDetected && !churnExplained, knownBefore, incomingTotal, knownIncoming, churnExplained };
 }
 
 /** #1195: message ids are content hashes — if a client resends history whose
@@ -1535,42 +1746,11 @@ export function foldCoverage(
     return matched < coveredBefore.size ? { expected: coveredBefore.size, matched } : null;
 }
 
-/** #2627: bili-synthesized Responses turn separators (repairResponsesAssistantOrdering,
- *  src/server.ts) are OUTBOUND-ONLY ordering markers — no client's resent history
- *  ever contains them, so they can never anchor or be covered. When a
- *  separator-bearing view reached applyCompression (the plugin lane handed its
- *  processed view straight in), their ids were registered into new blocks'
- *  direct/effectiveMessageIds and inherited by higher folds via child merge —
- *  permanently "missing" on every reconcile pass: false [acp-drift]/fold-
- *  reconcile warns and stalled per-block ledger evidence against an unchanged
- *  history. They are protocol-ordering artifacts, not compressible raw history:
- *  exclude them everywhere coverage is stored or compared. */
-export const RESPONSES_TURN_SEPARATOR_ID_PREFIX = "acp_turn_sep_";
-
-export function isResponsesTurnSeparatorId(id: string): boolean {
-    return id.startsWith(RESPONSES_TURN_SEPARATOR_ID_PREFIX);
-}
-
-/** #2627: strip turn-separator ids from block coverage IN PLACE (load-time heal
- *  of persisted state + post-commit scrub). Returns how many ids were removed;
- *  0 means the state was already clean. */
-export function scrubTurnSeparatorIds(
-    blocks: ReadonlyArray<{ directMessageIds?: string[]; effectiveMessageIds?: string[] }>,
-): number {
-    let removed = 0;
-    for (const block of blocks) {
-        for (const key of ["directMessageIds", "effectiveMessageIds"] as const) {
-            const ids = block[key];
-            if (!ids) continue;
-            const kept = ids.filter((id) => !isResponsesTurnSeparatorId(id));
-            if (kept.length !== ids.length) {
-                removed += ids.length - kept.length;
-                block[key] = kept;
-            }
-        }
-    }
-    return removed;
-}
+// #2627 turn-separator helpers moved to ./turn-separator.ts (zero-dependency leaf
+// — the storage seam needs them without session.ts's built-acp-kernel import;
+// the doc comments live there now). Re-exported so existing consumers keep the
+// session.js import path.
+export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds } from "./turn-separator.js";
 
 /** #2627: the REAL-history coverage set — active blocks' effective ids minus
  *  outbound-only turn separators. Single source for every drift consumer (the
@@ -1613,6 +1793,7 @@ function evictOldest(): boolean {
         return false;
     }
     sessions.delete(oldestId);
+    stampEvictedWeight(oldestId, sessionWeight(s));
     // #3126: eviction is the trigger for the empty-view compress window (the
     // session's message bytes live only here; state reloads from disk but the
     // view self-heals only on the next model request). Log it so operators can
@@ -1636,6 +1817,7 @@ export function _resetSessionsForTest(max?: number, maxBytes?: number): void {
         if (s.inFlight > 0) s.inFlight = 0;
     }
     sessions.clear();
+    evictedWeights.clear();
 }
 
 export function _sessionsSizeForTest(): number {

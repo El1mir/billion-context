@@ -1,5 +1,5 @@
-import { orderedRefPair } from "acp-kernel";
-import { listSessions, displayContextBest, type ContextBest, type Session } from "../session.js";
+import { defaultCountTokens, orderedRefPair } from "acp-kernel";
+import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../persist.js";
@@ -7,6 +7,7 @@ import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
+import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
@@ -39,6 +40,9 @@ interface WebSessionSummary {
     /** #1839: provenance of contextTokens — "usage" = last real usage report,
      *  "estimate" = bounded local estimate (display should mark it as such). */
     contextTokensSource?: "usage" | "estimate";
+    /** #3756 follow-up: snapshot-render shadow counters (view computed, never
+     *  emitted). Present only for sessions with at least one armed turn. */
+    snapshotShadow?: { turns: number; errors: number; lastClass: "watch" | "degraded" | "error"; lastReason?: string };
     /** #2117: the honest best reading of "how full is this context right now",
      *  picked by provenance (usage > calibrated estimate > char-count upper
      *  bound). Display surfaces drive their main bar from this so one value
@@ -102,6 +106,9 @@ interface WebSessionSummary {
     /** #2202: Σ (S−σ)×requestsAfter over coverage-lost folds — the part of
      *  grossSaved that is frozen rather than accruing. */
     coverageLostFrozenTokens?: number;
+    /** #3376: idle prompt-cache keepalive snapshot state — live sessions only
+     *  (the snapshot lives in memory and dies with the process). */
+    keepalive?: KeepaliveStatus;
 }
 
 interface WebOverview {
@@ -155,6 +162,12 @@ interface WebSessionDetail extends WebSessionSummary {
     retrieveMisses: number;
     storedBytes: number;
     storeBytesSaved: number;
+    /** #3671 direction 4: decompress usage — whole-block restores, how many of
+     *  those had a cheaper precise path available at restore time (#1336), and
+     *  range restores. Lets a human judge what the retained originals are worth. */
+    wholeBlockRestores: number;
+    wholeBlockRestoresPreciseAvailable: number;
+    rangeRestores: number;
     activePack?: string;
     /** Which client produced this session (plugin agent name or header/UA hint). */
     clientHint?: string;
@@ -208,6 +221,29 @@ interface WebSessionDetail extends WebSessionSummary {
         /** Present when the block's summary was written by the external
          *  summary chain — the web block badge mirrors /acp's "⚡ext". */
         external?: true;
+        /** #3917: blockId of the tier-above block that folded THIS one in
+         *  (`CompressionBlock.directBlockIds` inverted). Absent = tree root.
+         *  The 压缩结构 tab rebuilds the tier tree from these edges. */
+        parentBlockId?: string;
+        /** #3917: blocks this one absorbed when it was created (T2 covers T1s,
+         *  T3 covers T2s …); kept verbatim so the tree never has to infer. */
+        directBlockIds: string[];
+        /** #3917: Σ messages covered by this block AND its children — the
+         *  "N 条消息" the tree line shows. */
+        effectiveMessageCount: number;
+        /** #3917: messages this block folded directly (not through children). */
+        directMessageCount: number;
+        /** #3917: direct messages resolved to their mNNNNN refs (unresolvable
+         *  raw ids are omitted; `directMessageCount` still counts them). */
+        directMessageRefs: string[];
+        /** #3917: the block's direct messages as tree leaves — ref, role and a
+         *  short preview only; the full text stays behind the lazy endpoint.
+         *  `missing` marks a ref whose bytes are no longer stored (host prune). */
+        directMessages: Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }>;
+        /** #3917: summary size on the wire — tokens (same estimator the kernel
+         *  status uses) and UTF-8 bytes, so the tree can show size + ratio. */
+        summaryTokens: number;
+        summaryBytes: number;
     }>;
 }
 
@@ -625,6 +661,10 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // covered ids are now entirely off the wire. Live state: self-heals when
     // the host resends the originals again.
     const covAll = s.metadata[METADATA_FOLD_COVERAGE] as Record<string, { p?: number; r?: number; t?: number; e?: 1 }> | undefined;
+    // #3756 follow-up: snapshot-render shadow counters (view computed, never
+    // emitted) — surfaced on the list row so the panel can watch the render
+    // engine's health across the fleet before the rollout flip.
+    const shadowBlob = s.metadata["snapshotShadow"] as { turns?: number; errors?: number; lastClass?: string; lastReason?: string } | undefined;
     const agg = led;
     const requests = Math.max(s.stats.requests ?? 0, agg?.agg?.requests ?? 0);
     const inputTokens = Math.max(s.stats.inputTokens ?? 0, agg?.agg?.input ?? 0);
@@ -688,6 +728,8 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
+    // #3376: idle cache-keepalive state — memory-only, so live rows only.
+    const keepalive = live ? keepaliveStatusFor(s.id) : undefined;
     const best = displayContextBest(s);
     return {
         id: s.id,
@@ -700,6 +742,9 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(s.meta.label && s.meta.label !== s.id ? { label: s.meta.label } : {}),
         ...(s.meta.protocol ? { protocol: s.meta.protocol } : {}),
         ...(s.meta.upstreamOrigin ? { upstreamOrigin: s.meta.upstreamOrigin } : {}),
+        ...(shadowBlob && (shadowBlob.turns ?? 0) > 0
+            ? { snapshotShadow: { turns: shadowBlob.turns as number, errors: shadowBlob.errors ?? 0, lastClass: (shadowBlob.lastClass as "watch" | "degraded" | "error") ?? "watch", ...(shadowBlob.lastReason ? { lastReason: shadowBlob.lastReason } : {}) } }
+            : {}),
         live,
         requests,
         contextTokens: s.stats.contextTokens,
@@ -713,6 +758,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
         ...(selfHeal ? { selfHeal } : {}),
         ...(autoModeForge ? { autoModeForge } : {}),
+        ...(keepalive ? { keepalive } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
@@ -780,11 +826,23 @@ export async function buildSessionList(): Promise<WebSessionSummary[]> {
     return vis;
 }
 
-interface SessionPageQuery { q?: string; page?: number; pageSize: number }
+type SessionPageState = "live" | "history";
+
+interface SessionPageQuery {
+    q?: string;
+    protocol?: string;
+    client?: string;
+    state?: SessionPageState;
+    page?: number;
+    pageSize: number;
+}
 
 interface SessionPageResult {
     sessions: WebSessionSummary[];
     total: number;
+    unfilteredTotal: number;
+    protocols: string[];
+    clients: string[];
     page: number;
     pageSize: number;
 }
@@ -798,17 +856,36 @@ export async function buildSessionPage(query: SessionPageQuery): Promise<Session
     const all = await mergedSummaries();
     const vis = all.filter((s) => !isEmptyStub(s));
     lastHiddenEmpty = all.length - vis.length;
+    const unfilteredTotal = vis.length;
     const q = (query.q ?? "").trim().toLowerCase();
-    const filtered = q
-        ? vis.filter((s) =>
-            (s.title ?? "").toLowerCase().includes(q) ||
-            (s.label ?? "").toLowerCase().includes(q) ||
-            s.id.toLowerCase().includes(q))
-        : vis;
+    const protocol = (query.protocol ?? "").trim().toLowerCase();
+    const client = (query.client ?? "").trim().toLowerCase();
+    const filtered = vis.filter((s) => {
+        if (q) {
+            const hit =
+                (s.title ?? "").toLowerCase().includes(q) ||
+                (s.label ?? "").toLowerCase().includes(q) ||
+                s.id.toLowerCase().includes(q);
+            if (!hit) return false;
+        }
+        if (protocol && (s.protocol ?? "unknown").toLowerCase() !== protocol) return false;
+        if (client && (s.clientHint ?? "").toLowerCase() !== client) return false;
+        if (query.state === "live" && (!s.live || s.restored)) return false;
+        if (query.state === "history" && s.live && !s.restored) return false;
+        return true;
+    });
     const total = filtered.length;
     const pageSize = Math.min(Math.max(1, Math.floor(query.pageSize)), 200);
     const page = Math.max(1, Math.floor(query.page ?? 1));
-    return { sessions: filtered.slice((page - 1) * pageSize, page * pageSize), total, page, pageSize };
+    return {
+        sessions: filtered.slice((page - 1) * pageSize, page * pageSize),
+        total,
+        unfilteredTotal,
+        protocols: [...new Set(vis.map((s) => s.protocol ?? "unknown"))].sort((a, b) => a.localeCompare(b)),
+        clients: [...new Set(vis.flatMap((s) => s.clientHint ? [s.clientHint] : []))].sort((a, b) => a.localeCompare(b)),
+        page,
+        pageSize,
+    };
 }
 
 /** Aggregate stats across ALL known sessions (live + disk) — the "how many
@@ -914,39 +991,86 @@ export async function buildOverview(): Promise<WebOverview> {
 
 const detailInFlight = new Map<string, Promise<WebSessionDetail | null>>();
 
+/** #2960 R2.2: unified-first — loadSync resolves the index row even when the
+ *  legacy file is gone; otherwise fall through to the decoded disk-index file.
+ *  Returns null when the id is unknown. Never creates sessions — lookups go
+ *  through listSessions() + ONE decoded disk file (#1937: the old path scanned
+ *  the entire directory for a single id). */
+async function loadSessionById(id: string): Promise<{ session: Session; live: boolean } | null> {
+    const live = listSessions().find((s) => s.id === id);
+    if (live) return { session: live, live: true };
+    const synced = getDiskStore().loadSync(id);
+    if (synced) return { session: synced, live: false };
+    const files = await ensureIndex();
+    const abs = byId?.get(id);
+    if (abs && files.has(abs)) {
+        detailDecodes++;
+        const decoded = await getDiskStore().loadSessionFromFile(abs, id);
+        if (decoded) return { session: decoded, live: false };
+    }
+    return null;
+}
+
 /** Full detail for one session: stats + compression blocks + the per-request
  *  cache ledger (trajectory-chart source) + rendered handoff document.
- *  Returns null when the id is unknown (→ 404). Never creates sessions —
- *  lookups go through listSessions() + ONE decoded disk file (#1937: the old
- *  path scanned the entire directory for a single id). Concurrent requests
- *  for the same id share one decode. */
+ *  Returns null when the id is unknown (→ 404). Concurrent requests for the
+ *  same id share one decode. */
 export function buildSessionDetail(id: string): Promise<WebSessionDetail | null> {
     const existing = detailInFlight.get(id);
     if (existing) return existing;
     const run = (async (): Promise<WebSessionDetail | null> => {
-        const live = listSessions().find((s) => s.id === id);
-        let session: Session | undefined = live;
-        if (!session) {
-            // #2960 R2.2: unified-first — in full mode loadSync resolves the
-            // index row even when the legacy file is gone; in legacy/shadow it
-            // composes an origin-less path and misses, falling through to the
-            // disk-index file below.
-            session = getDiskStore().loadSync(id) ?? undefined;
-        }
-        if (!session) {
-            const files = await ensureIndex();
-            const abs = byId?.get(id);
-            if (abs && files.has(abs)) {
-                detailDecodes++;
-                session = (await getDiskStore().loadSessionFromFile(abs, id)) ?? undefined;
-            }
-        }
-        if (!session) return null;
-        return renderDetail(session, !!live);
+        const found = await loadSessionById(id);
+        if (!found) return null;
+        return renderDetail(found.session, found.live);
     })();
     const done = run.finally(() => detailInFlight.delete(id));
     detailInFlight.set(id, done);
     return done;
+}
+
+// #4173 (live tree thumbnail): the compact edge feed behind GET /sessions/<id>/tree.
+// Block id, tier, activity and fold edges ONLY — no summaries, tokens or refs:
+// a 180-block session ships ~6KB so the web UI can re-poll every 5s while a live
+// compression run redraws the page-head minimap.
+export interface WebSessionTreeNode {
+    blockId: string;
+    tier: number;
+    active: boolean;
+    // #4173 review: the covered message span (canonicalized ascending) so the
+    // live tree-map nodes can label "mXXXX–mYYYY" without shipping summaries.
+    startRef?: string;
+    endRef?: string;
+    parentBlockId?: string;
+    directBlockIds: string[];
+}
+
+const TREE_MAX_BLOCKS = 5000;
+
+export async function buildSessionTree(id: string): Promise<{ blocks: WebSessionTreeNode[] } | null> {
+    const found = await loadSessionById(id);
+    if (!found) return null;
+    // Same first-parent-wins inversion as renderDetail's parentBlockIdOf.
+    const parentOf = new Map<string, string>();
+    for (const b of found.session.state.blocks) {
+        for (const childId of b.directBlockIds || []) {
+            if (!parentOf.has(childId)) parentOf.set(childId, b.blockId);
+        }
+    }
+    const blocks: WebSessionTreeNode[] = found.session.state.blocks.slice(0, TREE_MAX_BLOCKS).map((b) => {
+        const span =
+            b.startRef !== undefined && b.endRef !== undefined
+                ? orderedRefPair(b.startRef, b.endRef)
+                : null;
+        return {
+            blockId: b.blockId,
+            tier: b.tier,
+            active: b.active !== false,
+            ...(span ? { startRef: span[0], endRef: span[1] } : {}),
+            ...(parentOf.get(b.blockId) !== undefined ? { parentBlockId: parentOf.get(b.blockId)! } : {}),
+            directBlockIds: (b.directBlockIds || []).slice(),
+        };
+    });
+    return { blocks };
 }
 
 function renderDetail(session: Session, live: boolean): WebSessionDetail {
@@ -978,6 +1102,54 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     const conflicts = conflictEventsOf(session).filter((e) => !(e.kind === "third-party-plugin" && (isSiblingConflictDetail(e.detail) || isDisplayOnlyConflictDetail(e.detail))));
     const conflictClient = conflicts.length > 0 ? conflictClientOf(session) : undefined;
 
+    // #3917: tier-tree edges. `directBlockIds` is the child list; the tree needs
+    // the inverse to know which blocks are roots. First parent wins (the kernel
+    // never lets two blocks fold the same child).
+    const parentBlockIdOf = new Map<string, string>();
+    for (const b of session.state.blocks) {
+        for (const childId of b.directBlockIds || []) {
+            if (!parentBlockIdOf.has(childId)) parentBlockIdOf.set(childId, b.blockId);
+        }
+    }
+    const byRaw = session.state.messageRefs.byRaw;
+    const refsOf = (rawIds: string[]): string[] => {
+        const out: string[] = [];
+        for (const raw of rawIds) {
+            const ref = byRaw[raw];
+            if (typeof ref === "string" && ref.length > 0) out.push(ref);
+        }
+        return out;
+    };
+    // #3917: message leaves. `lastMessages` is the newest full request the
+    // client sent (folded messages included — a client never drops them because
+    // of OUR folding), so the tree can name every message a block folded — ref,
+    // role, preview — without shipping a byte of full text. A raw id with no
+    // resident message (host-pruned / archived-only session) simply has no leaf;
+    // `directMessageCount` still tells the UI how many were folded.
+    const messageById = new Map((session.lastMessages || []).map((m) => [m.id, m]));
+    const messageLeaves = (rawIds: string[]): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
+        const out: Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> = [];
+        for (const raw of rawIds) {
+            const ref = byRaw[raw];
+            if (typeof ref !== "string" || ref.length === 0) continue;
+            const msg = messageById.get(raw);
+            // #3917: a folded message whose bytes are gone from the store still
+            // gets a row — the ref is the identity the user asked for — but it
+            // carries no preview and the UI says so instead of inventing text.
+            if (!msg) {
+                out.push({ ref, missing: true });
+                continue;
+            }
+            out.push({
+                ref,
+                role: msg.role,
+                ...(msg.toolName !== undefined ? { toolName: msg.toolName } : {}),
+                preview: messagePreview(msg.text ?? ""),
+            });
+        }
+        return out;
+    };
+
     return {
         ...summaryOf(session, live),
         lastInputTokens: session.stats.lastInputTokens,
@@ -987,10 +1159,22 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         retrieveMisses: session.stats.retrieveMisses,
         storedBytes: session.stats.storedBytes,
         storeBytesSaved: session.stats.storeBytesSaved,
+        wholeBlockRestores: session.stats.wholeBlockRestores ?? 0,
+        wholeBlockRestoresPreciseAvailable: session.stats.wholeBlockRestoresPreciseAvailable ?? 0,
+        rangeRestores: session.stats.rangeRestores,
         ...(session.meta.activePack ? { activePack: session.meta.activePack } : {}),
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
         ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
+        // #3756 follow-up: snapshot-render shadow observability (compute the
+        // view, never emit it) — surfaced so the panel can prove the render
+        // engine healthy across the fleet before the rollout flip.
+        ...(() => {
+            const b = session.metadata["snapshotShadow"] as { turns?: number; errors?: number; lastClass?: string; lastReason?: string } | undefined;
+            return b && typeof b.turns === "number" && b.turns > 0
+                ? { snapshotShadow: { turns: b.turns, errors: b.errors ?? 0, lastClass: (b.lastClass as "watch" | "degraded" | "error") ?? "watch", ...(b.lastReason ? { lastReason: b.lastReason } : {}) } }
+                : {};
+        })(),
         // #2904: no-ceiling output-budget degraded state (written by restoreOutputBudget).
         ...(typeof (session.metadata["outputBudgetDegraded"] as { model?: unknown } | undefined)?.model === "string"
             ? { outputBudgetDegraded: session.metadata["outputBudgetDegraded"] as { model: string; value: number; ts: number } }
@@ -1037,7 +1221,168 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
                 ...(span === null && b.endRef !== undefined ? { endRef: b.endRef } : {}),
                 active: b.active,
                 ...(isExternalSummaryBlock(b) ? { external: true } : {}),
+                ...(parentBlockIdOf.get(b.blockId) !== undefined ? { parentBlockId: parentBlockIdOf.get(b.blockId) } : {}),
+                directBlockIds: (b.directBlockIds || []).slice(),
+                effectiveMessageCount: (b.effectiveMessageIds || []).length,
+                directMessageCount: (b.directMessageIds || []).length,
+                directMessageRefs: refsOf(b.directMessageIds || []),
+                directMessages: messageLeaves(b.directMessageIds || []),
+                summaryTokens: defaultCountTokens(b.summary),
+                summaryBytes: utf8Bytes(b.summary),
             };
         }),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// #3917 lazy block content — the 压缩结构 tree fetches ONE block at a time
+// ---------------------------------------------------------------------------
+
+export type BlockContentView = "one" | "full";
+
+export type BlockContentLookup =
+    | { ok: true; blockId: string; view: BlockContentView; count: number; bytes: number; totalBytes: number; truncated: boolean; text: string }
+    | { ok: false; reason: "unknown-session" | "unknown-block" | "no-content-snapshot" };
+
+/** Cap on a single block's returned text: the tree renders original messages in
+ *  a <pre>, and a huge block would freeze the browser + bloat the response. The
+ *  full size is always reported via `totalBytes` so the UI can say "truncated". */
+const BLOCK_CONTENT_MAX_BYTES = 2 * 1024 * 1024;
+
+/** #3917: one-line preview for a message leaf — whitespace collapsed so a
+ *  multi-line tool output still fits the tree row. */
+const MESSAGE_PREVIEW_CHARS = 110;
+
+function messagePreview(text: string): string {
+    const flat = text.replace(/\s+/g, " ").trim();
+    const chars = Array.from(flat);
+    return chars.length > MESSAGE_PREVIEW_CHARS ? chars.slice(0, MESSAGE_PREVIEW_CHARS).join("") + "…" : flat;
+}
+
+function utf8Bytes(s: string): number {
+    return Buffer.byteLength(s, "utf8");
+}
+
+/** Largest prefix of `s` whose UTF-8 encoding fits in `maxBytes`, never cutting
+ *  a surrogate pair in half (a lone surrogate would surface as U+FFFD). */
+function sliceUtf8(s: string, maxBytes: number): string {
+    let lo = 0;
+    let hi = s.length;
+    while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (utf8Bytes(s.slice(0, mid)) > maxBytes) hi = mid - 1;
+        else lo = mid;
+    }
+    let end = lo;
+    if (end > 0 && end < s.length) {
+        const code = s.charCodeAt(end - 1);
+        if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+    }
+    return s.slice(0, end);
+}
+
+/** #3917: short-lived decode cache — the tree issues one request per block the
+ *  user opens, and every request would otherwise re-decode the whole session
+ *  file AND re-materialize its block contents (the expensive part). Keyed by
+ *  session id with a small TTL: the panel is read-only diagnostics, so a
+ *  sub-minute stale snapshot is acceptable, and the entry disappears on its
+ *  own. Bounded at 2 entries so resident memory stays flat. */
+const contentCache = new Map<string, { at: number; session: Session }>();
+const CONTENT_CACHE_MS = 60_000;
+const CONTENT_CACHE_MAX = 2;
+
+async function sessionForContent(id: string): Promise<Session | null> {
+    const hit = contentCache.get(id);
+    if (hit && Date.now() - hit.at <= CONTENT_CACHE_MS) return hit.session;
+    const loaded = await loadSessionById(id);
+    if (!loaded) return null;
+    cachedSession(id, loaded.session);
+    return loaded.session;
+}
+
+function cachedSession(id: string, session: Session): void {
+    const now = Date.now();
+    for (const [key, entry] of contentCache) {
+        if (now - entry.at > CONTENT_CACHE_MS) contentCache.delete(key);
+    }
+    while (contentCache.size >= CONTENT_CACHE_MAX) {
+        const oldest = contentCache.keys().next();
+        if (oldest.done) break;
+        contentCache.delete(oldest.value);
+    }
+    contentCache.set(id, { at: now, session });
+}
+
+/** #3917: one block's frozen original text, exactly as the compressor saw it.
+ *  `one` = the block's direct messages in full plus its children's summaries
+ *  (the one-tier-up view `collectBlockContent` builds); `full` = EVERY message
+ *  the block covers, children included. Both come from the snapshot cached on
+ *  the session at compression time (#401), so they survive later pruning of the
+ *  live message list. Missing snapshot → `no-content-snapshot` (the UI says so;
+ *  it never fabricates a view from whatever messages happen to remain). */
+export async function buildBlockContent(id: string, blockId: string, view: BlockContentView): Promise<BlockContentLookup> {
+    const session = await sessionForContent(id);
+    if (!session) return { ok: false, reason: "unknown-session" };
+    const block = session.state.blocks.find((b) => b.blockId === blockId);
+    if (!block) return { ok: false, reason: "unknown-block" };
+    let content: BlockContent | undefined;
+    try {
+        content = session.blockContents.get(blockId);
+    } catch (error) {
+        // #3917: a corrupt/unreadable content store must not 500 the panel —
+        // report it as "no snapshot" and let the UI explain.
+        log("warn", `[acp-web] block content read failed for ${id}/${blockId}: ${String(error)}`);
+        content = undefined;
+    }
+    const picked = content ? (view === "one" ? (content.one ?? content.full) : content.full) : null;
+    if (!picked) return { ok: false, reason: "no-content-snapshot" };
+    const totalBytes = utf8Bytes(picked.text);
+    const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;
+    return {
+        ok: true,
+        blockId,
+        view,
+        count: picked.count,
+        bytes: truncated ? BLOCK_CONTENT_MAX_BYTES : totalBytes,
+        totalBytes,
+        truncated,
+        text: truncated ? sliceUtf8(picked.text, BLOCK_CONTENT_MAX_BYTES) : picked.text,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// #3917 single-message leaves — the tier tree lists the mNNNNN messages a block
+// folded; their bytes load one click at a time, so a 3000-message session never
+// ships its transcript to the browser just to draw the tree.
+// ---------------------------------------------------------------------------
+
+export type MessageContentLookup =
+    | { ok: true; ref: string; role: string; toolName?: string; bytes: number; totalBytes: number; truncated: boolean; text: string }
+    | { ok: false; reason: "unknown-session" | "unknown-message" };
+
+/** #3917: ONE message's text, addressed by its ref. Resolves the ref to its raw
+ *  id and reads the message out of the newest request snapshot (`lastMessages`),
+ *  which still carries the messages this proxy folded — folding only changes the
+ *  OUTBOUND projection, never what the client keeps sending. A ref whose message
+ *  is gone (host-side native compaction pruning) reports `unknown-message`
+ *  instead of guessing. */
+export async function buildMessageContent(id: string, ref: string): Promise<MessageContentLookup> {
+    const session = await sessionForContent(id);
+    if (!session) return { ok: false, reason: "unknown-session" };
+    const raw = session.state.messageRefs.byRef[ref];
+    const msg = typeof raw === "string" ? (session.lastMessages || []).find((m) => m.id === raw) : undefined;
+    if (!msg) return { ok: false, reason: "unknown-message" };
+    const text = msg.text ?? "";
+    const totalBytes = utf8Bytes(text);
+    const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;
+    return {
+        ok: true,
+        ref,
+        role: msg.role,
+        ...(msg.toolName !== undefined ? { toolName: msg.toolName } : {}),
+        bytes: truncated ? BLOCK_CONTENT_MAX_BYTES : totalBytes,
+        totalBytes,
+        truncated,
+        text: truncated ? sliceUtf8(text, BLOCK_CONTENT_MAX_BYTES) : text,
     };
 }

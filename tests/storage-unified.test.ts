@@ -9,6 +9,7 @@ import type { Session } from "../src/session.ts";
 import type { CoreMessage, CompressionBlock } from "acp-kernel";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { restampRefsToLedger } from "acp-kernel";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
 import { resolveStorageWalJournalSizeLimit } from "../src/knobs.ts";
@@ -40,7 +41,8 @@ process.env.BILI_CONFIG_FILE = path.join(
     fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-hermetic-")),
     "no-config.json",
 );
-// Absent everywhere now resolves to the shadow DEFAULT (the #2815 rollout
+// Absent everywhere now resolves to the full DEFAULT (the #3818 flip; before that
+// the #2815 rollout
 // flip), but this suite loads the REPO corpus IN PLACE (loadCase) and asserts
 // index.db presence/absence per test — an implicit shadow sidecar would
 // pollute the golden corpus dirs. Pin the env tier to an explicit legacy
@@ -81,12 +83,20 @@ function loadCase(name: string): Session {
 
 /** Same digest shape as the corpus manifest (see scripts/update-storage-corpus.ts). */
 function sessionDigest(view: ReturnType<typeof loadLegacyView>): string {
+    // #4316 PR3/3: cold-load alignment sets refLedgerAligned on the served
+    // state — a marker, not view content. The parity digest strips it (the
+    // manifest predates the flag); any REAL renumbering still moves byRaw and
+    // stays pinned (the corpus cases keep their counter refs — only a state
+    // whose rows exist gets aligned, and the corpus regen writes files without
+    // a live store session).
+    const state = { ...(view.state as Record<string, unknown>) };
+    delete state.refLedgerAligned;
     return sha256(JSON.stringify(canonicalize({
         id: view.id,
         meta: view.meta,
         stats: view.stats,
         metadata: view.metadata,
-        state: view.state,
+        state,
         blockContents: [...view.blockContents.entries()],
         lastMessages: view.lastMessages,
         lastMessagesFolded: view.lastMessagesFolded,
@@ -333,8 +343,8 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
 
 test("resolveStorageMode maps every env spelling", () => {
     const cases: Array<[string | undefined, string]> = [
-        [undefined, "shadow"], // absent everywhere: the dry-run sidecar default
-        ["", "shadow"],
+        [undefined, "full"], // absent everywhere: the full default (#3818 flip)
+        ["", "full"],
         ["0", "legacy"],
         ["false", "legacy"],
         ["legacy", "legacy"],
@@ -354,8 +364,8 @@ test("resolveStorageMode maps every env spelling", () => {
 
 test("resolveStorageMode file tier: storage.unified applies when the env is absent, loses to it otherwise (#2671)", () => {
     const fileCases: Array<[string | undefined, string]> = [
-        [undefined, "shadow"], // absent everywhere: the dry-run sidecar default
-        ["", "shadow"],
+        [undefined, "full"], // absent everywhere: the full default (#3818 flip)
+        ["", "full"],
         ["legacy", "legacy"],
         ["shadow", "shadow"],
         ["full", "full"],
@@ -396,6 +406,41 @@ test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file t
     assert.equal(resolveStorageWalJournalSizeLimit({}, 2097152), 2097152, "file tier applies when the env is absent");
 });
 
+/** #4316 PR3/3 parity oracle: the expected digest for a FULL-mode load is
+ *  the LEGACY-mode view of the same files plus the deterministic one-time
+ *  ledger alignment (same seqByRaw the full-mode load aligned against). The
+ *  corpus manifest keeps pinning the PURE view (storage-corpus suite); this
+ *  oracle pins the equivalence "full serve = legacy serve + alignment". */
+function alignedLegacyDigest(caseDir: string, meta: { protocol: string; id: string }, seqByRawId: Map<string, number>): string {
+    const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-legacy-oracle-"));
+    try {
+        fs.cpSync(caseDir, path.join(legacyDir, "case"), { recursive: true });
+        // Remove any unified sidecar so the legacy store serves the files.
+        for (const f of fs.readdirSync(path.join(legacyDir, "case"))) {
+            if (f.startsWith("index.db") || f.endsWith(".lock")) fs.rmSync(path.join(path.join(legacyDir, "case"), f), { force: true });
+        }
+        const prev = process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
+        let store: InstanceType<typeof SessionStore> | null = null;
+        try {
+            store = new SessionStore({ dir: path.join(legacyDir, "case"), debounceMs: 1, enabled: true });
+            const pure = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+            assert.ok(pure, "legacy oracle load returned null");
+            const view = toLegacyLike(pure);
+            const state = structuredClone(view.state as Record<string, unknown>);
+            restampRefsToLedger(state as never, seqByRawId);
+            delete state.refLedgerAligned;
+            return sessionDigest({ ...view, state: state as never });
+        } finally {
+            store?.closeQuietly();
+            if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+            else process.env.BILI_STORAGE_UNIFIED = prev;
+        }
+    } finally {
+        try { fs.rmSync(legacyDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
+    }
+}
+
 test("storage unified FULL mode: read path serves from the index with organic import + GC parity", async () => {
     const meta = CASE_META["folded"]!;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-full-"));
@@ -409,21 +454,25 @@ test("storage unified FULL mode: read path serves from the index with organic im
         const store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         const session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "full-mode loadSync returned null");
-        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "full-mode read digest drift (organic import)");
         store.closeQuietly();
         // The import must have populated the index even though writeNow never ran.
         const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
+        let expectedDigest = "";
         try {
             assert.ok(probe.getSessionRow(meta.id), "organic import did not populate index.db");
+            // #4316 PR3/3: expected = legacy view of the same files + the
+            // deterministic alignment against these very rows.
+            expectedDigest = alignedLegacyDigest(caseDir, meta, probe.seqByRaw(meta.id));
         } finally {
             probe.close();
         }
+        assert.equal(sessionDigest(toLegacyLike(session)), expectedDigest, "full-mode read digest drift (organic import)");
         // Second store, same dir: load again — serves from the index, no
         // import churn, digest still exact.
         const store2 = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         const again = store2.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(again, "second full-mode loadSync returned null");
-        assert.equal(sessionDigest(toLegacyLike(again)), manifest["folded"]!.digest, "second full-mode read digest drift");
+        assert.equal(sessionDigest(toLegacyLike(again)), expectedDigest, "second full-mode read digest drift");
         store2.cancelAll();
     } finally {
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
@@ -507,8 +556,15 @@ test("storage unified: file-config storage.unified selects the mode; env tier st
         let store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         let session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "file-tier full loadSync returned null");
-        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "file-tier full read digest drift");
         store.closeQuietly();
+        const probeStore = UnifiedStore.open(path.join(caseDir, "index.db"));
+        let fileTierDigest = "";
+        try {
+            fileTierDigest = alignedLegacyDigest(caseDir, meta, probeStore.seqByRaw(meta.id));
+        } finally {
+            probeStore.close();
+        }
+        assert.equal(sessionDigest(toLegacyLike(session)), fileTierDigest, "file-tier full read digest drift");
         assert.ok(fs.existsSync(path.join(caseDir, "index.db")), "file-tier full did not create index.db");
         // Env tier wins: explicit env legacy overrides file full on a fresh
         // dir — a file-tier full would have opened the sidecar and imported,
@@ -738,7 +794,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 5, "schema version stamped to 5 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column)");
+            assert.equal(ver.user_version, 8, "schema version stamped to 8 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 orphans journal + v7 media map + v8 identity/tombstones)");
             // v3 backfill: every pre-existing sessions row claims its
             // (namespace, conversation_id) identity binding.
             const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");

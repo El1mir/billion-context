@@ -1,7 +1,10 @@
 name: e2e-native-opencode
 
 on:
-  # #3085: runs on every PR by default (reverts #2637's hot-file gate, which let untested changes ship).
+  # three-layer CI (#3295): pull_request feeds the ci:full label gate + the
+  # paths filter (where present) only — the pre-#3295 "#3085: every PR by
+  # default" rule no longer holds; plain PRs are covered by ci.yml's core
+  # matrix, master by ci.yml core runs + the gated scheduled full runs.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   schedule:
@@ -12,8 +15,14 @@ on:
 concurrency:
   # #2637 plan #3: schedule-safe group — master pushes must not cancel the
   # day's nightly run; same-ref pushes still supersede each other.
-  group: e2e-native-opencode-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
-  cancel-in-progress: true
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its gate job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: e2e-native-opencode-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   # three-layer CI: this lane only runs on demand (ci:full label / dispatch)

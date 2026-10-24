@@ -323,6 +323,11 @@ test("release canary: no-op self-update keeps every channel healthy (#1811)", { 
         const webCopyDir = seedDshProfile(envBase, "web", STALE_VERSION);
         envBase.BILI_UPDATE_REGISTRY = registry.url;
         envBase.BILI_UPDATE_CHECK_INTERVAL_MS = "1000";
+        // #3619 pins: see e2e-update-state — this suite asserts convergence
+        // timing (40 s/60 s waits); a staggered draw would starve them.
+        envBase.BILI_UPDATE_STAGGER_MIN_MS = "0";
+        envBase.BILI_UPDATE_STAGGER_MAX_MS = "0";
+        envBase.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
 
         // ── phase 1: boot the behind-machine as a live proxy ──
         const port = await freePort();

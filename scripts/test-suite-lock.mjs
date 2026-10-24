@@ -13,17 +13,23 @@
 //
 // Mechanism reuses the cross-process update-lock from src/update.ts (#117/#991):
 // an O_EXCL ("wx") lock file holding { pid, ts, cmdline, cwd }, liveness via
-// kill(pid, 0), steal-on-dead. NO age timeout — a live suite is never stolen no
-// matter how long it runs (a local full run can exceed any fixed budget); the
-// rare pid-reuse ghost is covered by the BILI_TEST_FORCE=1 escape hatch, which
-// the fail-fast line names explicitly.
+// kill(pid, 0), steal-on-dead. A live FRESH suite is never stolen (a local
+// full run can legitimately outlive any small budget); but the pid probe
+// alone has no age bound — a holder that died while its pid got reused by a
+// long-lived unrelated process, an orphan zombie nobody reaped, or a reboot
+// remnant on persistent $XDG_CACHE_HOME keeps kill(pid,0) succeeding FOREVER
+// and permanently wedges every later run (#3406 item 10). Past STALE_LOCK_MS
+// the pid probe stops being trusted: the lock is treated as dead, reclaimed
+// with a loud warning. BILI_TEST_FORCE=1 remains the escape hatch in the
+// opposite direction (run unlocked despite a live fresh holder).
 //
 // Two modes (argv[2]):
 //   gate  NON-owning fast check, prepended to the `pretest` npm hook so a second
 //         `npm test` refuses within milliseconds (BEFORE the kernel/pi build)
 //         instead of spending a build cycle and then colliding. Exits 1 with a
-//         holder line only when a LIVE holder exists; exits 0 for no-lock or a
-//         dead (stealable) holder. Creates/holds nothing.
+//         holder line only when a LIVE FRESH holder exists; exits 0 for no-lock,
+//         a dead holder, or a stale one (warns; the next `run` steals it).
+//         Creates/holds nothing.
 //   run   OWNING wrapper that REPLACES the old `test` body. Acquires the lock,
 //         spawns the real `node --import … --test …` suite, streams stdio, and
 //         releases the lock in finally regardless of outcome. A SIGKILLed
@@ -81,6 +87,40 @@ export function forceEnabled(env = process.env) {
     return v !== "" && v !== "0" && v !== "false" && v !== "no";
 }
 
+/**
+ * #3406 item 10: age bound for trusting the pid liveness probe. A holder whose
+ * `ts` (creation time, written once at wx-create and never touched — it plays
+ * the role of mtime and survives mtime-perturbing file copies) is older than
+ * this is treated as DEAD even when kill(pid,0) succeeds: at that age the
+ * number is presumed recycled to an unrelated process, the orphan was never
+ * reaped, or the lock outlived a reboot on persistent $XDG_CACHE_HOME — none
+ * of which time ever resolves on its own (the permanent-wedge bug).
+ *
+ * 30 min = ~1.5x headroom over the slowest legitimate single holder measured:
+ * the whole `npm test` suite on one machine, whose worst historical CI leg
+ * (windows, pre-shard) ran ~1225s ≈ 20.4 min (#3143 measurement); sharded CI
+ * legs and the kernel/pi-subagents suites (outside this lock) finish far
+ * under it. A genuinely longer local run that gets reclaimed must simply be
+ * rerun — the steal warns loudly. BILI_TEST_FORCE=1 bypasses when needed.
+ */
+export const STALE_LOCK_MS = 30 * 60 * 1000;
+
+/** #3406 item 10: is the holder past the age bound? (see STALE_LOCK_MS) */
+export function holderIsStale(holder, now = Date.now()) {
+    return typeof holder?.ts === "number" && now - holder.ts > STALE_LOCK_MS;
+}
+
+/** The stale-reclaim warning (stderr) — the loud alarm before stealing. */
+export function staleStealMessage(holder, lockPath, now = Date.now()) {
+    const lines = [
+        `⚠️  Stale test-suite lock at ${lockPath} — held ${formatAge(now - holder.ts)}, past the ${formatAge(STALE_LOCK_MS)} bound (#3406).`,
+        `   holder: pid=${holder.pid} still answers kill(pid,0), but at this age that is presumed pid reuse,`,
+        `   an unreaped orphan, or a reboot remnant — not the original suite. Reclaiming the lock; if a`,
+        `   suite genuinely ran this long, rerun it. BILI_TEST_FORCE=1 still bypasses the lock entirely.`,
+    ];
+    return lines.join("\n");
+}
+
 /** Human age string for the fail-fast line ("42s ago", "3m 05s ago", "1h 04m ago"). */
 export function formatAge(msAgo) {
     const s = Math.max(0, Math.round(msAgo / 1000));
@@ -114,7 +154,8 @@ export function blockedMessage(holder, lockPath, now = Date.now()) {
 /**
  * Try to acquire the lock. Returns { acquired, holder }:
  *  - free path            → { acquired: true, holder: null }
- *  - live foreign holder  → { acquired: false, holder }   (never steal a live suite)
+ *  - live fresh holder    → { acquired: false, holder }   (never steal a live fresh suite)
+ *  - stale live-looking   → warn + steal (#3406: past STALE_LOCK_MS the pid probe lies)
  *  - dead holder          → steal (unlink + rewrite) → { acquired: true, holder:null }
  *  - lost wx race         → { acquired: false, holder }
  * `meta` must carry at least { pid }.
@@ -137,8 +178,13 @@ export async function acquireLock(lockPath, meta) {
     if (first === "written") return { acquired: true, holder: null };
 
     const existing = await readLock(lockPath);
+    if (existing && existing.pid !== meta.pid && isAlive(existing.pid) && !holderIsStale(existing)) {
+        return { acquired: false, holder: existing }; // live fresh sibling — block
+    }
     if (existing && existing.pid !== meta.pid && isAlive(existing.pid)) {
-        return { acquired: false, holder: existing }; // live sibling — block
+        // #3406 item 10: alive-looking but past the age bound — pid-reuse ghost
+        // / unreaped orphan / reboot remnant. Warn loudly, then steal below.
+        console.error(staleStealMessage(existing, lockPath));
     }
 
     // Owner is not live: either a dead holder (parsed, pid gone) or a
@@ -254,6 +300,12 @@ async function main() {
     if (mode === "gate") {
         const holder = await readLock(lockPath);
         if (!holder || !isAlive(holder.pid)) return 0; // none, or stealable
+        if (holderIsStale(holder)) {
+            // #3406 item 10: past the age bound a live-looking pid is not
+            // trusted — stealable. Warn so the stale lock is visible pre-build.
+            console.error(staleStealMessage(holder, lockPath));
+            return 0;
+        }
         console.error(blockedMessage(holder, lockPath));
         return 1;
     }

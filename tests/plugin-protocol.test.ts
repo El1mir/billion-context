@@ -88,7 +88,7 @@ async function startHarness(
     scripts: string[][],
     kernelConfig?: Config,
     // #1278: the user-facing `compress` block (loadOptions → opts.compress), distinct
-    // from kernelConfig. Tests pass rules here to exercise the REAL path the
+    // from kernelConfig. Tests pass absorb/rules here to exercise the REAL path the
     // file config takes, not the kernelConfig shortcut the pre-fix manifest read.
     compress?: Partial<ProxyOptions["compress"]>,
 ): Promise<Harness> {
@@ -239,14 +239,14 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         assert.equal(manifest.ok, true);
         assert.equal(manifest.protocolVersion, 1);
         assert.ok(/^\d+\.\d+\.\d+/.test(manifest.version), `version looks wrong: ${manifest.version}`);
-        // #1192: every extra tool (acp_rule) is opt-in and only advertised
+        // #1192: every extra tool (absorb, acp_rule) is opt-in and only advertised
         // when enabled — hosts register manifest tools verbatim, so a disabled
         // tool must not be listed. acp_cache stays in the base toolset.
-        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
         const names = manifest.tools.anthropic!.map((t) => String(t.name)).sort();
-        assert.deepEqual(names, ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
-        assert.equal(manifest.tools.openai!.length, 5);
-        assert.equal(manifest.tools.responses!.length, 5);
+        assert.deepEqual(names, ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
+        assert.equal(manifest.tools.openai!.length, 6);
+        assert.equal(manifest.tools.responses!.length, 6);
         // #841: search_context's conversation_id doubles as a cross-session
         // read-only search target — its param description must carry the
         // historical-search wording in every wire shape.
@@ -278,21 +278,82 @@ test("plugin manifest: acp_rule advertised when rules enabled in config", async 
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);
         const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
-        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
         for (const shape of ["anthropic", "openai", "responses"] as const) {
             const listed = manifest.tools[shape]!.map((t) => {
                 const fn = t.function as { name?: unknown } | undefined;
                 return typeof t.name === "string" ? t.name : (typeof fn?.name === "string" ? fn.name : "");
             });
             assert.ok(listed.includes("acp_rule"), `${shape} has acp_rule`);
-            assert.equal(listed.length, 6);
+            assert.equal(listed.length, 7);
         }
     } finally {
         await h.close();
     }
 });
 
+// #1192 (regression): with absorb + rules enabled in the base config the
+// manifest advertises all eight tools again — enabling the features must not
+// shrink the toolset dsh/pi/omp/MCP shims register.
+test("plugin manifest: absorb and acp_rule advertised when enabled in config", async () => {
+    const h = await startHarness([textScript()], { ...defaultConfig(400_000), absorb: { enabled: true, toolName: "absorb", minToolTokens: 4000, contextThresholdPct: 0, excludeTools: [] }, rules: { enabled: true } });
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
+        assert.equal(resp.status, 200);
+        const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_read_original_image", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
+        for (const shape of ["anthropic", "openai", "responses"] as const) {
+            const listed = manifest.tools[shape]!.map((t) => {
+                const fn = t.function as { name?: unknown } | undefined;
+                return typeof t.name === "string" ? t.name : (typeof fn?.name === "string" ? fn.name : "");
+            });
+            assert.ok(listed.includes("absorb"), `${shape} has absorb`);
+            assert.ok(listed.includes("acp_rule"), `${shape} has acp_rule`);
+            assert.equal(listed.length, 8);
+        }
+    } finally {
+        await h.close();
+    }
+});
 
+// #1278 (regression): the pre-fix manifest read opts.kernelConfig (kernel defaults),
+// so an absorb enabled in the user's GLOBAL compress block — where loadOptions puts
+// the file config — was never advertised. Pi then registered no callable tool for the
+// [ACP absorb] prompts the wire emits. Enabling via the global compress block (the real
+// path) must now advertise absorb on every wire shape.
+test("plugin manifest: absorb advertised when enabled in the global compress block", async () => {
+    const h = await startHarness([textScript()], undefined, { absorb: { enabled: true } });
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
+        assert.equal(resp.status, 200);
+        const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
+        for (const shape of ["anthropic", "openai", "responses"] as const) {
+            const listed = manifest.tools[shape]!.map((t) => {
+                const fn = t.function as { name?: unknown } | undefined;
+                return typeof t.name === "string" ? t.name : (typeof fn?.name === "string" ? fn.name : "");
+            });
+            assert.ok(listed.includes("absorb"), `${shape} has absorb`);
+            assert.equal(listed.length, 7);
+        }
+    } finally {
+        await h.close();
+    }
+});
+
+// #1278: an explicit global disable keeps absorb out of the manifest (guards against
+// flipping the logic to "advertise whenever an absorb key is present").
+test("plugin manifest: absorb omitted when the global compress block disables it", async () => {
+    const h = await startHarness([textScript()], undefined, { absorb: { enabled: false } });
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
+        assert.equal(resp.status, 200);
+        const manifest = (await resp.json()) as { toolNames: string[] };
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
+    } finally {
+        await h.close();
+    }
+});
 
 test("plugin mode: no wire tool injection, philosophy still injected, native compress tool_use passes through untouched", async () => {
     const h = await startHarness([compressToolScript()]);
@@ -755,4 +816,14 @@ test("headless launcher registrations expire after the TTL (no stale poisoning)"
         Date.now = realNow;
         _resetPluginStateForTest();
     }
+});
+
+test("headless launcher registration selection preserves unrelated non-MCP lanes", () => {
+    queuePluginRegister("select-mcp", "mcp", false);
+    queuePluginRegister("select-pi", "pi", false);
+    const mcpFirst = takePendingPluginRegister((candidate) => candidate.agent === "mcp");
+    assert.equal(mcpFirst?.conversationId, "select-mcp");
+    const pi = takePendingPluginRegister((candidate) => candidate.agent !== "mcp");
+    assert.equal(pi?.conversationId, "select-pi");
+    assert.equal(takePendingPluginRegister(), undefined);
 });

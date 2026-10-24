@@ -104,7 +104,12 @@ test("#2029: acp_status nudge recompute feeds the provenance-aware baseline", ()
         const statsBefore = snap(ctx.session.stats);
         const stateBefore = snap(ctx.session.state);
         const out = handleAcpStatus({}, ctx);
-        assert.deepStrictEqual(ctx.seen, [sc.expected], `${sc.name}: tokenCount handed to the kernel`);
+        // #4331 added the uncovered-history audit, which runs its own
+        // processTurn passes on this surface — the contract is that EVERY
+        // kernel call on a status reader feeds the provenance-aware baseline,
+        // not that there is exactly one call.
+        assert.ok(ctx.seen.length >= 1 && ctx.seen.every((v) => v === sc.expected),
+            `${sc.name}: every kernel call fed the provenance-aware baseline (got ${JSON.stringify(ctx.seen)})`);
         assert.equal(snap(ctx.session.stats), statsBefore, `${sc.name}: stats must stay read-only`);
         assert.equal(snap(ctx.session.state), stateBefore, `${sc.name}: state must stay read-only`);
         const nudgeLine = out.text.split("\n").find((l) => l.startsWith("Nudge:"));

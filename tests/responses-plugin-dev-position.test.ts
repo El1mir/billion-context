@@ -215,7 +215,10 @@ function indexOfText(c: Captured, needle: string): number {
 }
 
 function notifItems(c: Captured, needle: string): Record<string, unknown>[] {
-    return c.input.filter((it) => it.role === "developer" && it.type === undefined && it.content === needle);
+    // #4166: codec-native in-place re-emission prepends the kernel ref tag
+    // (`<acp …>mNNNNN</acp>`) to the item content like every other text
+    // message — match by containment, not byte equality.
+    return c.input.filter((it) => it.role === "developer" && (it.type === undefined || it.type === "message") && typeof it.content === "string" && it.content.includes(needle));
 }
 
 test("responses plugin mode: mid-history developer notifications are position-preserved; front block byte-stable (#1638)", async () => {
@@ -321,7 +324,7 @@ test("responses plugin mode: leading additional_tools stays head-neutral — hea
     assert.equal(notifItems(caps[1]!, NOTIF1).length, 1, `${L(1)}: NOTIF1 in-place occurrences != 1`);
 });
 
-test("responses proxy mode: hoist semantics unchanged — notifications are not re-emitted in place (#1638 negative pin)", async () => {
+test("responses proxy mode: mid-history notifications now ride in place too (#4166 unified contract)", async () => {
     const steps: Step[] = [
         { send: [D(SYS), T(1)] },
         { send: [A(1), D(NOTIF1), T(2)] },
@@ -331,16 +334,18 @@ test("responses proxy mode: hoist semantics unchanged — notifications are not 
     const L = (i: number) => `devpos/proxy t${i + 1}`;
     const t2 = caps[1]!;
 
-    // Non-Codex native/proxy mode keeps the hoist (#1085 anchor path owns
-    // stability): the notification must not appear as an in-place developer
-    // item.
-    assert.equal(notifItems(t2, NOTIF1).length, 0, `${L(1)}: proxy mode must keep hoist semantics — NOTIF1 was re-emitted in place`);
-    // Client content still reaches the upstream somewhere (merged front
-    // block or anchor diff note) — never silently dropped.
-    assert.ok(t2.raw.includes(NOTIF1), `${L(1)}: NOTIF1 vanished from the forwarded body`);
-    // Front block exists and carries the head system text.
+    // #4166: position preservation is codec-native now — the mid-history
+    // developer notification rides IN PLACE in proxy mode exactly like
+    // plugin/codex mode (the old #1638 proxy hoist is gone; strict
+    // single-system upstreams keep the merged HEAD only, #377).
+    assert.equal(notifItems(t2, NOTIF1).length, 1, `${L(1)}: NOTIF1 must be re-emitted in place exactly once`);
+    // Front block exists and carries ONLY the head system text — never the
+    // notification (front block stays byte-stable across turns).
     const f = frontDev(t2);
     assert.ok(f.content.includes(SYS), `${L(1)}: front block lost the head system text`);
+    assert.ok(!f.content.includes(NOTIF1), `${L(1)}: notification leaked into the front block`);
+    const f1 = frontDev(caps[0]!);
+    assert.equal(JSON.stringify(f.content), JSON.stringify(f1.content), "front block bytes differ across turns");
 });
 
 test("responses codex proxy mode: mid-history developer items ride in place; front block byte-stable (#3227)", async () => {

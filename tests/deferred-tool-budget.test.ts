@@ -9,8 +9,21 @@ import { defaultConfig, defaultCountTokens } from "acp-kernel";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { getSession } from "../src/session.ts";
 import { startServer } from "../src/server.ts";
+import { normalizeUpstreamOrigin } from "../src/util.ts";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, modelVisibleTools } from "../src/server/budget.ts";
+
+// #4185: an identified fresh session whose preflight ends in deterministic
+// exhaustion now forwards once for upstream arbitration instead of failing
+// fast locally. These pins assert the LOCAL stop-before-forward contract, so
+// they carry a settled usage baseline to keep testing the evidence-driven path.
+function seedEvidence(upstreamPort: number, sessionId: string): void {
+    const s = getSession(sessionId);
+    s.stats.lastInputTokens = 100;
+    s.stats.lastInputTokensSource = "usage";
+    s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(`http://127.0.0.1:${upstreamPort}`);
+}
 
 const deferred = {
     type: "function", name: "large_schema", description: "x".repeat(1_200_000),
@@ -133,9 +146,11 @@ test("#2391: a 272k Responses proxy forwards the full deferred catalog and rejec
         assert.equal(accepted.status, 200, await accepted.text());
         assert.equal(received.length, 1);
         assert.deepEqual(received[0].tools, tools, "full upstream definitions must stay unchanged");
+        seedEvidence(upstreamPort, "2391-eager");
         const eager = await send({ ...body, tools: [{ ...deferred, defer_loading: false }, search] }, "2391-eager");
         assert.notEqual(eager.status, 200, await eager.text());
         assert.equal(received.length, 1, "eager overflow must be stopped before forwarding");
+        seedEvidence(upstreamPort, "2391-loaded");
         const loaded = await send({ ...body, input: [{ type: "additional_tools", tools: [deferred] }, ...body.input] }, "2391-loaded");
         assert.notEqual(loaded.status, 200, await loaded.text());
         assert.equal(received.length, 1, "loaded overflow must be stopped before forwarding");

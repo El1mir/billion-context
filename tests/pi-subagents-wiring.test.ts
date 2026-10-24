@@ -147,6 +147,28 @@ test("before_agent_start appends the delegate prompt once, after the host prompt
     assert.ok(array.systemPrompt.startsWith("A\nB\n\n"));
 });
 
+test("before_agent_start puts the delegate prompt in systemPromptOptions.sections on live-section hosts", async () => {
+    // pi 1.x renders event.systemPrompt live from the mutable options, and
+    // pi-claude-bridge forwards only the structured parts (sections included):
+    // a returned systemPrompt would never reach Claude Code.
+    const { pi, handlers } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    const ctx = sessionCtx();
+    await handlers.get("session_start")!(undefined, ctx);
+    const options = { sections: {} as Record<string, string> };
+    const event = {
+        get systemPrompt(): string {
+            return ["HOST PROMPT", ...Object.values(options.sections)].join("\n\n");
+        },
+        systemPromptOptions: options,
+    };
+    const result = handlers.get("before_agent_start")!(event, ctx);
+    assert.equal(result, undefined);
+    assert.ok(options.sections.acp_delegate?.startsWith("ACP_DELEGATE NOTIFICATIONS"));
+});
+
 test("tool_result dispatches read tracking for read and bash results", async () => {
     const { pi, handlers } = fakePi();
     (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;

@@ -7,7 +7,6 @@ process.env.NODE_ENV = "test";
 // Fail fast on 4xx retries so the halving path exercises immediately.
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -50,7 +49,7 @@ import { listSessions } from "../src/session.ts";
 // chunk after c1 carries < minCompressRange of effective mass no matter where
 // the recent-zone endpoint lands — nothing besides the snapped halves can fold.
 // Pre-fix: both halves carry a BLOCKED boundary -> preview rejects both ->
-// nothing folds -> payload stays over-window -> 502 (+ dead-end marker).
+// nothing folds -> payload stays over-window -> 502 (#4079: no marker is written anymore).
 // Post-fix: halves snap past the protected rim, fold, payload fits -> 200.
 
 const SUMMARY_TEXT =

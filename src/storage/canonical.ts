@@ -21,10 +21,12 @@ import { createHash } from "node:crypto";
  *    provenance (#2671), but its PRESENCE is new (corpus pins predate it),
  *    so masking the value like __VER__ cannot keep old pins green; the key
  *    is removed from digests altogether.
- *
- * NOT normalized (deliberately contract): every other byte — ref numbers,
- * block ids, summaries, stats, metadata. A change to any of those in the
- * round-trip is a migration regression and must fail the golden.
+ *  - tailGaps (#4390) → dropped entirely — read-time diagnostic added by
+ *    loadLegacyView (count of tail pointers whose row is missing); the live
+ *    legacy leg of any parity comparison structurally lacks the key, so
+ *    digesting its presence would report drift on every sampled save. Same
+ *    class as storageMode: the PRESENCE, not the value, is the problem. A
+ *    genuinely missing row still diverges the message arrays themselves.
  */
 export function canonicalize(value: unknown): unknown {
     return canonicalizeWithContext(value, undefined);
@@ -42,6 +44,11 @@ function canonicalizeWithContext(value: unknown, key: string | undefined): unkno
             // unlike biliVersion its PRESENCE is new, so masking the value
             // is not enough; drop the key from digests entirely.
             if (k === "storageMode") continue;
+            // tailGaps (#4390) is read-time gap-count metadata from
+            // loadLegacyView — the live legacy leg structurally lacks the
+            // key, so digesting its presence would flag drift on every
+            // sampled save; drop it like storageMode.
+            if (k === "tailGaps") continue;
             out[k] = canonicalizeWithContext(v, k);
         }
         return out;

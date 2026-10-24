@@ -57,10 +57,12 @@ interface Stats {
     storeBytesSaved: number;
     compressCreditTokens: number;
     rangeRestores: number;
+    wholeBlockRestores?: number;
+    wholeBlockRestoresPreciseAvailable?: number;
 }
 
 function zeroStats(): Stats {
-    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, compressCreditTokens: 0, rangeRestores: 0 };
+    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, compressCreditTokens: 0, rangeRestores: 0, wholeBlockRestores: 0, wholeBlockRestoresPreciseAvailable: 0 };
 }
 
 function makeSession(id: string, meta: Session["meta"] = {}, patch: Partial<Stats> = {}, lastSeen = Date.now()): Session {
@@ -304,32 +306,72 @@ withSessionsDir("tokensSaved derives from active blocks when the stat is dead (#
     assert.equal(d2?.tokensSaved, 9999, "larger legacy stat wins (floor)");
 });
 
-withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)", async (dir) => {
+withSessionsDir("session detail exposes decompress usage counters (#3671 direction 4)", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession("det-dec", { protocol: "openai", title: "Dec" }, { requests: 5, wholeBlockRestores: 26, wholeBlockRestoresPreciseAvailable: 9, rangeRestores: 3 });
+    await store.writeNow(s);
+    const z = makeSession("det-dec-zero", { protocol: "openai" });
+    await store.writeNow(z);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("det-dec");
+    assert.ok(d);
+    assert.equal(d.wholeBlockRestores, 26);
+    assert.equal(d.wholeBlockRestoresPreciseAvailable, 9);
+    assert.equal(d.rangeRestores, 3);
+    const dz = await buildSessionDetail("det-dec-zero");
+    assert.ok(dz);
+    assert.equal(dz.wholeBlockRestores, 0, "no restores → explicit zero, not absent");
+    assert.equal(dz.wholeBlockRestoresPreciseAvailable, 0);
+    assert.equal(dz.rangeRestores, 0);
+});
+
+withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)", async (dir) => {
     const saved: Array<string | undefined> = [process.env.BILI_STORAGE_UNIFIED, process.env.BILI_ENCRYPTION_KEY];
     const setEnv = (unified: string | undefined, key: string | undefined) => {
         if (unified === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = unified;
         if (key === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = key;
     };
+    // #3818/#3135-3: the stamp reflects what the STORE INSTANCE actually
+    // managed to open (liveStorageStamp), not the knob value at write time —
+    // so each leg builds its own store AFTER pinning the env. The
+    // stamp-plumbing leg pins shadow explicitly (absent everywhere now
+    // defaults to FULL and is asserted in tests/storage-full-flip.test.ts ①).
     try {
-        // no knob → the shadow DEFAULT stamps shadow (#2815 rollout flip)
-        setEnv(undefined, undefined);
-        await store.writeNow(makeSession("sm-default", { protocol: "openai" }));
+        setEnv("shadow", undefined);
+        let leg = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await leg.writeNow(makeSession("sm-default", { protocol: "openai" }));
+        leg.closeQuietly();
         // full → full stamp
         setEnv("full", undefined);
-        await store.writeNow(makeSession("sm-full", { protocol: "openai" }));
+        leg = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await leg.writeNow(makeSession("sm-full", { protocol: "openai" }));
+        leg.closeQuietly();
         // full requested but encryption blocks the sidecar → honest legacy stamp
         setEnv("full", "00".repeat(32));
-        await store.writeNow(makeSession("sm-blocked", { protocol: "openai" }));
+        leg = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await leg.writeNow(makeSession("sm-blocked", { protocol: "openai" }));
+        leg.closeQuietly();
     } finally {
         setEnv(saved[0], saved[1]);
     }
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetDiskCacheForTest();
-    assert.equal((await buildSessionDetail("sm-default"))?.storageMode, "shadow", "absent everywhere now defaults to shadow");
+    assert.equal((await buildSessionDetail("sm-default"))?.storageMode, "shadow", "explicit shadow stamps shadow");
     assert.equal((await buildSessionDetail("sm-full"))?.storageMode, "full");
-    assert.equal((await buildSessionDetail("sm-blocked"))?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
+    // #3818: per-leg stores mean the blocked leg's file is genuinely
+    // ENCRYPTED (full + key at write time) — read it back with the key.
+    // Reset the disk cache: the keyless reads above may have cached the
+    // unreadable encrypted file as a miss.
+    process.env.BILI_ENCRYPTION_KEY = "00".repeat(32);
+    try {
+        _resetDiskCacheForTest();
+        assert.equal((await buildSessionDetail("sm-blocked"))?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
+    } finally {
+        if (saved[1] === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = saved[1]!;
+    }
 });
 
 withSessionsDir("#3093: live (never-persisted) sessions carry the provenance stamps", async (_dir) => {
@@ -493,6 +535,71 @@ test("web endpoints serve overview, session list and per-session detail", async 
     }
 });
 
+test("/__bili/stats rows carry decompress usage counters (#3671 direction 4)", async () => {
+    const root = path.join(tmpdir(), `bili-web-sess-dec-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    const prevSessions = process.env.BILI_SESSIONS_DIR;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    process.env.BILI_SESSIONS_DIR = root;
+
+    setRegistryForTest({});
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
+    try {
+        const s = getSession("dec-live", { protocol: "openai" });
+        s.stats.wholeBlockRestores = 26;
+        s.stats.wholeBlockRestoresPreciseAvailable = 9;
+        s.stats.rangeRestores = 3;
+        s.state.blocks.push({ blockId: "b1", runId: "r1", tier: 1, topic: "T", summary: "S", directMessageIds: [], effectiveMessageIds: [], directBlockIds: [], compressedTokens: 100, createdAt: Date.now(), survivedCount: 1, generation: "young", active: true });
+        const res = await fetch(`http://127.0.0.1:${port}/__bili/stats`);
+        assert.equal(res.status, 200);
+        const body = (await res.json()) as { sessions: Array<{ id: string; wholeBlockRestores?: number; wholeBlockRestoresPreciseAvailable?: number; rangeRestores?: number; blocks?: number }> };
+        const row = body.sessions.find((x) => x.id === "dec-live");
+        assert.ok(row, "live session row present");
+        assert.equal(row!.wholeBlockRestores, 26);
+        assert.equal(row!.wholeBlockRestoresPreciseAvailable, 9);
+        assert.equal(row!.rangeRestores, 3);
+        assert.equal(row!.blocks, 1, "fold-count denominator rides the same row");
+    } finally {
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
+        if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
+        await close(proxy);
+        _resetSessionsForTest();
+        _resetDiskCacheForTest();
+        rmrf(root);
+    }
+});
+
 // #1535: the model-switch column must not break table rendering — header/colgroup/row cells/
 // empty-state colspan stay aligned, and the REAL client IIFE executed against the live
 // endpoints renders exactly 13 cells per session row with the switch cell populated.
@@ -508,9 +615,11 @@ interface DomEl {
     className: string;
     title: string;
     children: unknown[];
+    disabled: boolean;
     classList: { add(): void; remove(): void; contains(): boolean; toggle(): void };
-    addEventListener(): void;
+    addEventListener(type: string, fn: (ev?: unknown) => void): void;
     removeEventListener(): void;
+    dispatch(type: string): Promise<void>;
     appendChild(child: { tagName: string; innerHTML: string }): unknown;
     remove(): void;
     focus(): void;
@@ -526,6 +635,7 @@ interface DomEl {
 }
 
 function makeDomStub(tag: string): DomEl {
+    const listeners = new Map<string, Array<(ev?: unknown) => void>>();
     const el = {
         tagName: tag.toUpperCase(),
         innerHTML: "",
@@ -537,16 +647,24 @@ function makeDomStub(tag: string): DomEl {
         className: "",
         title: "",
         children: [] as unknown[],
+        disabled: false,
         classList: { add() { }, remove() { }, contains() { return false; }, toggle() { } },
-        addEventListener() { },
+        addEventListener(type: string, fn: (ev?: unknown) => void) {
+            const list = listeners.get(type) ?? [];
+            list.push(fn);
+            listeners.set(type, list);
+        },
         removeEventListener() { },
+        async dispatch(type: string) {
+            for (const fn of [...(listeners.get(type) ?? [])]) await fn();
+        },
         appendChild(child: { tagName: string; innerHTML: string }) {
             el.children.push(child);
             const t = child.tagName.toLowerCase();
             el.innerHTML += `<${t}>${child.innerHTML}</${t}>`;
             return child;
         },
-        remove() { }, focus() { }, blur() { }, select() { }, click() { },
+        remove() { }, focus() { }, blur() { }, select() { }, click() { el.dispatch("click"); },
         getAttribute(name: string) { return (el as unknown as Record<string, unknown>)[name] ?? null; },
         setAttribute(name: string, v: unknown) { (el as unknown as Record<string, unknown>)[name] = String(v); },
         querySelector() { return null; },
@@ -557,7 +675,12 @@ function makeDomStub(tag: string): DomEl {
     return el as DomEl;
 }
 
-async function runWebClient(base: string, hash: string): Promise<Map<string, DomEl>> {
+async function runWebClient(
+    base: string,
+    hash: string,
+    requests: string[] = [],
+    fetcher: (url: string, opts?: RequestInit) => Promise<Response> = globalThis.fetch,
+): Promise<Map<string, DomEl>> {
     const byId = new Map<string, DomEl>();
     const idEl = (id: string) => { let e = byId.get(id); if (!e) { e = makeDomStub("div"); byId.set(id, e); } return e; };
     const documentStub = {
@@ -566,6 +689,7 @@ async function runWebClient(base: string, hash: string): Promise<Map<string, Dom
         documentElement: makeDomStub("html"),
         getElementById: (id: string) => idEl(id),
         createElement: (t: string) => makeDomStub(t),
+        createDocumentFragment: () => makeDomStub("fragment"),
         querySelectorAll: () => [],
         querySelector: () => null,
         addEventListener() { },
@@ -576,7 +700,11 @@ async function runWebClient(base: string, hash: string): Promise<Map<string, Dom
         console,
         setTimeout, clearTimeout, clearInterval,
         setInterval: () => 0,
-        fetch: (url: string, opts?: unknown) => globalThis.fetch(new URL(url, base).toString(), opts as RequestInit | undefined),
+        fetch: (url: string, opts?: unknown) => {
+            const target = new URL(url, base).toString();
+            requests.push(target);
+            return fetcher(target, opts as RequestInit | undefined);
+        },
         document: documentStub,
         window: { addEventListener() { }, innerWidth: 1440, innerHeight: 900 },
         location: { hash },
@@ -586,6 +714,15 @@ async function runWebClient(base: string, hash: string): Promise<Map<string, Dom
     vm.createContext(sandbox);
     vm.runInNewContext(WEB_CLIENT, sandbox, { timeout: 5000 });
     return byId;
+}
+
+async function waitFor(predicate: () => boolean, message: string, timeoutMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.fail(message);
 }
 
 test("#1535: web UI stays aligned with the model-switch column", async () => {
@@ -602,6 +739,7 @@ test("#1535: web UI stays aligned with the model-switch column", async () => {
     const T0 = Date.parse("2026-09-28T09:00:00Z");
     const sw = makeSession("sw-1", { protocol: "openai" }, { requests: 4, inputTokens: 12000, cachedTokens: 2000, contextTokens: 9000 });
     sw.metadata = {
+        clientHint: "Codex Desktop/0.163.0-alpha.10.2 (Windows 10.0.26300; x86_64; unknown (Codex Desktop; 26.1013.31256))",
         lastModel: "model-b",
         cacheLedger: {
             v: 1, lastBlockId: null, consumedFoldSeq: 0, sampleSeq: 2, foldSeqCounter: 0, folds: [],
@@ -688,6 +826,10 @@ test("#1535: web UI stays aligned with the model-switch column", async () => {
         for (const r of rows) assert.equal((r.match(/<td/g) ?? []).length, 13, "row has exactly 13 cells");
         const swHtml = rows.find((r) => r.includes("sw-1"));
         assert.ok(swHtml, "switching session row rendered");
+        assert.ok(swHtml!.includes('class="client-cell"'), "客户端单元格保留限宽样式入口");
+        assert.match(swHtml!, /class="mono small clip w-client" title="Codex Desktop\/0\.163\.0-alpha\.10\.2 \(Windows 10\.0\.26300;/, "长客户端名称使用单行省略样式");
+        assert.ok(swHtml!.includes('title="' + sw.metadata.clientHint + '"'), "悬浮提示保留完整客户端名称");
+        assert.match(page, /\.w-client \{[^}]*max-width: 100%/, "客户端名称宽度不超出所在列");
         assert.match(swHtml!, /1 · 8\.0K/, "switch cell shows count · dropped tokens");
         assert.ok(swHtml!.includes('title="Mid-session model switches'), "switch cell carries the attribution tooltip");
         const plainHtml = rows.find((r) => r.includes("plain-1"));
@@ -950,6 +1092,192 @@ withSessionsDir("#1937: /__bili/sessions supports server-side paging & search", 
         assert.equal(clamped.sessions.length, 120);
     } finally {
         await close(proxy);
+    }
+});
+
+withSessionsDir("session filters compose before paging and drive the real client controls", async (dir) => {
+    _resetSessionsForTest();
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    for (let i = 0; i < 60; i++) {
+        const dsh = i < 20;
+        const codex = i >= 20 && i < 40;
+        const meta: Session["meta"] = dsh
+            ? { protocol: "openai", label: `Dsh ${i}` }
+            : codex
+                ? { protocol: "anthropic", label: `Codex ${i}` }
+                : { label: `Legacy ${i}` };
+        const session = makeSession(`filter-${i}`, meta, { requests: 2, inputTokens: 10, cachedTokens: 4, contextTokens: 5 });
+        if (dsh) session.metadata = { pluginAgent: "dsh" };
+        if (codex) session.metadata = { clientHint: "codex" };
+        await store.writeNow(session);
+    }
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const live = getSession("live-codex", { protocol: "anthropic", label: "Live Codex" });
+    live.metadata = { clientHint: "codex" };
+    live.stats.requests = 3;
+    live.stats.inputTokens = 30;
+    live.stats.cachedTokens = 12;
+    live.stats.contextTokens = 9;
+    live.lastSeen = Date.now() + 1;
+    _resetDiskCacheForTest();
+    setRegistryForTest({});
+
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+    try {
+        const j = async (u: string): Promise<{
+            sessions: Array<Record<string, unknown>>;
+            total: number;
+            unfilteredTotal: number;
+            protocols: string[];
+            clients: string[];
+            page: number;
+            pageSize: number;
+        }> => (await (await fetch(base + u)).json()) as {
+            sessions: Array<Record<string, unknown>>;
+            total: number;
+            unfilteredTotal: number;
+            protocols: string[];
+            clients: string[];
+            page: number;
+            pageSize: number;
+        };
+
+        const all = await j("/__bili/sessions?page=1&pageSize=50");
+        assert.equal(all.total, 61);
+        assert.equal(all.unfilteredTotal, 61);
+        assert.deepEqual(all.protocols, ["anthropic", "openai", "unknown"]);
+        assert.deepEqual(all.clients, ["codex", "dsh"]);
+        assert.equal(all.sessions.length, 50);
+        const second = await j("/__bili/sessions?page=2&pageSize=50");
+        assert.equal(second.sessions.length, 11);
+
+        const combined = await j("/__bili/sessions?protocol=OPENAI&client=DSH&state=history&q=dsh%201&page=1&pageSize=50");
+        assert.equal(combined.total, 11, "all filters compose, including case-insensitive protocol/client matching");
+        assert.equal(combined.unfilteredTotal, 61, "the unfiltered total stays available for the filtered-count label");
+        assert.ok(combined.sessions.every((s) => String(s.id).startsWith("filter-")), "history excludes the resident live session");
+        assert.ok(combined.sessions.every((s) => s.protocol === "openai" && s.clientHint === "dsh"));
+
+        const liveOnly = await j("/__bili/sessions?client=codex&state=live&page=1&pageSize=50");
+        assert.deepEqual(liveOnly.sessions.map((s) => s.id), ["live-codex"]);
+        const history = await j("/__bili/sessions?state=history&page=1&pageSize=50");
+        assert.equal(history.total, 60);
+        const ignoredState = await j("/__bili/sessions?state=unknown&page=1&pageSize=50");
+        assert.equal(ignoredState.total, 61, "unknown state is ignored rather than filtering everything out");
+
+        const requests: string[] = [];
+        const els = await runWebClient(base, "#/sessions", requests);
+        await waitFor(() => els.get("ses-count")?.textContent === "61 sessions", "initial session page did not render");
+        assert.equal(els.get("ses-prev")?.disabled, true);
+        assert.equal(els.get("ses-next")?.disabled, false);
+        assert.equal(els.get("ses-page-label")?.textContent, "Page 1 of 2");
+        const protocolOptions = els.get("ses-protocol")?.children[0] as DomEl | undefined;
+        const clientOptions = els.get("ses-client")?.children[0] as DomEl | undefined;
+        assert.deepEqual((protocolOptions?.children ?? []).map((c) => (c as DomEl).value), ["", "anthropic", "openai", "unknown"]);
+        assert.deepEqual((clientOptions?.children ?? []).map((c) => (c as DomEl).value), ["", "codex", "dsh"]);
+
+        els.get("ses-next")!.dispatch("click");
+        await waitFor(() => els.get("ses-page-label")?.textContent === "Page 2 of 2", "next-page click did not advance the list");
+        assert.equal(els.get("ses-prev")?.disabled, false);
+        assert.equal(els.get("ses-next")?.disabled, true);
+        const page2 = new URL(requests.at(-1)!);
+        assert.equal(page2.searchParams.get("page"), "2");
+        assert.equal(page2.searchParams.get("pageSize"), "50");
+
+        els.get("ses-protocol")!.value = "openai";
+        els.get("ses-client")!.value = "dsh";
+        els.get("ses-state")!.value = "history";
+        els.get("ses-state")!.dispatch("change");
+        await waitFor(() => els.get("ses-count")?.textContent === "20 / 61 sessions", "combined filter did not return to page one");
+        const filteredUrl = new URL(requests.at(-1)!);
+        assert.equal(filteredUrl.searchParams.get("page"), "1");
+        assert.equal(filteredUrl.searchParams.get("protocol"), "openai");
+        assert.equal(filteredUrl.searchParams.get("client"), "dsh");
+        assert.equal(filteredUrl.searchParams.get("state"), "history");
+
+        els.get("ses-search")!.value = "Dsh 1";
+        els.get("ses-search")!.dispatch("input");
+        await waitFor(() => els.get("ses-count")?.textContent === "11 / 61 sessions", "debounced search did not compose with filters");
+        assert.equal(new URL(requests.at(-1)!).searchParams.get("q"), "Dsh 1");
+
+        els.get("ses-reset-filters")!.dispatch("click");
+        await waitFor(() => els.get("ses-count")?.textContent === "61 sessions", "reset did not restore the unfiltered list");
+        const resetUrl = new URL(requests.at(-1)!);
+        for (const key of ["q", "protocol", "client", "state"]) assert.equal(resetUrl.searchParams.has(key), false, `${key} must be cleared`);
+        assert.equal(els.get("ses-search")?.value, "");
+        assert.equal(els.get("ses-protocol")?.value, "");
+        assert.equal(els.get("ses-client")?.value, "");
+        assert.equal(els.get("ses-state")?.value, "");
+    } finally {
+        await close(proxy);
+    }
+});
+
+test("会话列表忽略过期筛选响应，并在总页数缩减后返回有效页", async () => {
+    const requests: string[] = [];
+    let releaseSlow: (response: Response) => void = () => {};
+    const slow = new Promise<Response>((resolve) => { releaseSlow = resolve; });
+    let shrink = false;
+    const pageData = (page: number, total: number) => ({
+        sessions: [],
+        total,
+        unfilteredTotal: 61,
+        protocols: ["anthropic", "openai"],
+        clients: [],
+        page,
+        pageSize: 50,
+    });
+    const fetcher = async (url: string): Promise<Response> => {
+        const query = new URL(url).searchParams;
+        const page = Number(query.get("page") || 1);
+        if (query.get("protocol") === "openai") return slow;
+        if (query.get("protocol") === "anthropic") return Response.json(pageData(page, 7));
+        return Response.json(pageData(page, shrink ? 1 : 61));
+    };
+    try {
+        const els = await runWebClient("http://session-ui.test", "#/sessions", requests, fetcher);
+        const protocol = els.get("ses-protocol")!;
+        protocol.value = "openai";
+        const staleRefresh = protocol.dispatch("change");
+        protocol.value = "anthropic";
+        await protocol.dispatch("change");
+        assert.equal(els.get("ses-count")?.textContent, "7 / 61 sessions");
+        releaseSlow(Response.json(pageData(1, 20)));
+        await staleRefresh;
+        assert.equal(els.get("ses-count")?.textContent, "7 / 61 sessions", "较晚返回的旧筛选响应不能覆盖当前结果");
+
+        await els.get("ses-reset-filters")!.dispatch("click");
+        await els.get("ses-next")!.dispatch("click");
+        assert.equal(els.get("ses-page-label")?.textContent, "Page 2 of 2");
+        shrink = true;
+        await els.get("ses-refresh")!.dispatch("click");
+        assert.equal(els.get("ses-page-label")?.textContent, "Page 1 of 1", "刷新后页数缩减时重新加载有效页");
+        assert.deepEqual(requests.slice(-2).map((url) => new URL(url).searchParams.get("page")), ["2", "1"]);
+        assert.equal(els.get("ses-prev")?.disabled, true);
+        assert.equal(els.get("ses-next")?.disabled, true);
+    } finally {
+        releaseSlow(Response.json(pageData(1, 20)));
     }
 });
 

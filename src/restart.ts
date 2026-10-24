@@ -59,6 +59,7 @@ import { closeLogger, type Logger } from "./logger.js";
 import { flushAllSessions, totalInFlight } from "./session.js";
 import { flushConversations } from "./plugin.js";
 import { flushPrefixAffinity } from "./affinity-persist.js";
+import { flushOrderSkeletons } from "./order-persist.js";
 import { findInstallDir, isVersionNewer, verifyInstallLoadable } from "./update.js";
 import { isPidAlive, listInstances } from "./instance.js";
 import { UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
@@ -412,18 +413,31 @@ export async function performSelfRestart(deps: SelfRestartDeps): Promise<SelfRes
     };
 }
 
+/** Wait up to `ms` for `pid` to die; true once it's gone (final recheck
+ *  after the loop so a death landing exactly at the deadline isn't missed). */
+async function waitUntilGone(pid: number, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+        if (!isPidAlive(pid)) return true;
+        await sleep(POLL_MS);
+    }
+    return !isPidAlive(pid);
+}
+
 /** Terminate a failed replacement and verify it actually died (#3044): a
  *  kill that silently no-ops leaves exactly the orphan processes that report
- *  describes — idle, holding a port nobody routes to, accumulating memory. */
+ *  describes — idle, holding a port nobody routes to, accumulating memory.
+ *  #3344: escalate SIGTERM → SIGKILL before asking a human — a replacement
+ *  stuck in a SIGTERM-resistant state (blocked syscall / TERM ignored) is
+ *  still force-killable; manual cleanup stays only the last resort. */
 async function killAndVerify(child: ChildProcess, pid: number | undefined, verifyMs: number, log: Logger): Promise<void> {
     try { child.kill(); } catch { /* already gone */ }
     if (pid === undefined) return;
-    const deadline = Date.now() + verifyMs;
-    while (Date.now() < deadline) {
-        if (!isPidAlive(pid)) return;
-        await sleep(POLL_MS);
-    }
-    log("error", `[restart] replacement pid ${pid} is still alive after SIGTERM — manual cleanup required (kill ${pid}); until it dies it keeps leaking CPU/memory on a port nobody routes to (#3044)`);
+    if (await waitUntilGone(pid, verifyMs)) return;
+    // SIGTERM didn't take within the window — escalate before reporting.
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    if (await waitUntilGone(pid, verifyMs)) return;
+    log("error", `[restart] replacement pid ${pid} is still alive after SIGTERM+SIGKILL — manual cleanup required (kill -9 ${pid}); until it dies it keeps leaking CPU/memory on a port nobody routes to (#3044)`);
 }
 
 function resumeListening(server: http.Server, host: string, port: number, log: Logger): void {
@@ -436,16 +450,18 @@ function resumeListening(server: http.Server, host: string, port: number, log: L
 
 /** #1724: durable-state set captured before the replacement boots — mirrors
  *  what the normal shutdown path persists (conversations + sessions +
- *  prefix-affinity). */
+ *  prefix-affinity + session-order skeletons #3397). */
 async function defaultPreSpawnFlush(): Promise<void> {
     flushConversations();
     await flushAllSessions();
     flushPrefixAffinity();
+    flushOrderSkeletons();
 }
 
 function defaultFinish(): void {
     flushConversations();
     flushPrefixAffinity();
+    flushOrderSkeletons();
     void flushAllSessions().finally(() => {
         closeLogger();
         process.exit(0);

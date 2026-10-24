@@ -6,9 +6,25 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
+import { vertexEnabled } from "./vertex.js";
 
 export interface ClaudeSettings {
     anthropicBaseUrl?: string;
+    /** Vertex AI is the lane's provider (Claude Code's own
+     *  `CLAUDE_CODE_USE_VERTEX=1`). When it is set, Claude Code ignores
+     *  `ANTHROPIC_BASE_URL` and posts to `ANTHROPIC_VERTEX_BASE_URL` — a
+     *  launcher that rewrites only the former routes nothing. */
+    vertexEnabled?: boolean;
+    /** `ANTHROPIC_VERTEX_BASE_URL` — an explicit Vertex endpoint (may carry a
+     *  path, may be a private endpoint or a relay). */
+    vertexBaseUrl?: string;
+    /** `CLOUD_ML_REGION` — the client builds `/locations/{region}/…` from this
+     *  value, so the host the launcher derives must come from the same one or
+     *  host and path disagree and Vertex 404s. */
+    vertexRegion?: string;
+    /** `ANTHROPIC_VERTEX_PROJECT_ID` — diagnostic only: the client builds its
+     *  own `/projects/{id}/…` path and nothing derives from it. */
+    vertexProjectId?: string;
     /** Model claude runs: settings `env.ANTHROPIC_MODEL` ?? top-level `model`. */
     model?: string;
     /** The user's explicit auto-compact window (settings `autoCompactWindow`
@@ -615,6 +631,13 @@ export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.Pro
     let anthropicBaseUrl: string | undefined;
     let model: string | undefined;
     let autoCompactWindow: number | undefined;
+    // Vertex (Claude Code's third-party convention, same precedence as the base
+    // URL above): the settings env block is where a user configures Vertex, so
+    // it cannot be shell-only — but the shell is honored as the fallback.
+    let vertexFlagRaw: string | undefined;
+    let vertexBaseUrl: string | undefined;
+    let vertexRegion: string | undefined;
+    let vertexProjectId: string | undefined;
     for (const f of files) {
         const obj = readJsonObject(f);
         const settingsEnv = obj?.env;
@@ -628,6 +651,14 @@ export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.Pro
             if (nonEmpty(m)) model = String(m);
             const acw = Number(e.CLAUDE_CODE_AUTO_COMPACT_WINDOW);
             if (Number.isFinite(acw) && acw > 0) autoCompactWindow = acw;
+            const vf = e.CLAUDE_CODE_USE_VERTEX;
+            if (vf !== undefined) vertexFlagRaw = String(vf);
+            const vbu = e.ANTHROPIC_VERTEX_BASE_URL;
+            if (nonEmpty(vbu)) vertexBaseUrl = String(vbu);
+            const vreg = e.CLOUD_ML_REGION;
+            if (nonEmpty(vreg)) vertexRegion = String(vreg);
+            const vpid = e.ANTHROPIC_VERTEX_PROJECT_ID;
+            if (nonEmpty(vpid)) vertexProjectId = String(vpid);
         }
         const tm = obj?.model;
         if (nonEmpty(tm) && model === undefined) model = String(tm);
@@ -637,8 +668,20 @@ export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.Pro
     // Honor a shell-exported ANTHROPIC_BASE_URL (claude's native override) so
     // the launcher wraps the relay the user actually uses, not the default.
     if (!anthropicBaseUrl && nonEmpty(env.ANTHROPIC_BASE_URL)) anthropicBaseUrl = env.ANTHROPIC_BASE_URL;
+    if (vertexFlagRaw === undefined && env.CLAUDE_CODE_USE_VERTEX !== undefined) vertexFlagRaw = env.CLAUDE_CODE_USE_VERTEX;
+    if (!vertexBaseUrl && nonEmpty(env.ANTHROPIC_VERTEX_BASE_URL)) vertexBaseUrl = env.ANTHROPIC_VERTEX_BASE_URL;
+    if (!vertexRegion && nonEmpty(env.CLOUD_ML_REGION)) vertexRegion = env.CLOUD_ML_REGION;
+    if (!vertexProjectId && nonEmpty(env.ANTHROPIC_VERTEX_PROJECT_ID)) vertexProjectId = env.ANTHROPIC_VERTEX_PROJECT_ID;
+    // A settings-file value beats the shell here: the env block is applied by
+    // claude itself, so an explicit `=0` in settings must not be overridden by
+    // a stale export in the launching shell.
+    const vertexOn = vertexEnabled({ CLAUDE_CODE_USE_VERTEX: vertexFlagRaw });
     return {
         ...(anthropicBaseUrl ? { anthropicBaseUrl } : {}),
+        ...(vertexOn ? { vertexEnabled: true } : {}),
+        ...(vertexBaseUrl ? { vertexBaseUrl } : {}),
+        ...(vertexRegion ? { vertexRegion } : {}),
+        ...(vertexProjectId ? { vertexProjectId } : {}),
         ...(model ? { model } : {}),
         ...(autoCompactWindow ? { autoCompactWindow } : {}),
     };

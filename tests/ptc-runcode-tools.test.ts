@@ -3,10 +3,11 @@
 // The two serving sites answer with description-side notes so the model never
 // has to rediscover the calling convention by trial and error:
 //  - proxy lane (injectTool & co): when the client's own tools array carries
-//    run_code, the injected ACP entries get PTC_EXEMPT_NOTE ("this tool is the
-//    exception — call it DIRECTLY; the proxy executes it server-side"),
-//    because bili's tools have no run_code SDK binding and the proxy tool loop
-//    executes direct calls upstream of the harness.
+//    a known code-mode omnibus (run_code / code_run — #3884), the injected
+//    ACP entries get PTC_EXEMPT_NOTE ("this tool is the exception — call it
+//    DIRECTLY; the proxy executes it server-side"), because bili's tools have
+//    no omnibus SDK binding and the proxy tool loop executes direct calls
+//    upstream of the harness.
 //  - plugin lane (handlePluginManifest): every wire gets PTC_BINDING_NOTE (the
 //    conditional both-conventions sentence) since one manifest serves native
 //    and code-mode hosts alike.
@@ -109,6 +110,44 @@ test("injectGoogleTool: no run_code → no exempt note", () => {
     const decls = new Map(out.flatMap((t) => (t.functionDeclarations ?? []).map((d) => [d.name, d.description] as const)) as [string, string][]);
     assert.ok(!(decls.get("compress") ?? "").includes(PTC_EXEMPT_NOTE));
     assert.ok((decls.get("compress") ?? "").includes(PROJECT_URL_NOTE));
+});
+
+// #3884: DSH 0.2.x code-mode transport is named `code_run` (dsh-codemode
+// plugin; the reserved name `run_code` belongs to dsh-tools). ptcNoteMode must
+// read it code-mode-shaped too, or proxy-lane injections for such clients lose
+// the exempt note and the model may refuse direct bili calls under the
+// harness's only-omnibus rule — silent compression failure, same family as the
+// lane-decisions miss. Positive rows below; the negative direction is pinned by
+// the bash-only rows above (#3617 bidirectional discipline).
+const CODE_RUN = { name: "code_run", description: "Run a program in the sandbox." };
+
+test("injectTool: code_run client → exempt note on ACP entries (#3884)", () => {
+    const out = flat(injectTool([CODE_RUN, BASH] as unknown[]));
+    assert.equal(out.get("code_run"), CODE_RUN.description, "client entry untouched");
+    for (const name of ["compress", "decompress", "search_context", "acp_status", "acp_cache"]) {
+        assert.ok((out.get(name) ?? "").includes(PTC_EXEMPT_NOTE), `${name} carries the exempt note`);
+    }
+});
+
+test("injectOpenaiTool: code_run client → exempt note under function.description (#3884)", () => {
+    const out = openaiShape(injectOpenaiTool([
+        { type: "function", function: { name: "code_run", description: "prog", parameters: { type: "object" } } },
+    ]) as { function: { name?: string; description?: string } }[]);
+    assert.ok((out.get("compress") ?? "").includes(PTC_EXEMPT_NOTE));
+    assert.ok((out.get("acp_status") ?? "").includes(PTC_EXEMPT_NOTE));
+});
+
+test("injectResponsesTool: code_run client → exempt note, flat shape (#3884)", () => {
+    const out = flat(injectResponsesTool([CODE_RUN] as unknown[]));
+    assert.ok((out.get("decompress") ?? "").includes(PTC_EXEMPT_NOTE));
+    assert.ok((out.get("compress") ?? "").includes(PROJECT_URL_NOTE));
+});
+
+test("injectGoogleTool: code_run declaration → exempt note on appended declarations (#3884)", () => {
+    const out = injectGoogleTool([{ functionDeclarations: [{ name: "code_run", description: "prog" }] }] as never);
+    const decls = new Map(out.flatMap((t) => (t.functionDeclarations ?? []).map((d) => [d.name, d.description] as const)) as [string, string][]);
+    assert.ok((decls.get("compress") ?? "").includes(PTC_EXEMPT_NOTE));
+    assert.equal(decls.get("code_run"), "prog", "client declaration untouched");
 });
 
 // — plugin lane: manifest always carries the binding note (no per-request signal) —

@@ -26,6 +26,14 @@ function captureStderr(): { lines: string[]; restore: () => void } {
     return { lines, restore: () => Object.defineProperty(process, "stderr", { configurable: true, value: orig }) };
 }
 
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 3000): Promise<void> {
+    const start = Date.now();
+    while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${what}`);
+        await new Promise((r) => setTimeout(r, 20));
+    }
+}
+
 async function settle(file: string, timeoutMs = 3000): Promise<void> {
     const start = Date.now();
     let last = -1;
@@ -50,6 +58,13 @@ test("muteStderrLeg: file leg live → stderr silent, file still written", async
     const cap = captureStderr();
     configureLogger(file);
     try {
+        // #3857: liveness is proven by a DELIVERED write (an async open — or on
+        // win32, an fd whose writes fail — does not count), so seed one first.
+        log("info", "seed");
+        // fd visibility alone lags behind delivery ('open' precedes the first
+        // flushed write) — wait for a byte on disk, not an open event.
+        // existsSync first: the file only exists once the async open lands.
+        await waitFor(() => fs.existsSync(file) && fs.statSync(file).size > 0, "delivered write proves the leg");
         log("info", "pre-mute");
         assert.ok(cap.lines.some((l) => l.includes("pre-mute")), "unmuted tee must reach stderr");
         assert.equal(isFileLoggingActive(), true);

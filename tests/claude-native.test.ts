@@ -15,6 +15,8 @@ import {
     CLAUDE_ACP_CACHE_COMMAND,
     claudeAcpCacheCommandFile,
     claudeNativeBaseUrl,
+    claudeNativeVertexBaseUrl,
+    claudeNativeOrigin,
     claudeNativeInstalled,
     claudeSettingsFile,
     claudeNativeBaseUrlForOrigin,
@@ -95,6 +97,118 @@ test("applyClaudeManagedBlock: never clobbers foreign keys", () => {
     assert.ok(notes.some((n) => n.includes("foreign value") || n.includes("left untouched")));
 });
 
+test("applyClaudeManagedBlock: pins the Vertex variable too when one is resolved", () => {
+    // Vertex port, phase 1 (decision 4): with CLAUDE_CODE_USE_VERTEX=1 the client
+    // ignores the block's ANTHROPIC_BASE_URL, so a native install without this key
+    // calls Google directly and never touches bili.
+    const vertexUrl = "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1";
+    const { data, notes } = applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: vertexUrl });
+    const env = data.env as Record<string, string>;
+    assert.equal(env.ANTHROPIC_BASE_URL, baseUrlForPort(48787));
+    assert.equal(env.ANTHROPIC_VERTEX_BASE_URL, vertexUrl);
+    assert.ok(notes.some((n) => n.includes("ANTHROPIC_VERTEX_BASE_URL")));
+});
+
+test("applyClaudeManagedBlock: rewrites an older bili Vertex URL to the current port", () => {
+    const stale = "http://127.0.0.1:40000/bili/anthropic/https://aiplatform.googleapis.com/v1";
+    const current = "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1";
+    assert.equal(isBiliClaudeBaseUrl(stale), true, "the protocol segment is still a bili URL");
+    const { data } = applyClaudeManagedBlock({ env: { ANTHROPIC_VERTEX_BASE_URL: stale } }, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: current });
+    assert.equal((data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, current);
+});
+
+test("applyClaudeManagedBlock: a foreign Vertex variable is never clobbered", () => {
+    const settings = { env: { ANTHROPIC_VERTEX_BASE_URL: "https://vertex-gateway.example/v1" } };
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1" });
+    assert.equal((data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, "https://vertex-gateway.example/v1");
+    assert.ok(notes.some((n) => n.includes("ANTHROPIC_VERTEX_BASE_URL") && n.includes("left untouched")));
+});
+
+test("applyClaudeManagedBlock: Vertex off (no resolved value) leaves the key alone entirely", () => {
+    const { data, notes } = applyClaudeManagedBlock({ env: { ANTHROPIC_VERTEX_BASE_URL: "https://vertex-gateway.example/v1" } }, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
+    assert.equal((data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, "https://vertex-gateway.example/v1");
+    assert.ok(!notes.some((n) => n.includes("ANTHROPIC_VERTEX_BASE_URL")));
+    assert.equal((applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND }).data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, undefined);
+});
+
+test("claudeNativeVertexBaseUrl: resolves the client's own config, settings block first", () => {
+    // Same resolution order the client uses: a settings.json env block is where a
+    // Vertex user configures this, with the shell only as fallback.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-vertex-home-"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "bili-vertex-cwd-"));
+    try {
+        fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+        fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({
+            env: { CLAUDE_CODE_USE_VERTEX: "1", CLOUD_ML_REGION: "global", ANTHROPIC_VERTEX_PROJECT_ID: "aolshev-playground" },
+        }));
+        assert.equal(
+            claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd),
+            "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1",
+        );
+        // Switch off in the same file: nothing to pin, the key must not appear.
+        fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ env: { CLOUD_ML_REGION: "global" } }));
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), undefined);
+        // Switch on without a region and without an explicit URL: not routable.
+        fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_USE_VERTEX: "1" } }));
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), undefined);
+        // An explicit endpoint wins over the region and is handed over untouched.
+        fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({
+            env: { CLAUDE_CODE_USE_VERTEX: "1", CLOUD_ML_REGION: "us-east5", ANTHROPIC_VERTEX_BASE_URL: "https://gateway.example/vertex/v1/" },
+        }));
+        assert.equal(
+            claudeNativeVertexBaseUrl("http://127.0.0.1:48787/", {}, home, cwd),
+            "http://127.0.0.1:48787/bili/anthropic/https://gateway.example/vertex/v1",
+        );
+    } finally {
+        rmrf(home);
+        rmrf(cwd);
+    }
+});
+
+test("claudeNativeVertexBaseUrl: an already-managed value is never wrapped twice", () => {
+    // Install writes this key, then the SessionStart hook re-derives it from the
+    // file it wrote. Treating our own wrapper as a user endpoint nested another
+    // /bili/anthropic/ layer per repin, so the URL ended up targeting the proxy's
+    // own port — which the tunnel guard denies (403 detail:"self").
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-vertex-home-"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "bili-vertex-cwd-"));
+    try {
+        fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+        const file = path.join(home, ".claude", "settings.json");
+        const managed = "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1";
+        const write = (url: string) => fs.writeFileSync(file, JSON.stringify({
+            env: { CLAUDE_CODE_USE_VERTEX: "1", CLOUD_ML_REGION: "global", ANTHROPIC_VERTEX_BASE_URL: url },
+        }));
+        write(managed);
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), managed, "idempotent on its own output");
+        const once = claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd)!;
+        write(once);
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), managed, "a repin does not nest a layer");
+        // A relay the user baked in behind our wrapper is preserved: only our own
+        // wrapper comes off, the inner endpoint is handed over untouched.
+        const relay = "https://vertex-gateway.example/proxy/v1";
+        write(`http://127.0.0.1:40000/bili/anthropic/${relay}`);
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), `http://127.0.0.1:48787/bili/anthropic/${relay}`);
+        // An explicit non-bili endpoint still wins over the region (unchanged rule).
+        write("https://gateway.example/vertex/v1");
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), "http://127.0.0.1:48787/bili/anthropic/https://gateway.example/vertex/v1");
+        // The file bili 0.1.197 left behind holds TWO layers; the derivation must
+        // collapse both rather than settle at two.
+        write(`http://127.0.0.1:48787/bili/anthropic/${managed}`);
+        assert.equal(claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd), managed, "a nested value collapses to the endpoint");
+        // The install path is idempotent on what it wrote: apply twice, nothing moves
+        // (before the fix the URL grew a layer per run).
+        const derive = () => claudeNativeVertexBaseUrl("http://127.0.0.1:48787", {}, home, cwd)!;
+        const first = applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: derive() });
+        const second = applyClaudeManagedBlock(first.data, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: derive() });
+        assert.deepEqual(second.data, first.data, "a re-apply changes nothing");
+        assert.equal((second.data.env as Record<string, string>).ANTHROPIC_VERTEX_BASE_URL, managed);
+    } finally {
+        rmrf(home);
+        rmrf(cwd);
+    }
+});
+
 test("applyClaudeManagedBlock: preserves user SessionStart entries, refreshes ours", () => {
     const userEntry = { matcher: "startup", hooks: [{ type: "command", command: "echo hi" }] };
     const first = applyClaudeManagedBlock({ hooks: { SessionStart: [userEntry] } }, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
@@ -128,10 +242,10 @@ test("stripClaudeManagedBlock: round-trip removes ours, keeps user keys", () => 
     const userEntry = { hooks: [{ type: "command", command: "echo hi" }] };
     const applied = applyClaudeManagedBlock(
         { env: { ...userEnv }, hooks: { SessionStart: [userEntry], PreCompact: [userEntry] } },
-        { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND },
+        { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, vertexBaseUrl: "http://127.0.0.1:48787/bili/anthropic/https://aiplatform.googleapis.com/v1" },
     );
     const { data, removed } = stripClaudeManagedBlock(applied.data);
-    assert.deepEqual(removed.sort(), ["env.DISABLE_AUTO_COMPACT", "env.ANTHROPIC_BASE_URL", "hooks.SessionStart entry"].sort());
+    assert.deepEqual(removed.sort(), ["env.DISABLE_AUTO_COMPACT", "env.ANTHROPIC_BASE_URL", "env.ANTHROPIC_VERTEX_BASE_URL", "hooks.SessionStart entry"].sort());
     assert.deepEqual(data.env, userEnv);
     assert.deepEqual((data.hooks as Record<string, unknown[]>).SessionStart, [userEntry]);
     assert.ok((data.hooks as Record<string, unknown>).PreCompact);
@@ -1025,6 +1139,33 @@ test("claudeNativeRoutingCheck: non-bili ANTHROPIC_BASE_URL fires; bili URL and 
     assert.equal(both.reasons.length, 2);
 });
 
+test("claudeNativeRoutingCheck: a Vertex session routes on ANTHROPIC_VERTEX_BASE_URL, so the managed ANTHROPIC_BASE_URL cannot be trusted alone (#3323)", () => {
+    const biliBase = baseUrlForPort(18787);
+    const biliVertex = baseUrlForPort(18787).replace(/\/bili\//, "/bili/anthropic/");
+    // Vertex on, variable unset: claude derives the aiplatform host itself, so
+    // the managed settings.json value routes nothing — the case the pre-Vertex
+    // check reported as healthy.
+    const unset = claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: "1" });
+    assert.equal(unset.bypassed, true);
+    assert.match(unset.reasons[0]!, /ANTHROPIC_VERTEX_BASE_URL is unset/);
+    // Vertex on with a foreign Vertex base URL.
+    const foreign = claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: "1", ANTHROPIC_VERTEX_BASE_URL: "https://aiplatform.googleapis.com" });
+    assert.equal(foreign.bypassed, true);
+    assert.match(foreign.reasons[0]!, /ANTHROPIC_VERTEX_BASE_URL=https:\/\/aiplatform\.googleapis\.com/);
+    // Vertex on with the launcher's own value — the healthy shape phase 1 emits.
+    assert.equal(claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: "1", ANTHROPIC_VERTEX_BASE_URL: biliVertex }).bypassed, false);
+    // The switch is read the same way src/vertex.ts reads it: 0/false/no/off and
+    // an absent value mean off, and then a plain bili ANTHROPIC_BASE_URL is healthy.
+    for (const off of ["0", "false", "no", "off", ""]) {
+        assert.equal(claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: off, ANTHROPIC_BASE_URL: biliBase }).bypassed, false, `CLAUDE_CODE_USE_VERTEX=${JSON.stringify(off)} must not fire`);
+    }
+    // Vertex on AND a foreign ANTHROPIC_BASE_URL still reports both signals —
+    // the entrypoint-style reasons are additive, not exclusive.
+    const both = claudeNativeRoutingCheck({ CLAUDE_CODE_USE_VERTEX: "1", ANTHROPIC_BASE_URL: "https://api.anthropic.com" });
+    assert.equal(both.bypassed, true);
+    assert.equal(both.reasons.length, 2);
+});
+
 test("#2290 marker round-trip: recordClaudeRoutingWarning writes what doctor reads, latest wins, never throws", () => {
     const state = fs.mkdtempSync(path.join(os.tmpdir(), "bc-claude-route-mark-"));
     const prev = process.env.XDG_STATE_HOME;
@@ -1474,8 +1615,10 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
         assert.ok(await canConnect(port), "proxy survives the transient sh wrapper's death");
 
         // Session end: claude dies, the proxy must follow within a few ticks.
+        // #3890 widened owner-death→exit by up to ~6s (three consecutive failed
+        // probes now confirm death instead of one) — deadline re-sized to match.
         if (claudePid > 1) killPid(claudePid);
-        const deadline = Date.now() + 15_000;
+        const deadline = Date.now() + 30_000;
         while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
         assert.equal(await canConnect(port), false, "proxy exits with the claude session");
     } finally {
@@ -1556,17 +1699,22 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
         // Grace: keeper1 dies, and BEFORE the idle grace expires a new owner
         // registers (the live race: spawner exits right after a second session
         // starts). The pending shutdown must be cancelled — the proxy stays up
-        // well past the grace window.
+        // well past the grace window. #3890: keeper1's removal now takes ~6s
+        // (three consecutive failed probes confirm death), so the late
+        // registration lands AFTER removal but INSIDE the 5s idle grace that
+        // follows it — still exercising the cancellation of an armed pending
+        // shutdown (which would otherwise fire ~11s after the death).
         if (keeperPid > 1) killPid(keeperPid);
-        await new Promise((r) => setTimeout(r, 3000));
+        await new Promise((r) => setTimeout(r, 8000));
         const late = await post({ pid: keeper2Pid });
         assert.equal(late.status, 200, "late registration within the grace window accepted");
-        await new Promise((r) => setTimeout(r, 7000));
+        await new Promise((r) => setTimeout(r, 8000));
         assert.ok(await canConnect(port), "grace registration cancelled the pending shutdown");
 
         // LAST owner dies → armed proxy must follow (≤ a few ticks + grace).
+        // #3890 widened owner-death→exit by up to ~6s (confirmation ticks).
         if (keeper2Pid > 1) killPid(keeper2Pid);
-        const deadline = Date.now() + 15_000;
+        const deadline = Date.now() + 30_000;
         while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
         assert.equal(await canConnect(port), false, "armed proxy exits when its watcher dies");
 
@@ -1774,8 +1922,9 @@ test("hook e2e: shared proxy survives the first session's exit, dies after the l
         assert.equal(instMid.pid, proxyPid, "same proxy instance throughout — no respawn");
 
         // Last session exits → the proxy must follow within a few ticks.
+        // #3890 widened owner-death→exit by up to ~6s (confirmation ticks).
         if (claudeB > 1) killPid(claudeB);
-        const deadline = Date.now() + 15_000;
+        const deadline = Date.now() + 30_000;
         while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
         assert.equal(await canConnect(port), false, "proxy exits after the LAST session");
     } finally {

@@ -229,7 +229,17 @@ test("e2e: rollback-form advisory (#1588) — forced rollback, no ping-pong, per
     // --- setup: registry with the controlled version sequence, disk on START
     reg = await startRegistry(path.join(work, "registry"));
     const envBase = isolatedEnv(work);
-    const biliEnv = { ...envBase, BILI_UPDATE_REGISTRY: reg.url, BILI_UPDATE_CHECK_INTERVAL_MS: String(CYCLE_MS) };
+    const biliEnv = {
+        ...envBase,
+        BILI_UPDATE_REGISTRY: reg.url,
+        BILI_UPDATE_CHECK_INTERVAL_MS: String(CYCLE_MS),
+        // #3619 pins: this suite drives version sequencing via advisory
+        // force-installs and periodic checks with tight waits — keep the
+        // stagger rollout at legacy immediate and the policy file unreachable.
+        BILI_UPDATE_STAGGER_MIN_MS: "0",
+        BILI_UPDATE_STAGGER_MAX_MS: "0",
+        BILI_UPDATE_POLICY_URL: "http://127.0.0.1:1/no-policy.json",
+    };
 
     const startTgz = await makeFixtureTarball(work, START);
     const latestTgz = await makeFixtureTarball(work, LATEST);

@@ -20,6 +20,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 
 process.env.NODE_ENV = "test";
 
@@ -44,13 +45,15 @@ import {
     BILI_DECOMPRESS_TOOL_OPENAI,
     BILI_DECOMPRESS_TOOL_RESPONSES,
     BILI_DECOMPRESS_TOOL_GOOGLE,
+    ABSORB_TOOL_RESPONSES,
+    READ_ORIGINAL_IMAGE_TOOL_NAME,
     RULE_TOOL,
     RULE_TOOL_OPENAI,
     RULE_TOOL_RESPONSES,
     RULE_TOOL_GOOGLE,
     retrieveToolsFor,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -72,6 +75,23 @@ test("WC-015 validates message-item IDs without constraining provider namespaces
     assert.deepEqual(VALIDATORS.responses({ input: [{ type: "reasoning", id: "rs_1" }] }), []);
     assert.deepEqual(VALIDATORS.responses({ input: [{ type: "function_call", id: "fc_1", call_id: "c1", name: "f", arguments: "{}" }] }), []);
     assert.match(VALIDATORS.responses({ input: [{ type: "message", role: "assistant", id: "marker-1791393957942-2", content: "x" }] })[0], /WC-015/);
+});
+
+test("WC-022 tool_addition/tool_removal blocks are only valid inside role:system messages", () => {
+    const addition = { type: "tool_addition", tool: { type: "tool_definition", definition: { name: "t", input_schema: { type: "object", properties: {} } } } };
+    assert.deepEqual(VALIDATORS.anthropic({
+        messages: [
+            { role: "user", content: [{ type: "text", text: "u" }] },
+            { role: "system", content: [{ type: "text", text: "tools changed" }, addition] },
+        ],
+    }), []);
+    // The master-b156c02f shape: the system message re-emitted as user.
+    assert.match(VALIDATORS.anthropic({
+        messages: [{ role: "user", content: [{ type: "text", text: "tools changed" }, addition] }],
+    })[0], /WC-022/);
+    assert.match(VALIDATORS.anthropic({
+        messages: [{ role: "user", content: [{ type: "tool_removal", tool_name: "t" }] }],
+    })[0], /WC-022/);
 });
 
 test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
@@ -131,7 +151,10 @@ function toolNameOf(wire: Wire, t: ToolShape): string | undefined {
     return typeof t.name === "string" ? t.name : undefined;
 }
 
-const COMPRESS_FORM_PROPS = ["topic", "content", "startId", "endId", "startRef", "endRef", "summary"];
+// #4252: only the string form is advertised (topic + content). The legacy
+// flat-form fields (startId/endId/startRef/endRef/summary) and array content
+// remain functional in parseCompressInput but are deliberately NOT taught.
+const COMPRESS_FORM_PROPS = ["topic", "content"];
 
 function assertCompressFormsKept(tool: ToolShape | undefined, source: string): void {
     assert.ok(tool, `${source}: compress tool present`);
@@ -164,6 +187,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
                 tools: [{ name: "t", input_schema: { type: "object", properties: {} } }],
                 system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
             },
+            // WC-022: a pi mid-conversation system message re-emitted as user.
+            { messages: [{ role: "user", content: [{ type: "tool_removal", tool_name: "t" }] }] },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
@@ -203,6 +228,24 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
     // cannot enforce them (WC-013 forbids exactly what WC-017 requires, same frame shape).
     const laneProbes: Array<{ ruleId: string; validate: (body: unknown) => string[]; body: unknown }> = [
         { ruleId: "WC-017", validate: validateCodexResponsesWsCreate, body: { type: "response.create", input: [] } },
+        // WC-019/020/021 are the Vertex Anthropic lane (lane: "vertex-anthropic") — the wire rules that
+        // hold only on that lane, so the shared anthropic validator must not carry them. WC-019 is
+        // body-level; WC-020 is path-level (its clause is the parser returning null, which the fake
+        // turns into the 404 Vertex itself answers); WC-021 is envelope-level (the clause is the error
+        // envelope the fake actually returns). End-to-end assertions live in
+        // tests/vertex-fake-upstream.test.ts, including that the fake accepts the captured client bytes.
+        { ruleId: "WC-019", validate: validateVertexAnthropicBody, body: { max_tokens: 1 } },
+        {
+            ruleId: "WC-020",
+            validate: (body: unknown) => (vertexAnthropicPathInfo(String(body)) ? [] : ["WC-020 not a Vertex Anthropic publisher path"]),
+            body: "/v1/messages",
+        },
+        {
+            ruleId: "WC-021",
+            validate: (streaming: unknown) =>
+                Array.isArray(JSON.parse(vertexErrorEnvelope(streaming === true, "x").body)) ? ["WC-021 stream errors are array-wrapped"] : [],
+            body: true,
+        },
     ];
     for (const { ruleId, validate, body } of laneProbes) {
         assert.ok(validate(body).some(v => v.startsWith(ruleId)), `lane-scoped rule ${ruleId} has no live enforcement clause in its lane fake`);
@@ -272,6 +315,7 @@ const BILI_ARRAYS: Array<[string, Wire]> = [
 const BILI_INDIVIDUALS: Array<[string, Wire]> = [
     ["BILI_SEARCH_CONTEXT_TOOL", "anthropic"], ["BILI_SEARCH_CONTEXT_TOOL_OPENAI", "openai-chat"], ["BILI_SEARCH_CONTEXT_TOOL_RESPONSES", "responses"], ["BILI_SEARCH_CONTEXT_TOOL_GOOGLE", "google"],
     ["BILI_DECOMPRESS_TOOL", "anthropic"], ["BILI_DECOMPRESS_TOOL_OPENAI", "openai-chat"], ["BILI_DECOMPRESS_TOOL_RESPONSES", "responses"], ["BILI_DECOMPRESS_TOOL_GOOGLE", "google"],
+    ["ABSORB_TOOL_RESPONSES", "responses"],
     ["RULE_TOOL", "anthropic"], ["RULE_TOOL_OPENAI", "openai-chat"], ["RULE_TOOL_RESPONSES", "responses"], ["RULE_TOOL_GOOGLE", "google"],
 ];
 
@@ -279,7 +323,7 @@ const BILI_CONSTANTS: Record<string, unknown> = {
     BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_READONLY_TOOLS_RESPONSES,
     BILI_SEARCH_CONTEXT_TOOL, BILI_SEARCH_CONTEXT_TOOL_OPENAI, BILI_SEARCH_CONTEXT_TOOL_RESPONSES, BILI_SEARCH_CONTEXT_TOOL_GOOGLE,
     BILI_DECOMPRESS_TOOL, BILI_DECOMPRESS_TOOL_OPENAI, BILI_DECOMPRESS_TOOL_RESPONSES, BILI_DECOMPRESS_TOOL_GOOGLE,
-    RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, RULE_TOOL_GOOGLE,
+    ABSORB_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, RULE_TOOL_GOOGLE,
     RETRIEVE_TOOLS: retrieveToolsFor("acp_retrieve"),
 };
 
@@ -345,25 +389,25 @@ test("wire-contract C: default manifest serves only legal base tools", () => {
     assertManifestLegal(m, "default");
     const anthNames = new Set(m.tools.anthropic.map((t) => t.name));
     for (const n of BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name)) assert.ok(anthNames.has(n), `default manifest: base tool ${n} present`);
-    for (const optIn of ["acp_retrieve"]) assert.ok(!anthNames.has(optIn), `default manifest: ${optIn} absent when disabled (#1192)`);
-    assert.ok(!anthNames.has("acp_rule"), "default manifest: acp_rule absent — opt-in extra (#1192 discipline)");
+    for (const optIn of ["absorb", "acp_retrieve"]) assert.ok(!anthNames.has(optIn), `default manifest: ${optIn} absent when disabled (#1192)`);
+    assert.ok(!anthNames.has("acp_rule"), "default manifest: acp_rule absent — opt-in like absorb (#1192 discipline)");
     const offM = captureManifest({ ...defaultConfig(100_000), rules: { enabled: false } });
     assert.ok(!new Set(offM.tools.anthropic.map((t) => t.name)).has("acp_rule"), "disabled manifest: acp_rule absent (#1192)");
     assertCompressFormsKept(m.tools.anthropic.find((t) => t.name === "compress") as ToolShape, "manifest-default");
 });
 
-test("wire-contract C: opt-in manifest advertises acp_rule/acp_retrieve legally", () => {
-    const config = { ...defaultConfig(100_000), rules: { enabled: true }, ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } };
+test("wire-contract C: opt-in manifest advertises absorb/acp_rule/acp_retrieve legally", () => {
+    const config = { ...defaultConfig(100_000), absorb: { ...K.DEFAULT_ABSORB_CONFIG, enabled: true }, rules: { enabled: true }, ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } };
     const m = captureManifest(config);
     assertManifestLegal(m, "optin");
     const anthNames = new Set(m.tools.anthropic.map((t) => t.name));
     const openAiNames = new Set(m.tools.openai.map((t) => toolNameOf("openai-chat", t)));
     const respNames = new Set(m.tools.responses.map((t) => t.name));
-    for (const n of ["acp_rule", "acp_retrieve"]) {
+    for (const n of ["absorb", "acp_rule", "acp_retrieve"]) {
         assert.ok(anthNames.has(n), `optin manifest: anthropic advertises ${n}`);
         assert.ok(openAiNames.has(n), `optin manifest: openai advertises ${n}`);
     }
-    assert.ok(respNames.has("acp_rule"), "optin manifest: responses advertises acp_rule");
+    for (const n of ["absorb", "acp_rule"]) assert.ok(respNames.has(n), `optin manifest: responses advertises ${n}`);
     assert.ok(!respNames.has("acp_retrieve"), "optin manifest: responses does NOT advertise acp_retrieve (#1271)");
     assertCompressFormsKept(m.tools.anthropic.find((t) => t.name === "compress") as ToolShape, "manifest-optin");
 });
@@ -374,11 +418,28 @@ test("wire-contract C: opt-in manifest advertises acp_rule/acp_retrieve legally"
 
 interface Lane {
     wire: Wire;
+    /** Protocol marker for the `/bili/<protocol>/<url>` form. Unset keeps the bare
+     *  `/bili/<url>` URL every pre-existing lane uses, byte for byte. */
+    protocol?: string;
+    /** When set, the fake enforces this lane's own contract instead of the wire's. */
+    lane?: "vertex-anthropic";
     model: string;
     path: string;
     clientBody: Record<string, unknown>;
     clientToolNames: string[];
 }
+
+/** Phase 0's captured client body, replayed through the proxy here so the contract
+ *  layer sees the bytes a real Claude Code-on-Vertex turn sends (45 KB, twelve
+ *  client tools). The client tool names are derived from the same bytes rather
+ *  than listed: the assertion is "everything the client owned survives", and a
+ *  hardcoded copy would quietly stop asserting that the day the capture changes. */
+const VERTEX_CAPTURED_BODY = JSON.parse(
+    readFileSync(new URL("./fixtures/vertex-anthropic/turn-streaming.body.json", import.meta.url), "utf8"),
+) as Record<string, unknown>;
+const VERTEX_CAPTURED_TOOL_NAMES = ((VERTEX_CAPTURED_BODY.tools ?? []) as Array<{ name?: unknown }>)
+    .map((t) => t.name)
+    .filter((n): n is string => typeof n === "string");
 
 const LANES: Lane[] = [
     {
@@ -393,6 +454,20 @@ const LANES: Lane[] = [
             tools: [{ name: "client_tool", description: "client-owned", input_schema: { type: "object", properties: {} } }],
         },
         clientToolNames: ["client_tool"],
+    },
+    {
+        // Anthropic on Vertex: the same wire, a different endpoint contract —
+        // the model lives in the publisher path, the version in the body, and
+        // the stream ends at message_stop with no [DONE]. The lane-scoped fake
+        // holds WC-019/WC-020/WC-021; this row is what runs them through the
+        // proxy instead of against the fake directly.
+        wire: "anthropic",
+        protocol: "anthropic",
+        lane: "vertex-anthropic",
+        model: "claude-opus-5-5",
+        path: "/v1/projects/aolshev-playground/locations/global/publishers/anthropic/models/claude-opus-5-5:streamRawPredict",
+        clientBody: VERTEX_CAPTURED_BODY,
+        clientToolNames: VERTEX_CAPTURED_TOOL_NAMES,
     },
     {
         wire: "openai-chat",
@@ -424,11 +499,14 @@ const LANES: Lane[] = [
 
 // #1399: acp_rule is part of the default injected surface on every wire, so
 // it joins the base expectation here (opt-in lanes below no longer add it).
+// #3400: acp_read_original_image likewise — the egress rescale pass defaults ON,
+// so proxy-injection lanes forward it on every wire (tool-rejecting lanes
+// like codex degrade to size-only notes and never run these rigs).
 const BASE_EXPECTED: Record<Wire, string[]> = {
-    anthropic: BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name),
-    "openai-chat": BILI_ACP_TOOLS_OPENAI.map((t) => t.function.name),
-    responses: BILI_ACP_TOOLS_RESPONSES.map((t) => t.name),
-    google: BILI_ACP_TOOLS_GOOGLE.map((t) => t.name),
+    anthropic: [...BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name), READ_ORIGINAL_IMAGE_TOOL_NAME],
+    "openai-chat": [...BILI_ACP_TOOLS_OPENAI.map((t) => t.function.name), READ_ORIGINAL_IMAGE_TOOL_NAME],
+    responses: [...BILI_ACP_TOOLS_RESPONSES.map((t) => t.name), READ_ORIGINAL_IMAGE_TOOL_NAME],
+    google: [...BILI_ACP_TOOLS_GOOGLE.map((t) => t.name), READ_ORIGINAL_IMAGE_TOOL_NAME],
 };
 
 function extractForwardedNames(wire: Wire, body: unknown): string[] {
@@ -454,14 +532,14 @@ interface Rig {
 // Opt-in features arm through bili's CompressSettings namespace (`opts.compress`),
 // resolved per request by resolveCompress + applyCompressSettings — not through
 // the raw kernelConfig (server.ts stamps effectiveCcr from compressCfg.ccr only).
-async function startRig(fakeUrl: string, model: string, compressOverrides: Record<string, unknown>, dropFields?: string[]): Promise<Rig> {
+async function startRig(fakeUrl: string, model: string, compressOverrides: Record<string, unknown>, rigOpts?: { dropFields?: string[]; protocol?: string }): Promise<Rig> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const opts: ProxyOptions = {
         port: 0,
         host: "127.0.0.1",
         upstream: fakeUrl,
-        routes: { [fakeUrl]: { models: { [model]: { context: 100_000 } }, ...(dropFields ? { compat: { dropFields } } : {}) } },
+        routes: { [fakeUrl]: { models: { [model]: { context: 100_000 } }, ...(rigOpts?.dropFields ? { compat: { dropFields: rigOpts.dropFields } } : {}) } },
         modelContextLimit: 100_000,
         kernelConfig: defaultConfig(100_000),
         compress: { injectTool: true, injectNudge: true, ...compressOverrides },
@@ -484,17 +562,19 @@ async function startRig(fakeUrl: string, model: string, compressOverrides: Recor
     await once(proxy, "listening");
     const port = (proxy.address() as { port: number }).port;
     return {
-        proxyUrl: `http://127.0.0.1:${port}/bili/${fakeUrl}`,
+        // The protocol marker is additive: without it the URL is exactly the
+        // bare form the four wire lanes have always used.
+        proxyUrl: `http://127.0.0.1:${port}/bili/${rigOpts?.protocol ? `${rigOpts.protocol}/` : ""}${fakeUrl}`,
         close: () => new Promise<void>((resolve, reject) => proxy.close((e) => (e ? reject(e) : resolve()))),
     };
 }
 
 for (const lane of LANES) {
-    test(`wire-contract D: proxied ${lane.wire} turn is accepted by the validation-parity fake`, async () => {
-        const fake = await startFakeUpstream(lane.wire);
+    test(`wire-contract D: proxied ${lane.lane ? `${lane.wire}/${lane.lane}` : lane.wire} turn is accepted by the validation-parity fake`, async () => {
+        const fake = await startFakeUpstream(lane.wire, lane.lane ? { lane: lane.lane } : undefined);
         let rig: Rig | undefined;
         try {
-            rig = await startRig(fake.url, lane.model, {});
+            rig = await startRig(fake.url, lane.model, {}, lane.protocol ? { protocol: lane.protocol } : undefined);
             const res = await fetch(`${rig.proxyUrl}${lane.path}`, {
                 method: "POST",
                 headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": `wc-${lane.wire}` },
@@ -506,6 +586,13 @@ for (const lane of LANES) {
 
             assert.equal(fake.requests.length, 1, `${lane.wire}: exactly one upstream request`);
             assert.equal(fake.violations.length, 0, `${lane.wire}: fake upstream rejected the forwarded body:\n${fake.violations.join("\n")}`);
+            // Vertex: the body carries no model at all, so the fake's reading of
+            // the forwarded path is the only evidence the proxy resolved the id
+            // and passed the publisher path through intact. The path is asserted
+            // by the fake's own matcher (a non-Vertex path 404s → status 404).
+            if (lane.lane === "vertex-anthropic") {
+                assert.equal(fake.requests[0].model, lane.model, "the forwarded Vertex path still names the model the client asked for");
+            }
 
             const fwdNames = extractForwardedNames(lane.wire, fake.requests[0].body);
             const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames].sort();
@@ -517,12 +604,12 @@ for (const lane of LANES) {
     });
 }
 
-test("wire-contract D: opt-in lane (rules+ccr) forwards the extended surface legally", async () => {
+test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surface legally", async () => {
     const lane = LANES[0];
     const fake = await startFakeUpstream(lane.wire);
     let rig: Rig | undefined;
     try {
-        rig = await startRig(fake.url, lane.model, { rules: true, ccr: { enabled: true } });
+        rig = await startRig(fake.url, lane.model, { absorb: { enabled: true }, rules: true, ccr: { enabled: true } });
         const res = await fetch(`${rig.proxyUrl}${lane.path}`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "wc-anth-optin" },
@@ -532,8 +619,8 @@ test("wire-contract D: opt-in lane (rules+ccr) forwards the extended surface leg
         await res.text();
         assert.equal(fake.violations.length, 0, `opt-in fake violations:\n${fake.violations.join("\n")}`);
         const fwdNames = extractForwardedNames(lane.wire, fake.requests[0].body);
-        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "acp_rule", "acp_retrieve"].sort();
-        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base + acp_rule (rules:true) + acp_retrieve + client tools");
+        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "acp_rule", "absorb", "acp_retrieve"].sort();
+        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base + acp_rule (rules:true) + absorb/acp_retrieve + client tools");
         const fwdTools = (fake.requests[0].body as ToolShape).tools;
         const compress = (Array.isArray(fwdTools) ? fwdTools : []).find((t) => (t as ToolShape).name === "compress") as ToolShape;
         assert.ok(compress, "opt-in forwarded body carries compress");
@@ -583,7 +670,7 @@ test("WC-013 configured: compat.dropFields strips reasoning.summary before forwa
     const fake = await startFakeUpstream("responses");
     let rig: Rig | undefined;
     try {
-        rig = await startRig(fake.url, "resp-test", {}, ["reasoning.summary"]);
+        rig = await startRig(fake.url, "resp-test", {}, { dropFields: ["reasoning.summary"] });
         const res = await fetch(`${rig.proxyUrl}/v1/responses`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "wc-wc013-pos" },

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
     computeFoldEconomics,
     decomposeSample,
@@ -16,7 +17,7 @@ import {
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
-import { clearPostRebuildAnchor, markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
+import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 import { isProxyManagedCredential } from "./codex-integration/cc-switch.js";
@@ -82,6 +83,9 @@ interface LedgerFold {
 }
 
 interface LedgerLine {
+    captureId?: string;
+    captureRound?: number;
+    evidence?: "out-of-order";
     seq: number;
     at: number;
     input: number;
@@ -120,7 +124,7 @@ interface LedgerLine {
      *  of host churn). Sparse: omitted unless booked. The seam arm sets `seam`
      *  above instead. Lets the web trajectory chart paint the same bucket
      *  membership the economics card aggregates. */
-    prov?: "ttl" | "side" | "rewind" | "client";
+    prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep";
     /** #1535: 1 iff `model` differs from the previous sample's KNOWN model
      *  (unknown sides never flag); marks the re-billed stable prefix on the
      *  first request after a model switch. Sparse: omitted unless set. */
@@ -169,7 +173,15 @@ interface LedgerLine {
     nb?: 1;
     /** #1847: the single primary cause this line's stable-prefix residual was charged to (a partition —
      *  never more than one); omitted when unattributed or unmeasured. */
-    cause?: "restart" | "model" | "key" | "prompt" | "projection" | "wire" | "upstream";
+    cause?: "restart" | "model" | "effort" | "key" | "prompt" | "projection" | "wire" | "upstream";
+    /** #3803: 1 iff the outbound generation-parameter fingerprint (reasoning
+     *  effort / thinking config) changed between consecutive samples — a host-side
+     *  knob flip that re-partitions the provider's prompt-cache namespace (e.g.
+     *  DeepSeek buckets cache by `output_config.effort`). Sparse: omitted unless set. */
+    ef?: 1;
+    /** #3803: this request's generation-parameter fingerprint ("sha256:<16hex>").
+     *  Sparse: omitted when no effort-bearing field was present on the wire. */
+    efp?: string;
     /** #2131: SHA-256 hex of this request's exact outbound body — the per-call
      *  byte-identity proof; sparse: omitted when no body was captured. */
     bd?: string;
@@ -187,8 +199,11 @@ interface LedgerLine {
      *  mid-history rewrite; "tail" (#2982): the first divergence sits at/past
      *  the shorter body's message-array closing bracket — only trailing
      *  top-level params (host-computed max_tokens/…) or an ephemeral tail note
-     *  that appeared/vanished between requests changed; shared history bytes
-     *  untouched, prefix cache unaffected; "unknown": bodies above BODY_FULL_CAP
+     *  that appeared/vanished between requests changed; shared history bytes are
+     *  untouched, but a provider MAY partition its prompt cache on a trailing field
+     *  (e.g. DeepSeek's output_config.effort — see the effort dimension, #3803), so
+     *  the cache is NOT universally unaffected; above SEAM_BODY_CAP the append
+     *  evidence itself is also blind (#3800); "unknown": bodies above BODY_FULL_CAP
      *  (inequality proven by digest, offset unavailable). Sparse. */
     bs?: "head" | "append" | "mid" | "tail" | "unknown";
 }
@@ -196,6 +211,13 @@ interface LedgerLine {
 interface CacheLedger {
     v: 1;
     lastBlockId: number;
+    /** #3769: high-water of session.state.sweptOrphanCallIds length — detects a
+     *  proactive failed-compress cleanup between samples so detectSeam can
+     *  attribute a mid-history break to the cleanup instead of "unexplained". */
+    lastSweptCount?: number;
+    /** #3769: orphans swept on the CURRENT sample (0 = none); read by detectSeam's
+     *  orphan-sweep arm, refreshed each recordCacheSample. Transient. */
+    sweepThisSample?: number;
     consumedFoldSeq: number;
     sampleSeq: number;
     foldSeqCounter: number;
@@ -211,6 +233,13 @@ interface CacheLedger {
         tr: number;
         switches: number;
         switchMissed: number;
+        /** #3803: host generation-parameter (reasoning-effort / thinking-config)
+         *  flips between consecutive samples — re-partitions the provider's
+         *  prompt-cache namespace (DeepSeek buckets cache by effort), so the first
+         *  use of a new value pays one full-prefix re-prefill. Counted independently;
+         *  charged only when `effort` wins the attribution partition. */
+        effSwitches: number;
+        effSwitchMissed: number;
         /** #2131: relay account rotations — the outbound credential
          *  fingerprint changed between consecutive samples (same URL can
          *  hide a key pool behind it). Counted independently of the model/
@@ -261,6 +290,11 @@ interface CacheLedger {
          *  bili rebuild seam. Charged only when the client arm wins. */
         clientInserts: number;
         clientInsertMissed: number;
+        /** #3769: mid-history breaks attributed to a proactive failed-compress
+         *  cleanup (orphan rotation) landing in-window without a fold claiming
+         *  the break — kept out of the unexplained seam tally. */
+        orphanSweepSeams: number;
+        orphanSweepMissed: number;
         /** #2929: the provider-side arm split by idle gap — samples settled more
          *  than PROVIDER_TTL_GAP_MS after the previous sample are normal TTL
          *  expiry, not an abnormal provider failure. */
@@ -299,7 +333,11 @@ interface CacheLedger {
      *  mode-independent, so a stable canon with a flipped forwarded projection
      *  is bili's own mode/projection switch, not a host rewrite. */
     lastKnownCanon?: string;
+    /** #3803: last measured outbound generation-parameter fingerprint ("sha256:<16hex>").
+     *  Absent until the first request that carried one — unknown never flags. */
+    lastKnownEff?: string;
     invModel?: { seq: number; at: number; from: string | null; to: string };
+    invEff?: { seq: number; at: number; from: string | null; to: string };
     invWire?: { seq: number; at: number; from: string | null; to: string };
     invUp?: { seq: number; at: number; from: string | null; to: string };
     invKey?: { seq: number; at: number; from: string | null; to: string };
@@ -321,7 +359,7 @@ function round1(n: number): number {
  *  sum of first-render token counts of all refs chronologically before it.
  *  Refs are assigned in message order and never reused (kernel contract),
  *  so numeric order IS view order. */
-function prefixTokensBeforeRef(session: Session, ref: string): number {
+export function prefixTokensBeforeRef(session: Session, ref: string): number {
     const byRef = session.state?.messageRefs?.byRef;
     const snap = session.state?.tokenSnapshot;
     if (!byRef || !snap || refNum(ref) === 0) return 0;
@@ -385,6 +423,9 @@ const BODY_FULL_CAP = 8 * 1024 * 1024;
  *  UTF-8 bytes). #2923: slots live under session.transient so the retained
  *  copies release with the session. */
 export interface SeamSlot {
+    order?: number;
+    requestId?: string;
+    round?: number;
     /** Capped head (≤ SEAM_BODY_CAP bytes) — seam forensics + JSON parse side. */
     head: Buffer;
     /** Exact outbound body size in bytes — precise cap/full detection. */
@@ -396,6 +437,10 @@ export interface SeamSlot {
      *  Preserved across byte-identical re-notes (the non-streaming settle
      *  re-notes the same wireBody without headers in hand). */
     keyFp?: string;
+    /** #3803: generation-parameter (reasoning-effort / thinking-config)
+     *  fingerprint of the parsed outbound body that carried this request out.
+     *  Preserved across byte-identical re-notes like keyFp. */
+    effFp?: string;
 }
 
 // #3023: message-count ceiling for the inbound pair. The per-message
@@ -423,13 +468,85 @@ export interface InboundSlot {
     meta: { role: string; len: number; cls: string }[];
 }
 
+// #4043: host-generated metering fields — present on Prepared.originalMessages
+// but NOT in the client's bytes. projectThinkingMass (#1320) stamps
+// CoreMessage.thinkingTokens onto the anthropic-lane list between conversion
+// and this capture, and re-derives the value every turn from the previous
+// usage report — so a byte-stable client list would otherwise show positional
+// fingerprint divergence at every signature-only reasoning message, and
+// detectSeam's #3023 client arm would attribute a bili-owned miss to "host
+// churn". Strip these fields from the ORIGIN EVIDENCE only: signatures, raw
+// payloads, tool ids and unknown semantic fields stay full evidence, and miss
+// accounting is untouched. Future host-projected metering fields MUST extend
+// this list before shipping (evidence-permitlist, same discipline as #1104/#1107).
+const GENERATED_METERING_FIELDS: readonly string[] = ["thinkingTokens"];
+
+/** Canonical JSON of ONE message as ORIGIN EVIDENCE — the message minus the
+ *  host-generated metering fields above. Fast path: messages without any
+ *  generated field stringify byte-identically to before this exclusion
+ *  existed, so every unaffected session keeps its legacy fingerprints. */
+function originEvidenceJson(m: CoreMessage): string {
+    const r = m as unknown as Record<string, unknown>;
+    if (!GENERATED_METERING_FIELDS.some((k) => k in r)) return JSON.stringify(m);
+    const stripped: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(r)) {
+        if (!GENERATED_METERING_FIELDS.includes(k)) stripped[k] = v;
+    }
+    return JSON.stringify(stripped);
+}
+
+// #4430: per-request pending-evidence isolation. Overlapping forwards on one
+// session (same-request re-tries, concurrent side lanes) used to share ONE
+// session.transient slot — the second forward's evidence clobbered the first's
+// before settle. Pending evidence now lives in an AsyncLocalStorage capture;
+// session.transient remains the fallback for callers outside the wrapper.
+type Capture = {
+    session: Session;
+    requestId: string;
+    round: number;
+    sentBody?: SeamSlot;
+    inBody?: InboundSlot;
+    imageFacts?: ForwardedImageFacts;
+};
+const captures = new AsyncLocalStorage<Capture>();
+let captureOrder = 0;
+
+/** Covers the entire forward, including awaited streaming/loop callbacks.
+ *  Concurrent requests keep independent pending evidence; only settled pairs
+ *  live on the session. It does not serialize upstream work or change the wire. */
+export async function withCacheCapture<T>(session: Session | undefined, fn: () => Promise<T>): Promise<T> {
+    if (!session) return fn();
+    return captures.run({ session, requestId: randomUUID(), round: 0 }, async () => {
+        try { return await fn(); }
+        finally {
+            const capture = captures.getStore();
+            if (capture) {
+                delete capture.sentBody;
+                delete capture.inBody;
+                delete capture.imageFacts;
+            }
+        }
+    });
+}
+
+function pendingCapture(session: Session): Capture | NonNullable<Session["transient"]> {
+    const capture = captures.getStore();
+    return capture?.session === session ? capture : (session.transient ??= {});
+}
+
+export function lastForwardedBody(session: Session): SeamSlot | undefined {
+    return pendingCapture(session).sentBody;
+}
+
 /** #3023: capture side of the inbound pair — call at the send chokepoint
  *  (src/server/relay.ts), next to noteForwardedBody, with the request's
  *  original (pre-rebuild) message list. Cost is one canonical stringify per
  *  message (≈ one extra body serialization, the outbound path already does
- *  the same order of work hashing the wire body). */
+ *  the same order of work hashing the wire body). Fingerprints are computed
+ *  over origin evidence (#4043): host-generated metering never counts as
+ *  client-origin divergence, everything else does. */
 export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void {
-    const transient = session.transient ??= {};
+    const transient = pendingCapture(session);
     if (msgs.length > INBOUND_MSG_CAP) {
         // Too many messages to fingerprint whole: keep the count (so the
         // settle-side guard can decline) but drop any stale slot from a
@@ -441,7 +558,7 @@ export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void
     const fps: string[] = [];
     const meta: { role: string; len: number; cls: string }[] = [];
     for (const m of msgs) {
-        const j = JSON.stringify(m);
+        const j = originEvidenceJson(m);
         fps.push(createHash("sha256").update(j).digest("hex").slice(0, 16));
         meta.push({ role: String((m as { role?: unknown }).role ?? "?"), len: j.length, cls: inboundMessageClass(m) });
     }
@@ -531,6 +648,46 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
     return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
 }
 
+// #3803: deterministic key-sorted JSON — the fingerprint must be stable under
+// field reordering (a host that emits the same knobs in a different order must
+// NOT flip the cache-partition identity between requests).
+function canonicalJson(v: unknown): string {
+    if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+    if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+    const obj = v as Record<string, unknown>;
+    const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort();
+    return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalJson(obj[k])).join(",") + "}";
+}
+
+/** #3803: fingerprint the outbound body's generation-parameter surface — the
+ *  reasoning-effort / thinking-config knobs some providers fold into their prompt
+ *  cache key (DeepSeek buckets cache by `output_config.effort`; a new value pays
+ *  one full-prefix re-prefill). Built from the PARSED object at the send
+ *  chokepoint, never from the capped head (trailing fields sit past SEAM_BODY_CAP
+ *  exactly when the body is large → cap-independent). Only effort-bearing fields
+ *  are collected; cache-neutral params (max_tokens / temperature) stay OUT so
+ *  folding them cannot mask real provider-side losses. Returns undefined when no
+ *  effort-bearing field is present (unknown never flags). */
+export function generationParamFp(body: Record<string, unknown> | null | undefined): string | undefined {
+    if (!body || typeof body !== "object") return undefined;
+    const parts: Record<string, unknown> = {};
+    if (body.thinking !== undefined && body.thinking !== null) parts.thinking = body.thinking;
+    if (body.output_config !== undefined && body.output_config !== null) parts.output_config = body.output_config;
+    if (typeof body.reasoning_effort === "string" && body.reasoning_effort !== "") parts.reasoning_effort = body.reasoning_effort;
+    const r = body.reasoning;
+    if (r !== null && typeof r === "object") {
+        const re = (r as Record<string, unknown>).effort;
+        if (typeof re === "string" && re !== "") parts["reasoning.effort"] = re;
+    }
+    const gc = body.generationConfig;
+    if (gc !== null && typeof gc === "object") {
+        const tc = (gc as Record<string, unknown>).thinkingConfig;
+        if (tc !== undefined && tc !== null) parts.thinkingConfig = tc;
+    }
+    if (Object.keys(parts).length === 0) return undefined;
+    return "sha256:" + createHash("sha256").update(canonicalJson(parts), "utf8").digest("hex").slice(0, 16);
+}
+
 /** Record the body of the upstream round that is about to be sent. Called at
  *  the single send chokepoints (loop fetchUpstream, non-streaming forward);
  *  the next settleUsageReport pairs it with the usage report it produced.
@@ -538,8 +695,9 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
  *  stored payload is byte-identical to a previously noted one (the non-streaming
  *  settle re-noting the same wireBody), the earlier count is kept. `keyFp` is
  *  the outbound credential fingerprint (#2131) — likewise inherited from the
- *  prior slot on a byte-identical re-note without a fresh capture. */
-export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string): void {
+ *  prior slot on a byte-identical re-note without a fresh capture. `effFp` is
+ *  the generation-parameter fingerprint (#3803) — same inheritance rule. */
+export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string, effFp?: string): void {
     // #2868: encode to UTF-8 ONCE here — digest, capped head and retained full
     // body all consume this same buffer, so no later comparison re-encodes.
     // Caps are BYTES (the old code-unit caps overshot them up to 3× on CJK).
@@ -551,17 +709,25 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
     // re-deriving them.
     const buf = Buffer.from(body, "utf8");
     const digest = createHash("sha256").update(buf).digest("hex");
-    const transient = session.transient ??= {};
+    const transient = pendingCapture(session);
     const prior = transient.sentBody;
     const samePayload = prior !== undefined && prior.digest === digest;
     transient.sentBody = {
+        order: ++captureOrder,
+        requestId: "requestId" in transient ? transient.requestId : undefined,
+        round: "round" in transient ? ++transient.round : undefined,
         head: buf.byteLength > SEAM_BODY_CAP ? Buffer.from(buf.subarray(0, SEAM_BODY_CAP)) : buf,
         bytes: buf.byteLength,
         msgs: msgs ?? (samePayload ? prior.msgs : null),
         digest,
         full: buf.byteLength <= BODY_FULL_CAP ? buf : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
+        effFp: effFp ?? (samePayload ? prior.effFp : undefined),
     };
+    if ("round" in transient && transient.round > 1) {
+        delete transient.imageFacts;
+        delete transient.inBody;
+    }
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
     else delete session.metadata?.publicContextObservation;
@@ -595,20 +761,39 @@ interface ForwardedImageFacts {
 }
 const LEARNED_IMAGE_COST_TTL_MS = 24 * 60 * 60 * 1000;
 const LEARNED_IMAGE_COST_ALPHA = 0.5;
-const LEARNED_PER_IMAGE_MAX = 1_000_000;
+// Absolute backstop on a single learned per-image sample. Reduced from 1e6 (#4153): that
+// ceiling sat three orders of magnitude above any plausible vision bill, so a
+// residual-attribution blow-up (a route whose usage input outruns bili's text estimate by
+// reasoning/system/tool mass or relay accounting) sailed through and converged via EMA to a
+// nonsense fixed point (448k/image observed on a 2k-prior screenshot). 100k still admits
+// every realistic single-image bill — including genuinely large byte-billing payloads —
+// while rejecting only the degenerate samples that poison the store.
+const LEARNED_PER_IMAGE_MAX = 100_000;
+// #4153: how far a learned per-image cost may exceed the payload's OWN prior per-image cost
+// before it is treated as residual-attribution error rather than encoder variance. Anchored
+// to the #1843 documented encoder-variance band ("the prior can be off by up to 15x per
+// image"): within the band the learned value is trusted (it corrects the prior in either
+// direction); beyond it the residual has picked up non-image mass and the value is clamped
+// back to the band edge. Downward corrections (learned < prior — the #1843 rescue for
+// over-counting bytes priors) are untouched because the clamp only bounds the high side.
+const LEARNED_VARIANCE_BAND = 15;
 const imageFactsLastSent = new WeakMap<Session, ForwardedImageFacts>();
 
 /** Capture side of L1: called at the same send chokepoints as noteForwardedBody
  *  with the image facts of the round about to be sent. The next settleUsageReport
  *  consumes exactly this entry (same pairing guarantee as the seam forensics). */
 export function noteForwardedImageFacts(session: Session, facts: ForwardedImageFacts): void {
+    const capture = captures.getStore();
+    if (capture?.session === session) { capture.imageFacts = facts; return; }
     imageFactsLastSent.set(session, facts);
 }
 
 function settleImageLearning(session: Session, billedTotal: number): void {
-    const facts = imageFactsLastSent.get(session);
+    const capture = captures.getStore();
+    const facts = capture?.session === session ? capture.imageFacts : imageFactsLastSent.get(session);
     if (!facts) return;
-    imageFactsLastSent.delete(session);
+    if (capture?.session === session) delete capture.imageFacts;
+    else imageFactsLastSent.delete(session);
     if (facts.nImages <= 0 || billedTotal <= 0) return;
     const observed = billedTotal - facts.textSide;
     if (observed <= 0) return; // text estimate overshot the bill — no signal
@@ -616,22 +801,48 @@ function settleImageLearning(session: Session, billedTotal: number): void {
     if (!(per >= 1 && per <= LEARNED_PER_IMAGE_MAX)) return; // out-of-band sample
     const store = (session.metadata.learnedImageCosts ?? {}) as Record<string, LearnedImageCostEntry>;
     const prev = store[facts.host];
-    const cost = prev && typeof prev.cost === "number" ? prev.cost * (1 - LEARNED_IMAGE_COST_ALPHA) + per * LEARNED_IMAGE_COST_ALPHA : per;
-    store[facts.host] = { cost, seen: (prev?.seen ?? 0) + 1, ts: Date.now(), fp: facts.fp };
+    // #4153 Detail-1: the read side already ignores an entry whose fingerprint no longer
+    // matches (falls back to the prior), but the write side used to EMA straight off the
+    // stale base anyway — so a poisoned value captured under the old fingerprint kept being
+    // blended in forever, and setting a cap to mitigate only changed the read behavior and
+    // never diluted the stored value. A reconfigured route (billing/cap fp changed) starts
+    // fresh instead of inheriting the old base.
+    const fresh = !prev || typeof prev.cost !== "number" || prev.fp !== facts.fp;
+    const cost = fresh ? per : prev.cost * (1 - LEARNED_IMAGE_COST_ALPHA) + per * LEARNED_IMAGE_COST_ALPHA;
+    store[facts.host] = { cost, seen: fresh ? 1 : (prev.seen ?? 0) + 1, ts: Date.now(), fp: facts.fp };
     session.metadata.learnedImageCosts = store;
     markDirty(session);
 }
 
 /** Consume side of L1: the learned reserve for THIS payload — learned per-image
  *  cost x current image count, or undefined when no fresh matching evidence
- *  exists (caller then falls back to the prior-based estimate). */
-export function learnedImageReserve(session: Session, host: string, nImages: number, fp: string, cap: number): number | undefined {
+ *  exists (caller then falls back to the prior-based estimate).
+ *
+ *  `prior` is the caller's PRIOR-based estimate for this same payload (pixels/bytes).
+ *  When present it becomes the trust anchor (#4153): the learned per-image cost is
+ *  additionally clamped to LEARNED_VARIANCE_BAND × (prior/nImages) so a poisoned sample
+ *  can never push the reserve past a sane multiple of bili's own independent estimate. */
+export function learnedImageReserve(
+    session: Session,
+    host: string,
+    nImages: number,
+    fp: string,
+    cap: number,
+    prior?: number,
+): number | undefined {
     if (nImages <= 0) return undefined;
     const entry = (session.metadata.learnedImageCosts as Record<string, LearnedImageCostEntry> | undefined)?.[host];
     if (!entry || typeof entry.cost !== "number" || entry.seen < 1) return undefined;
     if (Date.now() - entry.ts > LEARNED_IMAGE_COST_TTL_MS) return undefined;
     if (entry.fp !== fp) return undefined; // billing/cap reconfigured since learning
-    const per = cap > 0 ? Math.min(entry.cost, cap) : entry.cost;
+    let per = cap > 0 ? Math.min(entry.cost, cap) : entry.cost;
+    if (typeof prior === "number" && prior > 0) {
+        // Trust the learned value only within the encoder-variance band around the payload's
+        // own prior; beyond it the residual has absorbed non-image mass (#4153) → clamp.
+        per = Math.min(per, (LEARNED_VARIANCE_BAND * prior) / nImages);
+    } else {
+        per = Math.min(per, LEARNED_PER_IMAGE_MAX);
+    }
     return per * nImages;
 }
 
@@ -679,6 +890,20 @@ function byteLcp(a: Buffer, b: Buffer): number {
     const n = Math.min(a.length, b.length);
     while (lcp < n && a[lcp] === b[lcp]) lcp++;
     return lcp;
+}
+
+// #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
+// plus some common suffix (its middle residual is EMPTY) while `cur` carries
+// extra bytes in that middle — a SEMANTIC append where one logical unit's
+// interior grows in place (auto-review FILTERED_HISTORY + fixed PENDING_ACTION
+// trailer). A genuine rewrite leaves a non-empty residual on the shorter side,
+// so it is never matched here and stays "mid". Mirrors src/acp-cache-diff.ts.
+function isMidInsertionAppend(prev: Buffer, cur: Buffer, lcp: number): boolean {
+    if (cur.length <= prev.length || lcp >= prev.length) return false;
+    const room = prev.length - lcp;
+    let lcs = 0;
+    while (lcs < room && prev[prev.length - 1 - lcs] === cur[cur.length - 1 - lcs]) lcs++;
+    return lcp + lcs === prev.length;
 }
 
 // #2982: byte offset of the CLOSING bracket terminating the top-level
@@ -759,8 +984,12 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
     if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
     const agg = led.agg;
-    const cur = session.transient?.sentBody;
+    const cur = pendingCapture(session).sentBody;
     const prev = session.transient?.settledBody;
+    if (cur?.order !== undefined && prev?.order !== undefined && cur.order <= prev.order) {
+        line.evidence = "out-of-order";
+        return;
+    }
     // #2929: split the provider-side arms by idle gap — a byte-stable miss
     // after a long idle is normal TTL expiry; the same miss seconds after the
     // previous request is the abnormal provider-side failure.
@@ -854,7 +1083,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // a bili rebuild seam. Requires BOTH inbound slots captured whole
     // (msgs <= INBOUND_MSG_CAP — an above-cap list cannot prove where it
     // broke, and a missing lane capture must keep the legacy bucket).
-    const curIn = session.transient?.inBody;
+    const curIn = pendingCapture(session).inBody;
     const prevIn = session.transient?.settledInBody;
     if (curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP) {
         const k = firstDivergentInboundMsg(prevIn, curIn);
@@ -875,6 +1104,21 @@ function detectSeam(session: Session, led: CacheLedger): void {
         }
         // Inbound prefix-stable or a clean tail boundary: the outbound
         // mid-list break is bili-side — fall through to the seam bucket.
+    }
+    // #3769: a proactive failed-compress cleanup (orphan rotation) landed in this
+    // window. After the fold-gated fix such a cleanup only rides along a committed
+    // fold, which claims its own break above via foldSeq — so reaching here means a
+    // mid-history break coincided with a cleanup WITHOUT any fold/switch/restart/
+    // client arm claiming it. Attribute it to the cleanup rather than leave it
+    // "unexplained". Additive: none of the earlier arms is touched.
+    if ((led.sweepThisSample ?? 0) > 0) {
+        line.prov = "orphan-sweep";
+        agg.orphanSweepSeams += 1;
+        agg.orphanSweepMissed += line.tr;
+        if (agg.orphanSweepSeams === 1) {
+            loggerLog("warn", `[${session.id}] [cache-seam] mid-history break attributed to proactive failed-compress cleanup (${led.sweepThisSample} record(s) rotated out, #3769): hit ${line.hitPct}% (unexplained=${Math.round(line.tr)} tok) — no fold claimed this break`);
+        }
+        return;
     }
     agg.seamSuspects += 1;
     agg.seamMissed += line.tr;
@@ -902,12 +1146,12 @@ export function getCacheLedger(session: Session): CacheLedger {
         // in place so later arithmetic never sees undefined.
         const g = existing.agg;
         for (const key of [
-            "switches", "switchMissed", "keySwitches", "keySwitchMissed", "promptSwitches", "promptSwitchMissed", "projSwitches", "projSwitchMissed", "wireSwitches", "wireSwitchMissed",
+            "switches", "switchMissed", "effSwitches", "effSwitchMissed", "keySwitches", "keySwitchMissed", "promptSwitches", "promptSwitchMissed", "projSwitches", "projSwitchMissed", "wireSwitches", "wireSwitchMissed",
             "upstreamSwitches", "upstreamSwitchMissed", "restartDrops",
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
             "seamSuspects", "seamMissed",
-            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated", "clientInserts", "clientInsertMissed",
+            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated", "clientInserts", "clientInsertMissed", "orphanSweepSeams", "orphanSweepMissed",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
         }
@@ -924,7 +1168,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, effSwitches: 0, effSwitchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0, orphanSweepSeams: 0, orphanSweepMissed: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -973,6 +1217,22 @@ function detectNewFolds(session: Session, led: CacheLedger): void {
     }
 }
 
+// #3769: sweptOrphanCallIds is monotonic, so its length high-water makes growth
+// exact. detectSeam's orphan-sweep arm reads sweepThisSample set here.
+function detectOrphanSweeps(session: Session, led: CacheLedger): void {
+    const n = session.state?.sweptOrphanCallIds?.length ?? 0;
+    // First observation only baselines: a resumed session's pre-existing sweeps
+    // must not be charged to the current sample.
+    if (led.lastSweptCount === undefined) {
+        led.lastSweptCount = n;
+        led.sweepThisSample = 0;
+        return;
+    }
+    const delta = n - led.lastSweptCount;
+    led.lastSweptCount = n;
+    led.sweepThisSample = delta > 0 ? delta : 0;
+}
+
 /** Record one provider usage report into the session ledger. `input` must be
  *  NORMALIZED (cached included — promptInputTotal semantics). `cached === null`
  *  means the provider reported NO cache-hit tokens (unmeasurable): such samples
@@ -980,16 +1240,18 @@ function detectNewFolds(session: Session, led: CacheLedger): void {
  *  billed prefix as an unexplained ttlRepay residual (#1536). */
 export function recordCacheSample(
     session: Session,
-    s: { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string; keyFp?: string; sysFp?: string; canonFp?: string; mode?: "plugin" | "proxy" },
+    s: { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string; keyFp?: string; sysFp?: string; canonFp?: string; mode?: "plugin" | "proxy"; effFp?: string },
 ): void {
     const led = getCacheLedger(session);
     detectNewFolds(session, led);
+    detectOrphanSweeps(session, led);
     const prevLine = led.lines[led.lines.length - 1];
     // #1536: unknown-cache samples still need a prev/cur pair so the fold chain
     // stays consistent, but decompose with cached=0 then QUARANTINE every derived
     // bucket (line missed/nc/cr/tr forced to 0 + excluded from agg below).
     const known = s.cached !== null;
     const effCached: number = s.cached ?? 0;
+    const eff = typeof s.effFp === "string" && s.effFp !== "" ? s.effFp : undefined;
     // Same window as buildCacheReport: a fold counts once its timestamp has
     // elapsed (f.at <= s.at), never earlier — keeps incremental and batch math
     // identical under clock skew between block.createdAt and settle time.
@@ -1015,6 +1277,40 @@ export function recordCacheSample(
         viewBefore: f.V,
         viewAfter: f.Vp,
     }));
+    // #3307 P2-A: f.X (firstFoldStartTokens) is prefixTokensBeforeRef over the
+    // client's UN-SHRUNKEN resent history — for a stateless proxy client that far
+    // exceeds the billed input, so decomposeSample zeroes structuralExcess and the
+    // fold's re-pay falls into the unattributed seam bucket. When a genuine
+    // bili-side mid-history break is present, measure the stable prefix straight
+    // off the wire instead: the byte-LCP between this outbound and the previous
+    // marks where a summary replaced folded content, so (lcpBytes / cur.bytes) *
+    // billed input is a same-space lower bound on the pre-fold prefix. min() with
+    // the snapshot X leaves already-correct folds untouched. Gated to mid-list
+    // breaks only (a tail append lands lcpBytes near the end -> xMeasured ~= input
+    // -> no effect) and never on a client-side inbound rewrite (#3023), whose
+    // earlier divergence would understate the fold and mis-credit it.
+    if (pending.length > 0 && known && s.input > 0) {
+        const rawMissed = s.input - effCached;
+        if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
+            const curB = session.transient?.sentBody;
+            const prevB = session.transient?.settledBody;
+            if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
+                const curIn = session.transient?.inBody;
+                const prevIn = session.transient?.settledInBody;
+                const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
+                    const k = firstDivergentInboundMsg(prevIn, curIn);
+                    return k !== null && k < Math.min(prevIn.msgs, curIn.msgs);
+                })();
+                if (!clientBreak) {
+                    const lcp = seamLcp(prevB.head, curB.head);
+                    if (lcp.msgIndex !== null && lcp.prevMsgs > 0 && lcp.msgIndex < lcp.prevMsgs && lcp.lcpBytes > 0 && lcp.lcpBytes < curB.head.byteLength) {
+                        const xMeasured = Math.round(s.input * (lcp.lcpBytes / curB.bytes));
+                        for (const p of pending) p.firstFoldStartTokens = Math.min(p.firstFoldStartTokens ?? Number.POSITIVE_INFINITY, xMeasured);
+                    }
+                }
+            }
+        }
+    }
     const rawDec = decomposeSample(
         prevLine ? { at: prevLine.at, input: prevLine.input, cached: prevLine.cached } : null,
         { at: s.at, input: s.input, cached: effCached },
@@ -1081,6 +1377,7 @@ export function recordCacheSample(
     // line — an unmeasured (null-cache) request at the switch boundary must not swallow the flag,
     // or the following measured cold re-bill lands unattributed. Unknown samples never advance it.
     const modelSwitched = known && model !== undefined && led.lastKnownModel !== undefined && model !== led.lastKnownModel;
+    const effortSwitched = known && eff !== undefined && led.lastKnownEff !== undefined && eff !== led.lastKnownEff;
     const wireSwitched = known && proto !== undefined && led.lastKnownProto !== undefined && proto !== led.lastKnownProto;
     const upstreamSwitched = known && up !== undefined && led.lastKnownUp !== undefined && up !== led.lastKnownUp;
     const keySwitched = known && key !== undefined && led.lastKnownKey !== undefined && key !== led.lastKnownKey;
@@ -1164,18 +1461,20 @@ export function recordCacheSample(
     // #2867: `projection` sits behind prompt — a forwarded-system flip whose
     // canonical incoming view stayed stable is bili's own mode/projection
     // switch (self-heal degrade-to-proxy), same full-cold shape, different actor.
-    const freshCause: "restart" | "model" | "key" | "prompt" | "projection" | "wire" | "upstream" | null =
+    const freshCause: "restart" | "model" | "effort" | "key" | "prompt" | "projection" | "wire" | "upstream" | null =
         restarted ? "restart"
             : modelSwitched ? "model"
+            : effortSwitched ? "effort"
             : keySwitched ? "key"
             : (promptSwitched && !projFlip) ? "prompt"
             : projFlip ? "projection"
             : wireSwitched ? "wire"
             : upstreamSwitched ? "upstream"
             : null;
-    const cause: "restart" | "model" | "key" | "prompt" | "projection" | "wire" | "upstream" | null =
+    const cause: "restart" | "model" | "effort" | "key" | "prompt" | "projection" | "wire" | "upstream" | null =
         freshCause !== null ? freshCause
             : contWithin(led.invModel) ? "model"
+            : contWithin(led.invEff) ? "effort"
             : contWithin(led.invKey) ? "key"
             : contWithin(led.invSp) ? "prompt"
             : contWithin(led.invProj) ? "projection"
@@ -1199,7 +1498,9 @@ export function recordCacheSample(
         up,
         kp: key,
         sp: sys,
+        efp: eff,
         sw: modelSwitched ? 1 : undefined,
+        ef: effortSwitched ? 1 : undefined,
         pw: wireSwitched ? 1 : undefined,
         uw: upstreamSwitched ? 1 : undefined,
         kw: keySwitched ? 1 : undefined,
@@ -1236,12 +1537,14 @@ export function recordCacheSample(
     // EXACTLY the primary cause so the per-cause breakdown partitions the residual instead of overlapping it.
     if (freshCause === "restart") agg.restartDrops += 1;
     else if (freshCause === "model") agg.switches += 1;
+    else if (freshCause === "effort") agg.effSwitches += 1;
     else if (freshCause === "key") agg.keySwitches += 1;
     else if (freshCause === "prompt") agg.promptSwitches += 1;
     else if (freshCause === "projection") agg.projSwitches += 1;
     else if (freshCause === "wire") agg.wireSwitches += 1;
     else if (freshCause === "upstream") agg.upstreamSwitches += 1;
     if (cause === "model") agg.switchMissed += dec.ttlRepay;
+    else if (cause === "effort") agg.effSwitchMissed += dec.ttlRepay;
     else if (cause === "key") agg.keySwitchMissed += dec.ttlRepay;
     else if (cause === "prompt") agg.promptSwitchMissed += dec.ttlRepay;
     else if (cause === "projection") agg.projSwitchMissed += dec.ttlRepay;
@@ -1253,6 +1556,7 @@ export function recordCacheSample(
     // window drops out, and a fresh change opens/replaces it.
     if (isWarm) {
         led.invModel = undefined;
+        led.invEff = undefined;
         led.invWire = undefined;
         led.invUp = undefined;
         led.invKey = undefined;
@@ -1260,6 +1564,7 @@ export function recordCacheSample(
         led.invProj = undefined;
     } else {
         if (led.invModel && seq - led.invModel.seq > SWITCH_COLD_ROUNDS) led.invModel = undefined;
+        if (led.invEff && seq - led.invEff.seq > SWITCH_COLD_ROUNDS) led.invEff = undefined;
         if (led.invWire && seq - led.invWire.seq > SWITCH_COLD_ROUNDS) led.invWire = undefined;
         if (led.invUp && seq - led.invUp.seq > SWITCH_COLD_ROUNDS) led.invUp = undefined;
         if (led.invKey && seq - led.invKey.seq > SWITCH_COLD_ROUNDS) led.invKey = undefined;
@@ -1267,6 +1572,7 @@ export function recordCacheSample(
         if (led.invProj && seq - led.invProj.seq > SWITCH_COLD_ROUNDS) led.invProj = undefined;
     }
     if (modelSwitched) led.invModel = { seq, at: s.at, from: led.lastKnownModel ?? null, to: model! };
+    if (effortSwitched) led.invEff = { seq, at: s.at, from: led.lastKnownEff ?? null, to: eff! };
     if (wireSwitched) led.invWire = { seq, at: s.at, from: led.lastKnownProto ?? null, to: proto! };
     if (upstreamSwitched) led.invUp = { seq, at: s.at, from: led.lastKnownUp ?? null, to: up! };
     if (keySwitched) led.invKey = { seq, at: s.at, from: led.lastKnownKey ?? null, to: key! };
@@ -1277,6 +1583,7 @@ export function recordCacheSample(
             if (promptSwitched && !projFlip) led.invSp = { seq, at: s.at, from: led.lastKnownSp ?? null, to: sys! };
     if (projFlip) led.invProj = { seq, at: s.at, from: led.lastKnownSp ?? null, to: sys! };
     if (model !== undefined) led.lastKnownModel = model;
+    if (eff !== undefined) led.lastKnownEff = eff;
     if (proto !== undefined) led.lastKnownProto = proto;
     if (up !== undefined) led.lastKnownUp = up;
     if (key !== undefined) led.lastKnownKey = key;
@@ -1345,6 +1652,119 @@ export function canonicalSysFpForSettle(session: Session, protocol?: string): st
     return typeof noted?.fp === "string" && noted.fp !== "" ? noted.fp : undefined;
 }
 
+/** #1933 F1 + #3900/#4079: ingest one billed-total-vs-pending-local-estimate
+ *  pair into the per-origin+model calibration ring and publish/clear k̂ per
+ *  the ring discipline. Extracted VERBATIM from settleUsageReport so usage
+ *  settles and overflow settles (settleOverflowCalibration) cannot drift
+ *  apart — every guard, band, clamp and provenance rule below is shared. */
+function ingestCalibrationPair(session: Session, billed: number, upstream: string | undefined): void {
+    // #3211: per-route calibration policy (providers[<key>].calibration),
+    // paired by handle.ts with the SAME latest-wins/origin-gated discipline
+    // as the pending estimate — applied below at PUBLICATION time only, so
+    // the learned ring stays raw and auditable. Origin mismatch (slot set
+    // by a request on another route) voids it for this settle.
+    const settleOrigin = normalizeUpstreamOrigin(upstream);
+    const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
+    const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
+    const pendingEst = session.stats.lastLocalTextEstimate;
+    const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
+    if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
+        const rawSample = billed / pendingEst;
+        // #2117 B: the ring is keyed by route AND model — tokenizers bill
+        // differently across models, so a mid-session model switch starts a
+        // FRESH ring instead of blending two models' billing scales into one
+        // factor. Missing model info NEVER invalidates (same discipline as
+        // currentCalibrationFactor): a ring without a model key — legacy
+        // pre-upgrade files included, and records restored after a restart
+        // whose load whitelist drops the model fields (#2141) — continues
+        // and ADOPTS the first known model. Discarding it would clear a
+        // provenance-matched published k̂ on the first post-restart settle
+        // (the #2129 regression class).
+        const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+        let ring = session.stats.calibrationRing;
+        if (!ring || ring.origin !== settleOrigin || (ring.model !== undefined && settleModel !== undefined && ring.model !== settleModel)) {
+            ring = { origin: settleOrigin, model: settleModel, values: [] };
+        } else if (ring.model === undefined && settleModel !== undefined) {
+            ring.model = settleModel;
+        }
+        if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
+            ring.values.push(rawSample);
+            if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
+            const spread = Math.max(...ring.values) / Math.min(...ring.values);
+            if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
+                const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
+                if (calibPolicy?.disabled === true) {
+                    // #3211: route-level opt-out — the learned value stays in
+                    // the ring (auditable) but is never applied on this route.
+                    delete session.stats.calibratedEstimate;
+                    delete session.stats.calibratedEstimateOrigin;
+                    delete session.stats.calibratedEstimateModel;
+                } else {
+                    const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
+                    session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
+                    session.stats.calibratedEstimateOrigin = settleOrigin;
+                    // Provenance is the ring's model key, not this sample's stamp —
+                    // an unknown-model settle continues a model-keyed ring without
+                    // blanking the established provenance. Stays inside the publish
+                    // branch: the disabled path above clears all three fields and
+                    // must not re-stamp one of them (#3211 review).
+                    session.stats.calibratedEstimateModel = ring.model;
+                }
+            } else {
+                delete session.stats.calibratedEstimate;
+                delete session.stats.calibratedEstimateOrigin;
+                delete session.stats.calibratedEstimateModel;
+            }
+        }
+        session.stats.calibrationRing = ring;
+    }
+}
+
+/** #3900/#4079: teach the estimator from an upstream overflow rejection.
+ *  parseOverflowCounts (#3450) extracts the REJECTED PAYLOAD'S OWN billed
+ *  message-token count from the 400 body — a usage-grade measurement of the
+ *  exact body whose local text estimate prepare recorded as the pending k̂
+ *  pair. A route that only ever overflows never settles a usage report, so
+ *  the local calibre never self-corrects: preflight keeps judging "fits"
+ *  on the low estimate, re-forwards the same doomed body, and the 400 loops
+ *  forever (#3900). Ingest the measurement through the shared ring
+ *  discipline (same plausibility band, same ≥2-agreeing-samples rule, same
+ *  publish clamps — never a shortcut) so k̂ converges and the next preflight
+ *  judges the payload at its true size. */
+export function settleOverflowCalibration(
+    session: Session,
+    measured: number,
+    upstream?: string,
+): void {
+    if (!(measured > 0)) return;
+    ingestCalibrationPair(session, measured, upstream);
+    // The rejected request will never produce a usage report — retire its
+    // pending pair NOW so no later report can mispair against a consumed
+    // estimate (#1933 F1). A same-request refold (#1195) re-runs prepare and
+    // re-notes a fresh pair for the folded body before its send.
+    session.stats.lastLocalTextEstimate = undefined;
+    session.stats.lastLocalTextEstimateOrigin = undefined;
+}
+
+/** #4383: the relay main-lane send stamp for per-send context evidence,
+ *  extracted from the forward chokepoint so the write contract is nameable
+ *  and testable: localInputEstimate/contextTokens carry the char-count upper
+ *  bound (fail-closed caliber, #553/#728/#1493), contextEstimateTokens the
+ *  k̂-scaled billing-caliber reading (#2117), and contextTokensSource=
+ *  "estimate" is the cycle-freshness mark that only a real usage settle
+ *  flips back to "usage" (settleUsageReport) — usageAnchorCycleStale
+ *  (session.ts) reads exactly that flip. */
+export function noteOutboundContextEstimates(
+    session: Session,
+    est: { upperBound: number; scaledText: number; imageTokens: number; calibrated: boolean },
+): void {
+    session.stats.localInputEstimate = est.upperBound;
+    session.stats.contextEstimateTokens = Math.round(est.scaledText + est.imageTokens);
+    session.stats.contextEstimateCalibrated = est.calibrated;
+    session.stats.contextTokens = est.upperBound;
+    session.stats.contextTokensSource = "estimate";
+}
+
 export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
@@ -1382,73 +1802,23 @@ export function settleUsageReport(
         // per-origin ring; the factor is published only once ≥2 recent samples
         // agree within ×2, and cleared again when they stop agreeing — until
         // then the raw estimate decides (legacy behavior).
-        // #3211: per-route calibration policy (providers[<key>].calibration),
-        // paired by handle.ts with the SAME latest-wins/origin-gated discipline
-        // as the pending estimate — applied below at PUBLICATION time only, so
-        // the learned ring stays raw and auditable. Origin mismatch (slot set
-        // by a request on another route) voids it for this settle.
-        const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
-        const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
-        const pendingEst = session.stats.lastLocalTextEstimate;
-        const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
-        if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
-            const rawSample = s.total / pendingEst;
-            // #2117 B: the ring is keyed by route AND model — tokenizers bill
-            // differently across models, so a mid-session model switch starts a
-            // FRESH ring instead of blending two models' billing scales into one
-            // factor. Missing model info NEVER invalidates (same discipline as
-            // currentCalibrationFactor): a ring without a model key — legacy
-            // pre-upgrade files included, and records restored after a restart
-            // whose load whitelist drops the model fields (#2141) — continues
-            // and ADOPTS the first known model. Discarding it would clear a
-            // provenance-matched published k̂ on the first post-restart settle
-            // (the #2129 regression class).
-            const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
-            let ring = session.stats.calibrationRing;
-            if (!ring || ring.origin !== settleOrigin || (ring.model !== undefined && settleModel !== undefined && ring.model !== settleModel)) {
-                ring = { origin: settleOrigin, model: settleModel, values: [] };
-            } else if (ring.model === undefined && settleModel !== undefined) {
-                ring.model = settleModel;
-            }
-            if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
-                ring.values.push(rawSample);
-                if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
-                const spread = Math.max(...ring.values) / Math.min(...ring.values);
-                if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
-                    const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
-                    if (calibPolicy?.disabled === true) {
-                        // #3211: route-level opt-out — the learned value stays in
-                        // the ring (auditable) but is never applied on this route.
-                        delete session.stats.calibratedEstimate;
-                        delete session.stats.calibratedEstimateOrigin;
-                        delete session.stats.calibratedEstimateModel;
-                    } else {
-                        const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
-                        session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
-                        session.stats.calibratedEstimateOrigin = settleOrigin;
-                        // Provenance is the ring's model key, not this sample's stamp —
-                        // an unknown-model settle continues a model-keyed ring without
-                        // blanking the established provenance. Stays inside the publish
-                        // branch: the disabled path above clears all three fields and
-                        // must not re-stamp one of them (#3211 review).
-                        session.stats.calibratedEstimateModel = ring.model;
-                    }
-                } else {
-                    delete session.stats.calibratedEstimate;
-                    delete session.stats.calibratedEstimateOrigin;
-                    delete session.stats.calibratedEstimateModel;
-                }
-            }
-            session.stats.calibrationRing = ring;
-        }
+        // #3900/#4079: extracted verbatim so an upstream overflow 400 — which is
+        // a usage-grade measurement of the rejected body (#3450 parseOverflowCounts)
+        // — can feed the SAME ring via settleOverflowCalibration. A route that
+        // only ever overflows never settles a usage report, so without this the
+        // local estimator's calibre never self-corrects and the same "fits"
+        // verdict re-forwards the same doomed body forever.
+        ingestCalibrationPair(session, s.total, s.upstream);
         // #1820: a real usage-grade sample supersedes the post-rebuild meter
         // anchor immediately — no need to wait out its prepare budget.
         clearPostRebuildAnchor(session);
         // #1110: a real usage report retires the one-shot overflow arm.
+        // #3450: the proven completion reservation retires with it — it was
+        // evidence about the rejected payload's turn; a recovered session
+        // returns to judging on the declared window (a repeat overflow
+        // re-arms both in one event).
         delete session.stats.overflowArmTokens;
-        // #1595: a real report landing far below a stale-high nudge reference
-        // retires that reference too (one call covers all three lanes).
-        reanchorNudgeOnUsageDrop(session);
+        delete session.stats.overflowArmCompletionReserve;
     }
     // #1933 F1: roll the pending pair forward to the current turn's value —
     // it will be consumed by the NEXT report (or cleared when the lane
@@ -1462,7 +1832,10 @@ export function settleUsageReport(
     // #2131: the credential fingerprint captured at the send chokepoint rides
     // the seam slot — read it BEFORE recordCacheSample so the line it pushes
     // already carries the identity (kp/kw) without a second slot lookup.
-    const curKeyFp = session.transient?.sentBody?.keyFp;
+    const curKeyFp = pendingCapture(session).sentBody?.keyFp;
+    // #3803: the generation-parameter fingerprint noted for THIS request at the
+    // send chokepoint — same transient-slot pairing as the credential one above.
+    const curEffFp = pendingCapture(session).sentBody?.effFp;
     // #2350: the host's system-prompt fingerprint as noted for THIS request by
     // fold-reconcile's wire sites (they precede this settle under the session
     // lock). Sparse: lanes that never noted one (title-gen / compaction-trigger
@@ -1478,18 +1851,27 @@ export function settleUsageReport(
     // responses request's label into an inert-but-misleading line field.
     const lastMode = s.protocol === "responses" ? (session.metadata?.[METADATA_LAST_RESPONSES_MODE] as unknown) : undefined;
     const led = getCacheLedger(session);
-    recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined });
+    recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, effFp: curEffFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined });
+    const capture = captures.getStore();
+    const sample = led.lines[led.lines.length - 1];
+    if (capture?.session === session && sample) {
+        sample.captureId = capture.requestId;
+        sample.captureRound = capture.round;
+    }
     // #2131: per-call body-stability proof on the just-recorded line — the same
     // pairing detectSeam uses (this request's forwarded body vs the previous
     // settled one), so "prefix unchanged between calls" is stored data, not an
     // interpretation. Digest equality decides; the LCP offset localizes where
     // a divergence started when both full bodies were retained.
-    const curSlot = session.transient?.sentBody;
+    const curSlot = pendingCapture(session).sentBody;
     if (curSlot !== undefined) {
         const curLine = led.lines[led.lines.length - 1];
         if (curLine !== undefined) {
             curLine.bd = curSlot.digest;
-            const prevSlot = session.transient?.settledBody;
+            const settled = session.transient?.settledBody;
+            const backwards = curSlot.order !== undefined && settled?.order !== undefined && curSlot.order <= settled.order;
+            const prevSlot = backwards ? undefined : settled;
+            if (backwards) curLine.evidence = "out-of-order";
             if (prevSlot !== undefined) {
                 if (curSlot.digest === prevSlot.digest) {
                     curLine.be = 1;
@@ -1514,7 +1896,11 @@ export function settleUsageReport(
                         // (unparseable body) keeps the conservative pre-fix class.
                         const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
                         const arrClose = messagesArrayCloseOffset(shorterFull);
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : "mid";
+                        // #3476: a growing logical unit (single giant message whose interior
+                        // container extends in place) is byte-wise a mid-body insertion but
+                        // semantically an append — recognize it in the would-be-mid slot.
+                        const midInsert = isMidInsertionAppend(prevSlot.full, curSlot.full, lcp);
+                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : midInsert ? "append" : "mid";
                     } else {
                         curLine.bs = "unknown";
                     }
@@ -1530,14 +1916,17 @@ export function settleUsageReport(
     // actually sent (noteForwardedBody), then keep it as the next pair's
     // baseline. Lanes without body capture still get the aggregate flag.
     detectSeam(session, led);
-    const seamBody = session.transient?.sentBody;
-    if (seamBody !== undefined) (session.transient ??= {}).settledBody = seamBody;
-    delete session.transient?.sentBody;
-    // #3023: settle the inbound pair with the same lifecycle — the next
-    // settle's client arm compares against THIS request's client view.
-    const seamIn = session.transient?.inBody;
-    if (seamIn !== undefined) (session.transient ??= {}).settledInBody = seamIn;
-    delete session.transient?.inBody;
+    const pending = pendingCapture(session);
+    const settled = session.transient ??= {};
+    const seamBody = pending.sentBody;
+    const backwards = seamBody?.order !== undefined && settled.settledBody?.order !== undefined && seamBody.order <= settled.settledBody.order;
+    if (seamBody !== undefined && !backwards) settled.settledBody = seamBody;
+    else delete settled.settledBody;
+    delete pending.sentBody;
+    const seamIn = pending.inBody;
+    if (seamBody !== undefined && seamIn !== undefined && !backwards) settled.settledInBody = seamIn;
+    else delete settled.settledInBody;
+    delete pending.inBody;
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).
@@ -1556,7 +1945,7 @@ function stampedPriceProfile(session: Session): PriceProfile | undefined {
     return Object.keys(out).length > 0 ? out : undefined;
 }
 
-interface ModelSwitchEvent {
+export interface ModelSwitchEvent {
     seq: number;
     at: number;
     from: string | null;
@@ -1576,6 +1965,9 @@ interface ModelSwitchStats {
 
 interface InvalidationTokenBreakdown {
     model: number;
+    /** #3803: stable-prefix re-bill charged to a host generation-parameter switch
+     *  (reasoning effort / thinking config) — a provider cache-namespace flip, not a history rewrite. */
+    effort: number;
     key: number;
     /** #2350: stable-prefix re-bill charged to host system-prompt rewrites. */
     prompt: number;
@@ -1607,7 +1999,7 @@ interface BodyStability {
     append: number;
     /** Mid-history byte change — the shape a real rewrite has. */
     mid: number;
-    /** #2982: divergence at/past the shorter body's message-array closing bracket — trailing top-level params or ephemeral tail notes; shared history bytes untouched, prefix cache unaffected. */
+    /** #2982: divergence at/past the shorter body's message-array closing bracket — trailing top-level params or ephemeral tail notes; shared history bytes untouched, though a provider may partition its prompt cache on a trailing field (#3803). */
     tail: number;
     /** Diverged but offset unknown (bodies above BODY_FULL_CAP, digest-only mode). */
     unknownOffset: number;
@@ -1620,8 +2012,10 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" }>;
+    lines: Array<CacheReportLine & { captureId?: string; captureRound?: number; evidence?: "out-of-order"; bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" }>;
     modelSwitches: ModelSwitchStats;
+    /** #3803: host generation-parameter switches (reasoning effort / thinking config) — a provider cache-namespace flip that re-bills the whole stable prefix once, distinct from any byte change. */
+    effSwitches: ModelSwitchStats;
     /** #2131: relay account rotations (credential fingerprint changes) —
      *  the identity a URL-granular upstream switch cannot see. */
     keySwitches: ModelSwitchStats;
@@ -1642,7 +2036,7 @@ interface BiliCacheReport extends CacheReport {
      *  is booked as new content, never as a prefix re-pay. */
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
-    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number } };
+    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number }; orphanSweep: { count: number; missed: number } };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -1682,7 +2076,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     // Unknown-cache samples are quarantined out of the rendered line set — they
     // carry no measurable hit rate and would show as misleading 0% rows.
     const knownLines = led.lines.filter((l) => l.unk !== 1);
-    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined, dim: "model" | "key" | "prompt" | "projection" | "wire" | "upstream"): ModelSwitchEvent[] => {
+    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined, dim: "model" | "effort" | "key" | "prompt" | "projection" | "wire" | "upstream"): ModelSwitchEvent[] => {
         const evs: ModelSwitchEvent[] = [];
         for (let i = 0; i < led.lines.length; i++) {
             const l = led.lines[i];
@@ -1724,6 +2118,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     }
     const invalidation: InvalidationTokenBreakdown = {
         model: a.switchMissed,
+        effort: a.effSwitchMissed,
         key: a.keySwitchMissed,
         prompt: a.promptSwitchMissed,
         projection: a.projSwitchMissed,
@@ -1807,15 +2202,20 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             foldSeq: l.foldSeq,
             seam: l.seam,
             prov: l.prov,
+            captureId: l.captureId,
+            captureRound: l.captureRound,
+            evidence: l.evidence,
             bodyDigest: l.bd,
             keyFp: l.kp,
             sysFp: l.sp,
+            efp: l.efp,
             bodyEqual: l.be,
             bodyLcp: l.bl,
             bodyClass: l.bs,
         })),
         linesOmitted: led.sampleSeq - led.lines.length,
         modelSwitches: { count: a.switches, missedTokens: a.switchMissed, events: switchEvents((l) => l.sw === 1 && l.model !== undefined, (l) => l?.model, "model") },
+        effSwitches: { count: a.effSwitches, missedTokens: a.effSwitchMissed, events: switchEvents((l) => l.ef === 1 && l.efp !== undefined, (l) => l?.efp, "effort") },
         keySwitches: { count: a.keySwitches, missedTokens: a.keySwitchMissed, events: switchEvents((l) => l.kw === 1 && l.kp !== undefined, (l) => l?.kp, "key") },
         promptSwitches: { count: a.promptSwitches, missedTokens: a.promptSwitchMissed, events: switchEvents((l) => l.sf === 1 && l.sp !== undefined, (l) => l?.sp, "prompt") },
         projSwitches: { count: a.projSwitches, missedTokens: a.projSwitchMissed, events: switchEvents((l) => l.pf === 1 && l.sp !== undefined, (l) => l?.sp, "projection") },
@@ -1826,7 +2226,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
-        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed } },
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed }, orphanSweep: { count: a.orphanSweepSeams, missed: a.orphanSweepMissed } },
     };
 }
 
@@ -1889,7 +2289,7 @@ function formatStability(st: BodyStability): string {
     out.push(`  divergence class: head <1KiB ${st.head} · tail-append ${st.append} · mid-history ${st.mid} · tail(params/notes) ${st.tail} · offset-unknown(capped) ${st.unknownOffset}`);
     if (st.head > 0) out.push(`  ⚠ ${st.head} head-region divergence(s) — model/tools/sampling/system changed between calls (host-side parameter change, NOT a bili history rewrite)`);
     if (st.mid > 0) out.push(`  ⚠ ${st.mid} mid-history divergence(s) — real prefix rewrites; inspect the seam events above`);
-    if (st.tail > 0) out.push(`  ${st.tail} tail-region divergence(s) — trailing top-level params or ephemeral tail notes at/past the message-array end; shared history bytes untouched, prefix cache unaffected (#2982)`);
+    if (st.tail > 0) out.push(`  ${st.tail} tail-region divergence(s) — trailing top-level params or ephemeral tail notes at/past the message-array end; shared history bytes untouched, but a provider may re-partition its prompt cache on a trailing field such as reasoning effort — see EFFORT SWITCHES / invalidation above (#3803)`);
     const sb = st.sizeBuckets.filter((b) => b.n >= 3);
     if (sb.length >= 2) out.push("  hit% by input size (median): " + sb.map((b) => `${Math.round(b.lo / 1000)}K=${b.hitMedian}%`).join("  "));
     const g = st.gapSplit;
@@ -1907,6 +2307,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
         const tail = (base: string): string => base + (stabilityText ? "\n\n" + stabilityText : "") + (formatSeam(report) ? "\n\n" + formatSeam(report) : "");
         // #2131: key switches get their own section only when observed — the
         // common case (one account, no rotation) stays byte-identical.
+        // #3803: host generation-parameter switches get their own section only when observed — a
+        // session whose host never changes reasoning effort stays byte-identical.
+        const effText = report.effSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.effSwitches, detail, "EFFORT SWITCHES (host changed reasoning effort / thinking config)") : "";
         const keyText = report.keySwitches.count > 0 ? "\n\n" + formatModelSwitches(report.keySwitches, detail, "KEY SWITCHES (relay account rotation)") : "";
         // #2350: host system-prompt rewrites get their own section only when
         // observed — sessions whose host never rewrites stay byte-identical.
@@ -1914,6 +2317,12 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
         // #2867: proxy-side mode/projection switches get their own section only
         // when observed — a session that never switches modes stays byte-identical.
         const projText = report.projSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.projSwitches, detail, "PROJECTION SWITCHES (proxy mode/projection change — bili's own doing, e.g. self-heal degrade-to-proxy)") : "";
+        // #3307: wire/upstream/restart carry per-event data in the report (switchEvents /
+        // restartEvents) but only their aggregate counts reached CACHE INVALIDATION — no
+        // per-line timestamps, so cross-checks (e.g. seam-vs-restart) were impossible.
+        const wireText = report.wireSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.wireSwitches, detail, "WIRE SWITCHES (client switched protocol wire between requests)") : "";
+        const upstreamText = report.upstreamSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.upstreamSwitches, detail, "UPSTREAM SWITCHES (relay/upstream origin changed between requests)") : "";
+        const restartText = report.restartDrops.count > 0 ? "\n\n" + formatModelSwitches(report.restartDrops, detail, "RESTART/REFORK (first bill under a fresh daemon boot — prefix re-billed once)") : "";
         if (detail === "full" && report.lines.length > FULL_DETAIL_LINES) {
             const dropped = report.lines.length - FULL_DETAIL_LINES;
             const capped = formatCacheReport(
@@ -1921,9 +2330,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
+            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + wireText + upstreamText + restartText + "\n\n" + formatInvalidation(report)));
         }
-        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
+        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + wireText + upstreamText + restartText + "\n\n" + formatInvalidation(report)));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return toolFail(`[acp_cache FAILED: ${String(err)}]`);
@@ -1969,11 +2378,17 @@ function formatSeam(r: BiliCacheReport): string {
     if (r.seam.suspects > 0) {
         out.push("⚠ CACHE SEAM (suspected mid-history prefix breaks)");
         out.push(`  ${r.seam.suspects} sample(s) · ${fmtTok(r.seam.missed)} tok re-billed with no fold/switch/restart attribution`);
-        for (const e of r.seam.events) {
+        // #3307: seamEvents holds BOTH suspect and #3023 client-side events
+        // (one shared capped ring), so listing every event here echoed host-owned
+        // rewrites under the "suspected bili rebuild" header — the ✎ CLIENT
+        // section below already owns those. List only suspects here so the two
+        // sections stay disjoint and a client insert is never misread as a seam.
+        const suspectEvents = r.seam.events.filter((e) => !e.client);
+        for (const e of suspectEvents) {
             out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · divergence ≥${fmtTok(e.lcpBytes)}B at message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
-        if (r.seam.events.length === 0) {
-            out.push("    (no body-pair forensics on this lane — aggregate flag only; report the session + log if this persists)");
+        if (suspectEvents.length === 0) {
+            out.push("    (no body-pair forensics retained for the suspect samples on this lane — aggregate flag only; client-side rewrites are listed separately below)");
         }
         out.push("  if reproducible: /acp-cache detail:\"full\" + bili.log around the timestamps above (likely a #1548-family round-2/steady render seam)");
     }
@@ -1997,6 +2412,10 @@ function formatSeam(r: BiliCacheReport): string {
             if (e.client) out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · inbound message[${e.client.idx}] ${e.client.role}/${e.client.cls} ${e.client.len}B JSON · outbound ${fmtTok(e.lcpBytes)}B @ message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
     }
+    if (r.seam.orphanSweep.count > 0) {
+        out.push("🧹 ORPHAN CLEANUP SEAM (proactive failed-compress rotation — #3769)");
+        out.push(`  ${r.seam.orphanSweep.count} sample(s) · ${fmtTok(r.seam.orphanSweep.missed)} tok re-billed when failed-compress records were rotated out of history without a fold claiming the break — bili's own cleanup, not an upstream or host rewrite`);
+    }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");
         out.push(`  ${r.seam.abortCorrelated} missed sample(s) within 30s of a client mid-stream abort — abort/retry churn rewrites the resent tail; correlation, not causation (see bili.log 'client aborted mid-stream')`);
@@ -2006,11 +2425,12 @@ function formatSeam(r: BiliCacheReport): string {
 
 function formatInvalidation(r: BiliCacheReport): string {
     const b = r.invalidation;
-    const named = b.model + b.key + b.prompt + b.projection + b.wire + b.upstream + b.restart;
+    const named = b.model + b.effort + b.key + b.prompt + b.projection + b.wire + b.upstream + b.restart;
     const total = named + b.remaining;
     const out: string[] = ["CACHE INVALIDATION"];
     out.push(`  stable-prefix re-bill by cause (mutually exclusive, sums to total): ${fmtTok(named)} tok charged · ${fmtTok(b.remaining)} tok unattributed (upstream TTL/eviction/wire rewrite)`);
     out.push(`    model switch:    ${fmtTok(b.model)} (${r.modelSwitches.count})`);
+    out.push(`    effort switch:   ${fmtTok(b.effort)} (${r.effSwitches.count}) — host changed reasoning effort / thinking config; provider re-partitions its prompt cache on it (#3803)`);
     out.push(`    key switch:      ${fmtTok(b.key)} (${r.keySwitches.count}) — relay account rotation, fingerprinted headers never logged raw`);
     out.push(`    prompt rewrite:  ${fmtTok(b.prompt)} (${r.promptSwitches.count}) — host rewrote its system prompt between requests (#2350)`);
     out.push(`    projection switch: ${fmtTok(b.projection)} (${r.projSwitches.count}) — proxy switched compression mode/projection (self-heal degrade-to-proxy re-hoists mid-history developer items, #2867)`);
@@ -2021,7 +2441,7 @@ function formatInvalidation(r: BiliCacheReport): string {
     // triage order would steer users to "③ bili bug". Name it explicitly as expected provider-side behavior.
     if (b.remaining > 0 && total > 0 && b.remaining / total >= 0.5) {
         const pct = Math.round((b.remaining / total) * 100);
-        const noCauseEver = r.modelSwitches.count === 0 && r.keySwitches.count === 0 && r.promptSwitches.count === 0 && r.projSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
+        const noCauseEver = r.modelSwitches.count === 0 && r.effSwitches.count === 0 && r.keySwitches.count === 0 && r.promptSwitches.count === 0 && r.projSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
         out.push(noCauseEver
             ? `  ⚠ ${pct}% of your stable-prefix re-bill has no observable cause (no model/wire/upstream switch or restart seen) — expected provider-side behavior (cache TTL expiry / eviction / relay rotation), NOT a bili bug; if reproducible see #1195 coverage-mismatch`
             : `  ⚠ ${pct}% of your stable-prefix re-bill is unnameable provider-side behavior (cache TTL expiry / eviction / relay rotation) beyond the causes listed above`);

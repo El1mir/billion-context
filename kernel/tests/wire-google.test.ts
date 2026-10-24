@@ -112,9 +112,14 @@ test("google: systemInstruction is hoisted out of the fold space", () => {
 
 test("google: model maps to assistant, user to user, thought parts to reasoning", () => {
   const { msgs } = googleToCore(ompBody());
+  // #3642 canonical granularity: every content part is its own core (the
+  // anthropic codec's model), so the [text, image] user content yields two
+  // user cores and the model turn yields reasoning + text (the opaque
+  // executableCode part rides the preceding text core's raw sidecar).
   assert.deepEqual(
     msgs.map((m) => `${m.role}/${m.contentType}`),
     [
+      "user/text",
       "user/text",
       "assistant/reasoning",
       "assistant/text",
@@ -124,13 +129,17 @@ test("google: model maps to assistant, user to user, thought parts to reasoning"
     ],
   );
   assert.equal(msgs[0]!.text, "run the tests");
-  assert.equal(msgs[0]!.imageMediaType, "image/png");
-  assert.equal(msgs[0]!.imageBase64, IMG);
-  assert.equal(msgs[1]!.text, "List the files first.");
-  assert.equal(msgs[3]!.toolName, "bash");
-  assert.equal(msgs[3]!.toolCallId, "call_list");
-  assert.equal(msgs[3]!.text, '{"cmd":"ls"}');
-  assert.equal(msgs[4]!.text, '{"output":"a.ts\\nb.ts"}');
+  assert.equal(msgs[0]!.imageMediaType, undefined);
+  assert.equal(msgs[1]!.text, "[image]");
+  assert.equal(msgs[1]!.imageMediaType, "image/png");
+  assert.equal(msgs[1]!.imageBase64, IMG);
+  assert.equal(msgs[2]!.text, "List the files first.");
+  assert.equal(msgs[4]!.toolName, "bash");
+  assert.equal(msgs[4]!.toolCallId, "call_list");
+  assert.equal(msgs[4]!.text, '{"cmd":"ls"}');
+  // #3658: google functionResponse single-key {output} objects unwrap into
+  // plain text — the tool-result core text is "a.ts\nb.ts", not a JSON blob.
+  assert.equal(msgs[5]!.text, "a.ts\nb.ts");
 });
 
 test("google: functionResponse parts become tool cores ahead of the user core", () => {
@@ -291,6 +300,9 @@ test("google: sidecar signature and image rebuild a core that lost its raw parts
   // Simulate a core whose raw parts array is gone (a host-set message), where
   // only the scalar sidecars remain.
   const rebuilt = coreToGoogle(msgs.map(({ rawGoogleParts, ...rest }) => rest));
+  // #3642: the [text, image] user run rebuilds as ONE content with the
+  // text part first and the image core's sidecar re-rendered as inlineData
+  // (the "[image]" marker never re-renders as a text part).
   assert.deepEqual(rebuilt[0]!.parts, [
     { text: "run the tests" },
     { inlineData: { mimeType: "image/png", data: IMG } },
@@ -319,7 +331,7 @@ test("google: sidecar signature and image rebuild a core that lost its raw parts
       functionResponse: {
         name: "bash",
         response: { output: "second, no id" },
-        id: msgs[5]!.toolCallId,
+        id: msgs[6]!.toolCallId,
       },
     },
   ]);

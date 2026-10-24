@@ -29,16 +29,23 @@ after(() => {
 
 import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
-import { ACP_TOOLS_OPENAI } from "../src/compress-tool.ts";
+import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 
 const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode, armNativeOpencode, verifyAttachAndRecover, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } = await import("../src/agent/opencode-native.ts");
 const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
 const { markNativeHost, nativeAttachOrigin } = await import("../src/agent/native-bootstrap.ts");
 const nativeDefault = (await import("../src/agent/opencode-native.ts")).default;
 
-const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name)];
+const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// #3501: a dev shell running opencode through a launcher exports a live attach
+// target; verifyAttachAndRecover reads BILLION_CONTEXT_ATTACH explicitly, so
+// every suite below must start from a clean slate or it silently binds to the
+// real proxy instead of the mock it set up.
+delete process.env.BILLION_CONTEXT_ATTACH;
+delete process.env.BILLION_CONTEXT_PROXY;
 
 // The diagnostic contract: the marker reaches bili.log AND nothing carrying it
 // reaches any terminal surface (console.* or raw stdout/stderr).
@@ -443,6 +450,62 @@ test("route: proxy down + body provably over the model window throws a local ref
     assert.equal(await (e.request as Request).text(), body, "measuring through the clone leaves the original body sendable");
 });
 
+for (const unavailable of ["dead", "busy-exhausted"] as const) {
+    test(`#4121 route: ${unavailable} excludes inline images from the direct-refusal text floor`, async (t) => {
+        const b64 = "A".repeat(8_000);
+        const dataUrl = `data:image/png;base64,${b64}`;
+        const bodies = {
+            openai: { messages: [{ role: "user", content: [{ type: "text", text: "Describe this image." }, { type: "image_url", image_url: { url: dataUrl } }] }] },
+            responses: { input: [{ role: "user", content: [{ type: "input_text", text: "Describe this image." }, { type: "input_image", image_url: dataUrl }] }] },
+            anthropic: { messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "shot", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: b64 } }] }] }] },
+        };
+        for (const [wire, payload] of Object.entries(bodies)) {
+            await t.test(wire, async () => {
+                const state: NativeInterceptState = { origin: "http://127.0.0.1:1", ready: Promise.resolve(undefined) };
+                const route = createNativeRoute(state, { probe: async () => ({ state: unavailable === "busy-exhausted" ? "busy" : "dead" }), busyWaitCapMs: 0 });
+                const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+                const body = JSON.stringify(payload);
+                assert.ok(Buffer.byteLength(body) / 4 > 1_000, "the raw-byte floor would refuse this image-heavy request");
+                const e: V2HttpRequestEvent = {
+                    model: { providerID: "prov", id: "model-x" },
+                    request: new Request(MODEL_URL, { method: "POST", body }),
+                };
+                await route(e, s);
+                assert.equal(state.lastUnavailableReason, unavailable);
+                assert.equal((e.request as Request).url, MODEL_URL);
+                assert.equal(s.proxyBase, undefined);
+                assert.equal(await (e.request as Request).text(), body, "direct fallback preserves the original body");
+            });
+        }
+    });
+
+    test(`#4121 route: ${unavailable} still refuses over-window text with or without media`, async (t) => {
+        const dataUrl = `data:image/png;base64,${"A".repeat(8_000)}`;
+        const text = "x".repeat(5_000);
+        const bodies = {
+            text: JSON.stringify({ messages: [{ role: "user", content: text }] }),
+            mixed: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text }, { type: "image_url", image_url: { url: dataUrl } }] }] }),
+            pasted_data_url: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: dataUrl }] }] }),
+            malformed: `{"messages":[${text}`,
+        };
+        for (const [name, body] of Object.entries(bodies)) {
+            await t.test(name, async () => {
+                const state: NativeInterceptState = { origin: "http://127.0.0.1:1", ready: Promise.resolve(undefined) };
+                const route = createNativeRoute(state, { probe: async () => ({ state: unavailable === "busy-exhausted" ? "busy" : "dead" }), busyWaitCapMs: 0 });
+                const e: V2HttpRequestEvent = {
+                    model: { providerID: "prov", id: "model-x" },
+                    request: new Request(MODEL_URL, { method: "POST", body }),
+                };
+                const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+                await assert.rejects(route(e, s), unavailable === "busy-exhausted" ? /proxy alive but unresponsive/ : /proxy unavailable/);
+                assert.equal(state.lastUnavailableReason, unavailable);
+                assert.equal((e.request as Request).url, MODEL_URL);
+                assert.equal(await (e.request as Request).text(), body);
+            });
+        }
+    });
+}
+
 test("route: proxy down + under-window body keeps the fail-open direct send", async () => {
     const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
     const route = createNativeRoute(state, { probe: async () => false });
@@ -771,6 +834,105 @@ test("#1365 verifyAttachAndRecover: persistently dead pinned target — refuses 
     } finally {
         delete process.env.BILLION_CONTEXT_PROXY;
         delete process.env.BILI_ATTACH_HEALTH_DEADLINE_MS;
+        _setSpawnForTest(undefined);
+        _resetNativeStateForTest();
+    }
+});
+
+// — #3501: an explicit attach endpoint stays authoritative over routed model-origin evidence —
+
+test("#3501 verifyAttachAndRecover: planted routed evidence from an admin-gated origin does not displace an explicit attach", async () => {
+    const attach = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ version: "0.1.119", tools: {} }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    await new Promise<void>((r) => attach.listen(0, "127.0.0.1", () => r()));
+    const attachOrigin = `http://127.0.0.1:${(attach.address() as AddressInfo).port}`;
+    let modelManifestRequests = 0;
+    const model = createServer((_req, res) => {
+        if (_req.url === "/__bili/plugin/manifest") modelManifestRequests += 1;
+        res.writeHead(403);
+        res.end("Forbidden");
+    });
+    await new Promise<void>((r) => model.listen(0, "127.0.0.1", () => r()));
+    const modelOrigin = `http://127.0.0.1:${(model.address() as AddressInfo).port}`;
+    let spawnCalls = 0;
+    try {
+        _resetNativeStateForTest();
+        _setSpawnForTest(async () => {
+            spawnCalls += 1;
+            return "http://127.0.0.1:2";
+        });
+        process.env.BILLION_CONTEXT_ATTACH = attachOrigin;
+        _noteRoutedForTest(`${modelOrigin}/bili/${MODEL_URL}`);
+        const recovered = await verifyAttachAndRecover(attachOrigin);
+        assert.equal(recovered, attachOrigin, "recovery lands on the explicit endpoint, not the model-only origin");
+        assert.equal(spawnCalls, 0, "no second instance over an API-only model route");
+        assert.equal(modelManifestRequests, 0, "planted model-route evidence must not override explicit attach");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, attachOrigin);
+    } finally {
+        attach.closeAllConnections?.();
+        attach.close();
+        model.closeAllConnections?.();
+        model.close();
+        delete process.env.BILLION_CONTEXT_ATTACH;
+        delete process.env.BILLION_CONTEXT_PROXY;
+        _setSpawnForTest(undefined);
+        _resetNativeStateForTest();
+    }
+});
+
+test("#3501 wiring: late routed evidence from an admin-gated origin does not rebind away from a healthy explicit attach", async () => {
+    const attach = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ version: "0.1.119", tools: {} }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    await new Promise<void>((r) => attach.listen(0, "127.0.0.1", () => r()));
+    const attachOrigin = `http://127.0.0.1:${(attach.address() as AddressInfo).port}`;
+    let modelManifestRequests = 0;
+    const model = createServer((_req, res) => {
+        if (_req.url === "/__bili/plugin/manifest") modelManifestRequests += 1;
+        res.writeHead(403);
+        res.end("Forbidden");
+    });
+    await new Promise<void>((r) => model.listen(0, "127.0.0.1", () => r()));
+    const modelOrigin = `http://127.0.0.1:${(model.address() as AddressInfo).port}`;
+    let spawned = 0;
+    try {
+        _resetNativeStateForTest();
+        _setSpawnForTest(async () => {
+            spawned += 1;
+            return "http://127.0.0.1:7777";
+        });
+        process.env.BILLION_CONTEXT_ATTACH = attachOrigin;
+        armNativeOpencode({ mode: "attach", attachOrigin });
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, attachOrigin, "healthy explicit target resolves to itself");
+        _noteRoutedForTest(`${modelOrigin}/bili/${MODEL_URL}`);
+        const deadline = Date.now() + 5000;
+        while (modelManifestRequests < 1 && Date.now() < deadline) {
+            await sleep(10);
+        }
+        assert.equal(modelManifestRequests, 1, "the hook liveness-probes the late routed origin exactly once");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, attachOrigin, "a failing probe must not rebind off the healthy explicit endpoint");
+        assert.equal(spawned, 0);
+    } finally {
+        attach.closeAllConnections?.();
+        attach.close();
+        model.closeAllConnections?.();
+        model.close();
+        delete process.env.BILLION_CONTEXT_ATTACH;
+        delete process.env.BILLION_CONTEXT_PROXY;
         _setSpawnForTest(undefined);
         _resetNativeStateForTest();
     }

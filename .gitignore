@@ -7,3 +7,8 @@ dist/
 tmp/
 tests/.pp-stamp-state-*/
 .tmp/
+plugin-lanes/
+
+# local tool scratch (esbuild temp redirection, see persona-fork tests)
+.esbuild-tmp/
+

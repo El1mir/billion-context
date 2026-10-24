@@ -1,7 +1,7 @@
 import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { GooglePart } from "acp-kernel/wire";
 import type { Session } from "./session.js";
-import { isProxyToolFor } from "./proxy-tool.js";
+import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyToolAsync } from "./loop/core.js";
 import { drainPendingRetrievals } from "./store.js";
 import { runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./stream.js";
@@ -26,7 +26,7 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
     const keptParts: GooglePart[] = [];
     // Absorb signature in whole text (m00885): drop only when the request
     // actually instructed the model about absorb.
-    const absorbArmed = false;
+    const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
     const requestText = JSON.stringify(ctx.messages);
     for (const part of parts) {
         if (!part || typeof part !== "object") continue;

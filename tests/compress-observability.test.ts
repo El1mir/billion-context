@@ -88,7 +88,7 @@ test("#189: fold point picks the EARLIEST range start across multiple ranges", (
     const ctx = makeCompressibleCtx();
     ctx.session.stats.lastInputTokens = 100000;
     const args = { content: [
-        { startId: "m00005", endId: "m00006", summary: "OBS-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
+        { startId: "m00003", endId: "m00004", summary: "OBS-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
         { startId: "m00001", endId: "m00002", summary: "OBS-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
     ] };
     runApply(ctx, args);

@@ -85,7 +85,9 @@ test("full mode: provider switch keeps the fold ledger (unified-first, #2847)", 
         assert.equal(row.namespace, "proxy", "bare proxy lane defaults to namespace=proxy");
         assert.equal(row.origin, ORIGIN_A, "origin column carries the shard origin at ingest time");
     } finally {
-        delete process.env.BILI_STORAGE_UNIFIED;
+        // #3818: absent now resolves to the full DEFAULT — restore the
+        // suite's declared legacy baseline instead of deleting the var.
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
         loader?.closeQuietly();
         db?.close();
         try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
@@ -131,7 +133,9 @@ test("full mode: plugin lane namespaces the row (metadata.pluginAgent)", async (
         assert.equal(row.namespace, "dsh", "pluginAgent lands in the namespace column");
         assert.equal(row.origin, ORIGIN_A);
     } finally {
-        delete process.env.BILI_STORAGE_UNIFIED;
+        // #3818: absent now resolves to the full DEFAULT — restore the
+        // suite's declared legacy baseline instead of deleting the var.
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
         loader?.closeQuietly();
         db?.close();
         try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
@@ -211,7 +215,9 @@ test("R2.1 identity index: ingest claims, first claimant wins, deleteSession swe
         assert.equal(db.lookupConversation("proxy", CORPUS_ID), null, "identity binding swept with the session");
         assert.equal(db.getSessionRow(rowId), null, "row gone");
     } finally {
-        delete process.env.BILI_STORAGE_UNIFIED;
+        // #3818: absent now resolves to the full DEFAULT — restore the
+        // suite's declared legacy baseline instead of deleting the var.
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
         loader?.closeQuietly();
         db?.close();
         try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
@@ -242,7 +248,9 @@ test("R2.1 boot union: full mode keeps index rows whose legacy file disappeared"
         const loaded = await loader.loadAll();
         assert.ok([...loaded.values()].some((s) => s.id === found!.id), "loadAll union sees the file-less row too");
     } finally {
-        delete process.env.BILI_STORAGE_UNIFIED;
+        // #3818: absent now resolves to the full DEFAULT — restore the
+        // suite's declared legacy baseline instead of deleting the var.
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
         loader?.closeQuietly();
         try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
     }
@@ -280,7 +288,9 @@ test("R2.1 list fast path: full-mode summaries match the legacy walk (parity)", 
         assert.equal(b.savedAt, a.savedAt, "savedAt parity (latest block created_at)");
         assert.equal(b.contextTokens, a.contextTokens, "contextTokens parity (stats_json)");
     } finally {
-        delete process.env.BILI_STORAGE_UNIFIED;
+        // #3818: absent now resolves to the full DEFAULT — restore the
+        // suite's declared legacy baseline instead of deleting the var.
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
         loader?.closeQuietly();
         try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
     }

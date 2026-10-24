@@ -16,6 +16,18 @@ import {
 
 const enc = new TextEncoder();
 
+// #3406 item 1: the threshold resolves through the guardrails.textRunThreshold
+// knob (BILI_GUARDRAIL_TEXT_RUN_THRESHOLD > config file > 200). Resolution is
+// per-guard at createRunawayGuard() time, so the env var is set around guard
+// creation / stream wrapping in these tests.
+async function withEnv<T>(vars: Record<string, string>, fn: () => T | Promise<T>): Promise<T> {
+    const saved: [string, string | undefined][] = [];
+    for (const [k, v] of Object.entries(vars)) { saved.push([k, process.env[k]]); process.env[k] = v; }
+    try { return await fn(); } finally {
+        for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+}
+
 function sseFrame(json: string): Uint8Array {
     return enc.encode(`data: ${json}\n\n`);
 }
@@ -197,6 +209,93 @@ test("wrap: responses function_call_arguments.delta with 300 '=' does NOT trip (
     assert.deepEqual(out, Buffer.concat(parts));
 });
 
+test("wrap: Google wire functionCall.args with 300 '=' does NOT trip (argument bytes)", async () => {
+    // Google streaming chunk: the tool call rides candidates[].content.parts[].functionCall.args
+    // and its payload leaf is typically named `content` — a TEXT_LEAF_KEYS name. Google events
+    // carry no top-level `type`, so the function_call frame gate cannot exempt them; only the
+    // branch exclusion can. Before it, a write-tool payload of >= 200 identical characters
+    // aborted the whole turn mid-stream.
+    const frame = JSON.stringify({
+        candidates: [
+            {
+                content: {
+                    role: "model",
+                    parts: [{ functionCall: { name: "write", args: { path: "notes.ts", content: "=".repeat(300) } } }],
+                },
+            },
+        ],
+    });
+    const parts = [sseFrame(frame), sseFrame(openaiDelta(" done."))];
+    const verdicts: RunawayVerdict[] = [];
+    const out = await collect(wrapParts(parts, verdicts));
+    assert.equal(verdicts.length, 0, JSON.stringify(verdicts));
+    assert.deepEqual(out, Buffer.concat(parts));
+});
+
+test("wrap: Google wire functionCall.args.text (second leaf-key spelling) with 300 '-' does NOT trip", async () => {
+    // The argument field can carry ANY TEXT_LEAF_KEYS name; pin the second spelling
+    // so the exclusion holds by BRANCH name (functionCall/args), not field-name luck.
+    // Ported from duplicate PR #3375 (closed as a dup of this PR; #3358).
+    const frame = JSON.stringify({
+        candidates: [
+            {
+                content: {
+                    role: "model",
+                    parts: [{ functionCall: { name: "edit", args: { text: "-".repeat(300) } } }],
+                },
+            },
+        ],
+    });
+    const parts = [sseFrame(frame)];
+    const verdicts: RunawayVerdict[] = [];
+    const out = await collect(wrapParts(parts, verdicts));
+    assert.equal(verdicts.length, 0, JSON.stringify(verdicts));
+    assert.deepEqual(out, Buffer.concat(parts));
+});
+
+test("wrap: mixed Google frame — prose part + 300-'=' arg part coexist without tripping", async () => {
+    // One frame carrying BOTH a model-text part and a huge argument part: the run
+    // tracker must see only the prose, and every byte forwards untouched.
+    // Ported from duplicate PR #3375 (closed as a dup of this PR; #3358).
+    const frame = JSON.stringify({
+        candidates: [
+            {
+                content: {
+                    role: "model",
+                    parts: [
+                        { text: "Writing the file now." },
+                        { functionCall: { name: "write", args: { path: "/tmp/x.txt", content: "=".repeat(300) } } },
+                    ],
+                },
+            },
+        ],
+    });
+    const parts = [
+        sseFrame(frame),
+        sseFrame(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: " done." }] } }] })),
+    ];
+    const verdicts: RunawayVerdict[] = [];
+    const out = await collect(wrapParts(parts, verdicts));
+    assert.equal(verdicts.length, 0, JSON.stringify(verdicts));
+    assert.deepEqual(out, Buffer.concat(parts));
+});
+
+test("wrap: Google wire parts[].text with 300 '=' still trips (exclusion must not swallow model text)", async () => {
+    // Companion to the args test: the same carrier shape with the run in the MODEL TEXT
+    // leaf (parts[].text) must still trip — proves the branch exclusion is scoped to
+    // functionCall.args, not to the whole Google candidates/content/parts subtree.
+    const parts: Uint8Array[] = [];
+    for (let i = 0; i < 3; i++) {
+        parts.push(sseFrame(JSON.stringify({
+            candidates: [{ content: { role: "model", parts: [{ text: "=".repeat(120) }] } }],
+        })));
+    }
+    const verdicts: RunawayVerdict[] = [];
+    await collect(wrapParts(parts, verdicts));
+    assert.equal(verdicts.length, 1, JSON.stringify(verdicts));
+    assert.equal(verdicts[0].reason, "text-run");
+});
+
 test("wrap: 3-byte-at-a-time feed crosses decoder/frame boundary splits and still trips", async () => {
     const sse = Array.from({ length: 7 }, () => `data: ${openaiDelta("=".repeat(37))}\n\n`).join("");
     const full = enc.encode(sse);
@@ -256,4 +355,56 @@ test("wrap: acp-tag flood still trips as acp-enumeration with the text lane acti
     await collect(wrapParts(parts, verdicts));
     assert.equal(verdicts.length, 1);
     assert.equal(verdicts[0].reason, "acp-enumeration");
+});
+
+test("knob: default 200 stays ON with the env var unset (behavior unchanged, #3406)", () => {
+    const saved = process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    delete process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD;
+    try {
+        const g = createRunawayGuard();
+        assert.equal(g.feedText("=".repeat(199)).tripped, false);
+        assert.equal(g.feedText("=").tripped, true, "exactly 200 still trips — default unchanged");
+    } finally {
+        if (saved !== undefined) process.env.BILI_GUARDRAIL_TEXT_RUN_THRESHOLD = saved;
+    }
+});
+
+test("knob: BILI_GUARDRAIL_TEXT_RUN_THRESHOLD=1000 raises the trip point (env tier)", async () => {
+    await withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "1000" }, () => {
+        const g = createRunawayGuard();
+        assert.equal(g.feedText("=".repeat(500)).tripped, false, "a 500-run that would die at the default 200 survives");
+        const v = g.feedText("=".repeat(500));
+        assert.equal(v.tripped, true, "still trips at the raised threshold (stateful across calls)");
+        assert.equal(v.reason, "text-run");
+        assert.equal(v.detail?.maxTextRun, 1000);
+    });
+});
+
+test("knob: threshold 0 disables the lane — 5000-char same-codepoint run streams through byte-exact", async () => {
+    await withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "0" }, async () => {
+        // A code-comment separator wall: 5000 '=' as text deltas — far past the 200
+        // default; with the knob off nothing trips and every byte forwards.
+        const parts: Uint8Array[] = [];
+        for (let i = 0; i < 25; i++) parts.push(sseFrame(openaiDelta("=".repeat(200))));
+        // The thinking channel sits inside the lane too — it must switch off with it.
+        const think = JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: "-".repeat(1000) } }] });
+        parts.push(sseFrame(think));
+        parts.push(sseFrame(openaiDelta(" done.")));
+        const verdicts: RunawayVerdict[] = [];
+        const out = await collect(wrapParts(parts, verdicts));
+        assert.equal(verdicts.length, 0);
+        assert.deepEqual(out, Buffer.concat(parts), "byte-exact end-to-end, no cut");
+    });
+});
+
+test("knob: threshold 0 disables ONLY the text-run lane — acp-tag flood still trips (#3406)", async () => {
+    await withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "0" }, async () => {
+        const tag = `\x3cacp tokens="0" type="text">m02040\x3c/acp\x3c/acp>\n`;
+        const parts: Uint8Array[] = [];
+        for (let i = 0; i < 265; i++) parts.push(enc.encode(tag));
+        const verdicts: RunawayVerdict[] = [];
+        await collect(wrapParts(parts, verdicts));
+        assert.equal(verdicts.length, 1);
+        assert.equal(verdicts[0].reason, "acp-enumeration", "disabling the text-run lane must not disarm the other lanes");
+    });
 });

@@ -24,7 +24,7 @@ test("extractors are not vacuous (golden anchors survive)", () => {
         "network.upstreamTimeoutMs",
         "persist.enabled",
         "sessions.gc.maxAgeDays",
-        "dsh.allowDshCompaction",
+        "dsh.authoredCompaction",
         "mitm.domains",
         "compress.tiers",
         "plugin.snapshotCapBytes",

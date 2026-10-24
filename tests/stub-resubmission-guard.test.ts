@@ -124,7 +124,10 @@ test("#2749 canonical integrity pin: full summary survives save → history redu
         ["user", "Follow-up questions about the configuration."],
         ["assistant", "y".repeat(3000)],
     ]);
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00004", topic: "T", summary: LONG_SUMMARY }] }), ctx).text;
+    // The fold is linked to its tool-call id exactly as production does
+    // (src/loop/core.ts passes callId); the resent "call-b1" below then
+    // classifies active instead of orphan.
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00004", topic: "T", summary: LONG_SUMMARY }] }, "call-b1"), ctx).text;
     assert.ok(out.startsWith("[Compressed m00001–m00004 → 1 block(s)"), out.split("\n")[0]);
     // (a) saved canonically in full — no trimming, no truncation.
     assert.equal(storedSummary(ctx.session.state, "b1"), LONG_SUMMARY);
@@ -155,7 +158,7 @@ test("#2749 rejects a byte-identical stub re-submission; state unchanged, refusa
         ["user", "late part two"], ["assistant", "d".repeat(1000)],
         ["user", "late part three"], ["assistant", "e".repeat(1000)],
     ]);
-    const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }), ctx).text;
+    const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }, "call-b1"), ctx).text;
     assert.ok(ok.startsWith("[Compressed m00001–m00002 → 1 block(s)"), ok.split("\n")[0]);
     // Next request: the model sees its own call reduced to the stub.
     ctx.messages = nextRequestView(ctx, "call-b1", "m00001", "m00002").map((m) => ({ ...m }));
@@ -181,7 +184,7 @@ test("#2749 self-refold under the block's own stub is blocked (silent-shrink wor
         ["user", "setup steps discussed early"], ["assistant", "a".repeat(4000)],
         ["user", "more detail on the setup"], ["assistant", "b".repeat(4000)],
     ]);
-    const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }), ctx).text;
+    const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }, "call-b1"), ctx).text;
     assert.ok(ok.startsWith("[Compressed m00001–m00002 → 1 block(s)"), ok.split("\n")[0]);
     ctx.messages = nextRequestView(ctx, "call-b1", "m00001", "m00002").map((m) => ({ ...m }));
     // Re-fold the SAME span submitting the block's own stub as the new summary.
@@ -204,7 +207,7 @@ test("#2749 legitimate summaries still pass: short, ellipsis-prose, and ±1-char
         ["user", "late four"], ["assistant", "f".repeat(4000)],
         ["user", "late five"], ["assistant", "g".repeat(4000)],
     ]);
-    const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }), ctx).text;
+    const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }, "call-b1"), ctx).text;
     assert.ok(ok.startsWith("[Compressed m00001–m00002 → 1 block(s)"), ok.split("\n")[0]);
     ctx.messages = nextRequestView(ctx, "call-b1", "m00001", "m00002").map((m) => ({ ...m }));
 
@@ -234,7 +237,7 @@ test("#2749 host harvest tracks kernel-emitted stubs (format-drift tripwire)", (
     seedTurn(ctx, [
         ["user", "early part"], ["assistant", "a".repeat(1000)],
     ]);
-    const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }), ctx).text;
+    const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", topic: "T", summary: LONG_SUMMARY }] }, "call-b1"), ctx).text;
     assert.ok(ok.startsWith("[Compressed"), ok.split("\n")[0]);
     const view = nextRequestView(ctx, "call-b1", "m00001", "m00002");
     const visCall = view.find((m) => m.toolCallId === "call-b1")!;

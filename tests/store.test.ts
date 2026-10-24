@@ -38,6 +38,7 @@ function toolResult(): CoreMessage[] {
 
 function ccrConfig() {
     return applyCompressSettings(defaultConfig(200000), 200_000, {
+        absorb: { enabled: true, minToolTokens: 50 },
         ccr: { enabled: true, minToolTokens: 50 },
     });
 }
@@ -110,7 +111,7 @@ test("applyCompressSettings: maps ccr onto kernel CcrConfig with DEFAULT_CCR_CON
     assert.equal(off.ccr?.enabled, false);
 });
 
-test("integration: kernel processTurn ID-references the oversized tool result (ccr enabled)", () => {
+test("integration: kernel processTurn ID-references the oversized tool result (ccr+absorb enabled)", () => {
     const cfg = ccrConfig();
     const turn = turnWith(cfg);
     const res = turn.messages.find((m) => m.role === "tool" && m.toolCallId === "call_1")!;

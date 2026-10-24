@@ -11,6 +11,9 @@ interface AcquireResult {
 export function resolveLockPath(env?: NodeJS.ProcessEnv): string;
 export function readLock(lockPath: string): Promise<LockRecord | null>;
 export function isAlive(pid: number): boolean;
+export const STALE_LOCK_MS: number;
+export function holderIsStale(holder: LockRecord, now?: number): boolean;
+export function staleStealMessage(holder: LockRecord, lockPath: string, now?: number): string;
 export function forceEnabled(env?: NodeJS.ProcessEnv): boolean;
 export function formatAge(msAgo: number): string;
 export function blockedMessage(holder: LockRecord, lockPath: string, now?: number): string;

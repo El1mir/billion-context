@@ -2,6 +2,70 @@
 # Edit HERE, then run: node tools/gen-config-docs.mjs generate
 domain: env-only
 entries:
+  - key: BILI_DSH_AUTHORED_COMPACTION
+    type: boolean
+    default: "true (on, #3901 flip)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Let bili ANSWER dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3733): identity header + kernel-rendered block summaries, zero egress; replay recognized via the #2432 rebase."
+    desc_zh: "让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。"
+  - key: BILI_DSH_CONTEXT_TAB
+    type: boolean
+    default: "true"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Env tier for dsh.contextTab (#4237): 0/false removes the DSH top-bar 「上下文」/「Context」 tab (everything else keeps working); any other value forces it on over the file tier; unset = file tier applies (default true). Takes effect on next page load / dsh restart."
+    desc_zh: "dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。"
+  - key: BILI_DSH_MAX_TESTED_VERSION
+    type: string
+    default: "0.2.0-rc.2 (CI e2e anchor)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Newest-tested @deepseek-ai/dsh build behind the dsh native lane's boot note (#4545): the running client build is resolved from the nearest node_modules/@deepseek-ai/dsh/package.json above the injected bundle; being STRICTLY NEWER than this cap earns ONE boot-time note (durable log record + banner) advising roll-back until support lands. One direction only — at-or-below-cap builds stay silent (known older-build break modes have their own overlay-latch detectors). Warns only — never gates or blocks traffic. Move the cap up as builds get verified; an EMPTY string turns the check off for this lane. Unresolvable/unparseable versions fail open to silence."
+    desc_zh: “dsh native lane 启动提示的“我们测过的最高版本”上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读出运行中的构建,**严格高于**上限才弹一条启动提示(持久日志 + 横幅),建议先回滚到上限版本。只覆盖"更新"一个方向:≤ 上限保持静默(旧版已知坏法有专门的失锁探测)。只提示、绝不拦截或阻断流量;新版本验证通过后抬高上限,空字符串 = 关闭本 lane 检查;读不到/解析不了的版本按静默处理。”
+  - key: BILI_STORAGE_BACKEND
+    type: "sqlite|mysql"
+    default: "sqlite"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Env tier for storage.backend (#3931): sqlite (default) or mysql (fully wired, #3388 steps 2+3 - saves ingest through the async shadow queue, sync reads ride the JSON envelope, replicas/ext/GC via the async twins; export too). Wins over the file tier."
+    desc_zh: "storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC 走异步孪生;export 同样支持）。优先于文件层。"
+  - key: BILI_MYSQL_DSN
+    type: string
+    default: "unset"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "MySQL DSN (mysql://user:pass@host:3306/db) for storage.backend=\"mysql\" (#3388, #3931). Wins over the file key storage.mysql.dsn. Empty = the mysql backend cannot open; the documented error names both knobs. The pool opens lazily; closeQuietlyAsync drains the ingest queue and closes it."
+    desc_zh: "storage.backend=\"mysql\" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。"
+  - key: BILI_STORAGE_ARCHIVE_AFTER_DAYS
+    type: integer
+    default: "365"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "GC age sweep window in days (#3463): sessions idle longer than this are archived (one JSON line appended to the single archive log (archive/archive.jsonl) + tombstone row + content/media refs released). 0 disables the age sweep; the manual entry POST /__bili/storage/gc always runs. Config-file key storage.archiveAfterDays is the persistent form."
+    desc_zh: "GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。"
+  - key: BILI_STORAGE_QUICK_CHECK
+    type: string
+    default: "on"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Storage integrity self-check at open (#4175): every index.db open runs PRAGMA quick_check BEFORE migrations; on failure the shadow layer quarantines the file set (index.db/-wal/-shm renamed to .corrupt-<ts>) and reopens fresh (JSON envelopes remain the recovery source). Set 0 only for boot-time-sensitive huge deployments where the check's cost matters."
+    desc_zh: "存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check;失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。仅当超大库的启动时间敏感时才设 0 跳过。"
+  - key: BILI_SNAPSHOT_SHADOW
+    type: boolean
+    default: "true (on)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Snapshot-render shadow observability (#3756 follow-up): compute the outbound snapshot view on every armed turn WITHOUT using it, classify the diff against the legacy outbound, and surface per-session counters in the web panel + the snapshot-shadow diagnostics topic. 0/false/off disables; 1/true/on enables; otherwise the config-file snapshot.shadow boolean applies (default on). The render lane itself stays rollout-gated (BILI_ROLLOUT_SNAPSHOT_RENDER), so the shadow lane never changes outbound bytes - it is the dry-run evidence that flips the rollout later."
+    desc_zh: "快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。"
   - key: BILI_CONFIG_FILE
     type: string
     default: "unset (XDG config path)"
@@ -106,6 +170,14 @@ entries:
     group: envonly
     desc_en: "Upstream pin for the claude lane."
     desc_zh: "claude 车道的上游钉死。"
+  - key: BILI_CODEX_STATE_MODE
+    type: string
+    default: "auto"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "codex state handling: auto (shared db via CODEX_SQLITE_HOME on modern codex, legacy overlay copies otherwise), shared, or legacy. Shared mode runs up to 16 concurrent sessions, one per-session overlay slot each; legacy keeps one exclusive overlay at a time."
+    desc_zh: "codex 状态处理方式：auto（新版 codex 走 CODEX_SQLITE_HOME 共享库，旧版回退 overlay 副本）、shared、legacy。shared 模式最多 16 个并发会话，每会话一个独立 overlay 槽位；legacy 保持一次仅一个独占 overlay。"
   - key: BILI_ATTACH_HEALTH_DEADLINE_MS
     type: number
     default: "(built-in)"
@@ -426,3 +498,11 @@ entries:
     group: envonly
     desc_en: "Spawn channel: marks a plugin-agent process."
     desc_zh: "派生通道：标记插件 agent 进程。"
+  - key: BILI_IMAGE_RESCALE_MAX_DIM
+    type: integer
+    default: "1600"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design."
+    desc_zh: "出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。"

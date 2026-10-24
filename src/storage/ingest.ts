@@ -29,25 +29,14 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
+import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
-/** Field order of mergeState() output (src/persist.ts) — the loader must
- *  rebuild the state object in exactly this order. Keep in sync. */
-const MERGE_STATE_FIELDS = [
-    "blocks",
-    "messageRefs",
-    "nudge",
-    "stats",
-    "nextBlockId",
-    "nextRunId",
-    "tokenSnapshot",
-    "lastPassIds",
-    "hiddenOrphanRefs",
-    "deadRefs",
-    "terminalStreak",
-    "nextRuleId",
-    "absorbed",
-    "rules",
-] as const;
+/**
+ * Field order of the hydration merge output — DERIVED from mergeState itself
+ * (src/state-hydration.ts), not hand-kept: the hand list had already drifted
+ * (#4192). The loader rebuilds the state object in exactly this order.
+ */
+import { COMPRESSION_STATE_FIELDS as MERGE_STATE_FIELDS } from "../state-hydration.js";
 
 /** Fields owned by dedicated tables/columns — never inside kstate_json. */
 const TABLE_OWNED_FIELDS = new Set(["blocks", "messageRefs", "deadRefs", "nextBlockId", "nextRunId"]);
@@ -71,6 +60,12 @@ export interface LegacySessionLike {
     lastMessages?: CoreMessage[];
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3301: external-converter import payload — original message
+     *  decompositions interned BEFORE the snapshot/tail so their rows get the
+     *  lowest seqs (they are the oldest evidence). Consumed by the full
+     *  ingest only; the delta planner falls back to the full path while it is
+     *  present (its rows would otherwise be skipped as "trusted prefix"). */
+    decompositionLog?: CoreMessage[];
     contentStore?: { version: 1; byHash: Record<string, string>; byRef: Record<string, unknown> };
 }
 
@@ -90,14 +85,25 @@ export const ingestSerializations = { count: 0 };
 /** One messages-log entry with its ABSOLUTE seq already assigned (intern
  *  assigns first-seen order; the delta planner continues after the trusted
  *  prefix). */
+/**
+ * #3762 media CAS split: pull the top-level imageBase64 payload out of the
+ * serialized message. The stored content keeps the key POSITION but carries
+ * a {"$media": sha256(bytes)} reference; the bytes themselves live in the
+ * content CAS, refcounted via message_media rows. Key order is preserved by
+ * JSON.parse, so hydrate-and-restringify is byte-identical — every existing
+ * reader (getMessages hydrates before returning) sees the verbatim original.
+ * No media (or empty) → passthrough with the plain content hash.
+ */
 interface LogEntry {
     seq: number;
     msgId: string;
     content: string;
     hash: string;
+    identity: string;
     role: string;
     kind: string;
     ref: string | null;
+    media?: { hash: string; bytes: string }[];
 }
 
 /** Adapts any Session-shaped object (persist loadSync output) to the
@@ -115,6 +121,7 @@ export function toLegacyLike(s: {
     lastMessages?: LegacySessionLike["lastMessages"];
     lastMessagesFolded?: boolean;
     pluginSnapshot?: LegacySessionLike["pluginSnapshot"];
+    decompositionLog?: LegacySessionLike["decompositionLog"];
     contentStore?: LegacySessionLike["contentStore"];
 }): LegacySessionLike {
     return {
@@ -129,6 +136,7 @@ export function toLegacyLike(s: {
         lastMessages: s.lastMessages,
         lastMessagesFolded: s.lastMessagesFolded,
         pluginSnapshot: s.pluginSnapshot,
+        decompositionLog: s.decompositionLog,
         contentStore: s.contentStore,
     };
 }
@@ -147,18 +155,26 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        const content = JSON.stringify(m);
+        const raw = JSON.stringify(m);
         ingestSerializations.count++;
-        const parsed = JSON.parse(content) as { role: string; contentType?: string };
-        const entry = { msgId: m.id, content, hash: sha256Hex(content), role: parsed.role, kind: parsed.contentType ?? "message" };
-        const key = `${m.id}\u0000${entry.hash}`;
+        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
+        const split = splitMediaContent(raw);
+        const entry = { msgId: m.id, content: split.content, hash: split.hash, role: parsed.role, kind: parsed.contentType ?? "message", media: split.media };
+        // #4390: the cross-save JOIN key is the POSITION-INDEPENDENT identity
+        // (stored-bytes serialization minus id/wireIndex). content_hash stays
+        // the byte-faithful CAS key; only the join moves to identity.
+        const identity = identityOfStoredContent(entry.content);
+        const key = `${m.id}\u0000${identity}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}) });
         return seq;
     };
+    // #3301: import payload first — its rows must sit below the snapshot/tail
+    // seqs so the stored log reads oldest-evidence-first.
+    if (session.decompositionLog && session.decompositionLog.length > 0) session.decompositionLog.forEach(intern);
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
     const tailSeqs = session.lastMessages ? session.lastMessages.map(intern) : null;
 
@@ -174,8 +190,33 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
  *  written by that save), and the probe pins slot L-1 to row `watermark`
  *  with nothing above it — so this save only has to append tail[L..] at
  *  watermark+1, watermark+2, … Only messages PAST the trusted prefix pay
- *  stringify+hash; every other row family is byte-identical to
- *  planIngest's, so the resulting store state equals a full ingest's.
+ *  stringify+hash; given the same log, finishPlan() emits every row family
+ *  byte-identical to planIngest's. The store-state equivalence holds under
+ *  a strict-append precondition (#4182): no message in tail[L..] may
+ *  carry an ALREADY-STORED identity (msg_id + content_hash). The planner
+ *  cannot see stored prefix identities — that is the point of skipping
+ *  them — so a resent/replayed message (#3661-class: content-derived ids
+ *  mean a resend IS the same identity) is appended as a fresh placeholder
+ *  slot, and the RAW PLAN diverges from planIngest, which dedups it onto
+ *  its existing seq via seqByIdentity. That divergence is by design,
+ *  neutralized at the store layer: UnifiedStore.ingestSession's delta
+ *  branch probes every new message's identity against the messages table
+ *  inside its transaction (the strictly-append guard behind
+ *  UNIQUE(session_id, msg_id, content_hash), SQLite + MySQL) and refuses
+ *  the whole plan on any hit; the caller then runs the exact full path,
+ *  whose dedup makes the COMMITTED store state equal to a pure full
+ *  ingest's anyway. Cost of a violation: one refused delta attempt + one
+ *  redundant full write — never wrong rows.
+ *
+ *  A second, intra-plan facet of the #4182 divergence stays open: two NEW
+ *  byte-identical messages inside the same tail share ONE content-derived
+ *  identity, so both pass the stored-identity probe above; the UNIQUE
+ *  constraint then silently skips the second insert, leaving its tailSeqs
+ *  slot pointing at nothing — the read view drops that entry for one save
+ *  cycle. The next save self-heals: the boundary probe finds no row at the
+ *  new watermark, refuses the delta, and the exact full path re-dedups.
+ *  Bounded and unusual-input-only; closing it (an intra-plan seen-set in
+ *  the store guard) changes fallback behavior and is a separate decision.
  *
  *  Returns null (→ full ingest) when: a pluginSnapshot is present (its
  *  entries may dedup against the trusted prefix and renumber the log),
@@ -184,15 +225,24 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
  *  tail slot at L-1 (edited/deleted/re-minted history). Interior edits
  *  BELOW the boundary are the watermark design's accepted trade-off — they
  *  never mis-attribute, only leave stale rows, and the sampled verify
- *  digest is the backstop. */
+ *  digest is the backstop. Exception (#3919): the HEAD slot (index 0) is
+ *  additionally probed via `head` (id-only, zero serialization cost — core
+ *  ids are content-derived, so a rewrite changes the id) so prefix rewrites
+ *  fail the delta immediately instead of riding it for ≤ VERIFY_EVERY_
+ *  INGESTS saves; deeper same-id byte drift below the boundary stays the
+ *  sampled backstop's job. */
 export function planIngestDelta(
     session: LegacySessionLike,
     watermark: number,
     trustedTailSeqs: number[],
     boundary: { msgId: string; contentHash: string },
     hasRawTail: boolean,
+    head?: { msgId: string } | null,
 ): IngestPlan | null {
     if (session.pluginSnapshot && session.pluginSnapshot.length > 0) return null;
+    // #3301: an import payload would be skipped as "trusted prefix" here — force
+    // the full path so its rows actually land.
+    if (session.decompositionLog && session.decompositionLog.length > 0) return null;
     const tail = session.lastMessages;
     const trustedLen = trustedTailSeqs.length;
     if (
@@ -221,15 +271,28 @@ export function planIngestDelta(
     // IS the message the watermark was set from.
     const probe = JSON.stringify(tail[trustedLen - 1]);
     ingestSerializations.count++;
-    if (tail[trustedLen - 1].id !== boundary.msgId || sha256Hex(probe) !== boundary.contentHash) return null;
+    // #3762: the stored boundary hash covers the MEDIA-SPLIT serialization;
+    // split the probe the same way so image messages verify identically.
+    if (tail[trustedLen - 1].id !== boundary.msgId || splitMediaContent(probe).hash !== boundary.contentHash) return null;
+    // #3919 head probe: the positional assumption covers the whole trusted
+    // prefix, but historically only its LAST slot was vouched for — a
+    // rewrite of an older message below the boundary rode the delta until
+    // the sampled verify cleared the watermark ≤ VERIFY_EVERY_INGESTS saves
+    // later (in full mode those stale bytes could even be served from the
+    // index). Id-only compare: core ids are content-derived, so a rewrite
+    // changes the id at zero serialization cost per save; mismatch fails
+    // soft to the exact full path. Deeper same-id byte drift below the
+    // boundary stays the sampled backstop's job (trade-off unchanged).
+    if (head !== undefined && head !== null && trustedLen > 1 && tail[0].id !== head.msgId) return null;
     const byRawRef = session.state.messageRefs.byRaw;
     const log: LogEntry[] = [];
     const appended: number[] = [];
     for (let i = trustedLen; i < tail.length; i++) {
         const m = tail[i];
-        const content = JSON.stringify(m);
+        const raw = JSON.stringify(m);
         ingestSerializations.count++;
-        const parsed = JSON.parse(content) as { role: string; contentType?: string };
+        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
+        const split = splitMediaContent(raw);
         // Placeholder seqs under the aligned assumption (no rows above the
         // watermark); ingestSession renumbers from max(seq)+1 inside the
         // transaction when a fold left rows above the trusted tip.
@@ -238,11 +301,13 @@ export function planIngestDelta(
         log.push({
             seq,
             msgId: m.id,
-            content,
-            hash: sha256Hex(content),
+            content: split.content,
+            hash: split.hash,
+            identity: identityOfStoredContent(split.content),
             role: parsed.role,
             kind: parsed.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
+            ...(split.media.length > 0 ? { media: split.media } : {}),
         });
     }
     // planIngest's snapshot ternary replicated on the ORIGINAL value: an
@@ -256,9 +321,11 @@ export function planIngestDelta(
     return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
 }
 
-/** Shared plan tail (everything except the messages log): byte-identical
- *  output for both planners — the watermark fast path must not change what
- *  a full ingest would write for the same session. */
+/** Shared plan tail (everything except the messages log): given the same
+ *  log + session, byte-identical output for both planners — the watermark
+ *  fast path must not change what a full ingest would write. (#4182: the
+ *  duplicate-identity case feeds this function DIFFERENT logs by design;
+ *  see planIngestDelta's strict-append precondition.) */
 function finishPlan(
     session: LegacySessionLike,
     byRawRef: Record<string, string>,
@@ -284,18 +351,37 @@ function finishPlan(
         kind: e.kind,
         content: e.content,
         contentHash: e.hash,
+        identity: e.identity,
+        ...(e.media && e.media.length > 0 ? { media: e.media } : {}),
     }));
+
+    // #4316 layer 3: the ledger positions of a block's covered messages —
+    // min/max seq over the rows its coverage resolves to. Ghost ids (no row
+    // in this plan's log) are skipped; a block whose coverage resolves to no
+    // row keeps the -1/-1 "unknown bounds" shape (pre-layer-3
+    // rows stored 0/0 placeholders; both are simply "no interval evidence"). These bounds are the durable interval form of coverage:
+    // independent of message ids, so byte churn can never invalidate them.
+    const seqById = new Map<string, number>();
+    for (const e of log) if (!seqById.has(e.msgId)) seqById.set(e.msgId, e.seq);
 
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
         const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
+        let startSeq = -1;
+        let endSeq = -1;
+        for (const id of b.effectiveMessageIds) {
+            const s = seqById.get(id);
+            if (s === undefined) continue;
+            if (startSeq === -1 || s < startSeq) startSeq = s;
+            if (s > endSeq) endSeq = s;
+        }
         return {
             blockId: b.blockId,
             ord,
-            startSeq: 0,
-            endSeq: 0,
+            startSeq,
+            endSeq,
             startRef: b.startRef !== undefined ? refToIndex(b.startRef) : null,
             endRef: b.endRef !== undefined ? refToIndex(b.endRef) : null,
             tier: b.tier,
@@ -308,6 +394,19 @@ function finishPlan(
             payloadJson: JSON.stringify(b),
         };
     });
+
+    // #4216/#4242: the orphan journal — blockContents entries whose block is
+    // gone from state.blocks (#2695 reap keeps the contents for decompress).
+    // Rides every plan; the store merges it into sessions.orphans_json in the
+    // same transaction as the rest of the session. This is what makes the
+    // reap shape REPRESENTABLE, so record() no longer skips the ingest (the
+    // freeze in #4216: sessions stuck at hours-old rows).
+    const knownBlockIds = new Set(session.state.blocks.map((b) => b.blockId));
+    const orphanEntries: Record<string, { one: unknown; full: unknown }> = {};
+    for (const [blockId, view] of session.blockContents) {
+        if (!knownBlockIds.has(blockId)) orphanEntries[blockId] = { one: view.one, full: view.full };
+    }
+    const orphansJson = Object.keys(orphanEntries).length > 0 ? JSON.stringify(orphanEntries) : null;
 
     const deadRefs = (session.state.deadRefs ?? []).map((ref, ord) => ({
         ord,
@@ -333,7 +432,12 @@ function finishPlan(
 
     const sessionRow: SessionRow = {
         sessionId: session.id,
-        parentSessionId: null,
+        // #4390: fork lineage into the unified row — the envelope's
+        // metadata.derivedFromSessionId (written by handle.ts at fork time)
+        // used to be the ONLY carrier; envelope loss orphaned the family.
+        parentSessionId: typeof session.metadata.derivedFromSessionId === "string" && session.metadata.derivedFromSessionId.length > 0
+            ? session.metadata.derivedFromSessionId
+            : null,
         forkPointSeq: null,
         protocol: typeof session.meta.protocol === "string" ? session.meta.protocol : null,
         label: typeof session.meta.label === "string" ? session.meta.label : null,
@@ -349,6 +453,7 @@ function finishPlan(
         status: "active",
         createdAt: session.createdAt,
         updatedAt: session.lastSeen,
+        orphansJson,
         nextBlockId: session.state.nextBlockId,
         nextRunId: session.state.nextRunId,
         metaJson: JSON.stringify(session.meta),
@@ -396,6 +501,7 @@ export function loadLegacyView(
             kstateJson: string;
             tailJson: string;
             ccrJson: string | null;
+            orphansJson?: string | null;
         };
         messages: { seq: number; msgId: string; ref: string | null; content: string }[];
         blocks: { blockId: string; summary: string; one: string | null; payloadJson: string }[];
@@ -415,6 +521,8 @@ export function loadLegacyView(
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
     contentStore?: LegacySessionLike["contentStore"];
+    /** #4390: tail/pluginSnapshot pointers whose backing row is missing. */
+    tailGaps?: number;
 } {
     const s = rows.session;
     const kstate = JSON.parse(s.kstateJson) as Record<string, unknown>;
@@ -469,21 +577,42 @@ export function loadLegacyView(
             full: JSON.parse(b.summary) as BlockView,
         });
     }
+    // #3841 reap journal: journal'd orphan contents (reaped blocks) ride
+    // blockContents so the derived-decompress fallback survives restarts —
+    // WITHOUT resurrecting state.blocks (the reaped entries stay reaped).
+    if (s.orphansJson !== null && s.orphansJson !== undefined && s.orphansJson !== "") {
+        try {
+            const orphans = JSON.parse(s.orphansJson) as Record<string, { one: BlockView | null; full: BlockView }>;
+            for (const [blockId, view] of Object.entries(orphans)) {
+                if (!blockContents.has(blockId)) blockContents.set(blockId, view);
+            }
+        } catch {
+            // corrupt journal → skip; the JSON envelope still carries the text
+        }
+    }
 
     const messagesBySeq = new Map(rows.messages.map((m) => [m.seq, JSON.parse(m.content) as CoreMessage]));
-    const lastMessages = tail.tailSeqs
-        ? tail.tailSeqs.map((seq) => messagesBySeq.get(seq)).filter((m): m is CoreMessage => m !== undefined)
-        : undefined;
-    const pluginSnapshot = tail.pluginSnapshotSeqs
-        ? tail.pluginSnapshotSeqs
-              .map((seq) => messagesBySeq.get(seq))
-              .filter((m): m is CoreMessage => m !== undefined)
-        : undefined;
+    // #4390: a tail pointer whose row is gone used to be silently filtered
+    // out — the view shrank with no trace. Count the gaps so callers can
+    // warn (persist logs them); the surviving members still load.
+    let tailGaps = 0;
+    const resolveSeqs = (seqs: number[]): CoreMessage[] => {
+        const out: CoreMessage[] = [];
+        for (const seq of seqs) {
+            const m = messagesBySeq.get(seq);
+            if (m === undefined) tailGaps++;
+            else out.push(m);
+        }
+        return out;
+    };
+    const lastMessages = tail.tailSeqs ? resolveSeqs(tail.tailSeqs) : undefined;
+    const pluginSnapshot = tail.pluginSnapshotSeqs ? resolveSeqs(tail.pluginSnapshotSeqs) : undefined;
 
     const out: ReturnType<typeof loadLegacyView> = {
         id: s.sessionId,
         createdAt: s.createdAt,
         lastSeen: s.updatedAt,
+        tailGaps,
         meta: JSON.parse(s.metaJson),
         stats: JSON.parse(s.statsJson),
         metadata: JSON.parse(s.metadataJson),

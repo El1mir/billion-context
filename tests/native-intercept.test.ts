@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -19,6 +23,23 @@ test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
     assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"), true);
     assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-2.5-flash:countTokens"), true);
     assert.equal(isModelApiUrl("https://gw.example.com/api/v1beta/models/my-model@v2:generateContent"), true);
+});
+
+test("isModelApiUrl: matches Google Cloud Code v1internal wire shapes (#4256)", () => {
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"), true);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1internal:generateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1internal:countTokens"), true);
+});
+
+test("isModelApiUrl: rejects v1internal control-plane endpoints (#3129)", () => {
+    // Only the three model methods route; Antigravity's non-model control-plane
+    // POSTs keep going direct (mirrors isV1InternalControlPlanePath's lookahead).
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal"), false);
 });
 
 test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
@@ -45,23 +66,6 @@ function fakeFetch(sink: string[]) {
     }) as typeof fetch;
 }
 
-interface RecordedCall {
-    url: string;
-    headers: Record<string, string>;
-    at: number;
-}
-
-function fakeFetchRecordingHeaders(sink: RecordedCall[]) {
-    return (async (input: string | URL | Request, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
-        const src = init?.headers !== undefined ? init.headers : input instanceof Request ? input.headers : undefined;
-        const headers: Record<string, string> = {};
-        if (src !== undefined) for (const [k, v] of new Headers(src).entries()) headers[k] = v;
-        sink.push({ url, headers, at: Date.now() });
-        return new Response("{}", { status: 200 });
-    }) as typeof fetch;
-}
-
 async function withPatchRecording<T>(
     state: NativeInterceptState,
     fn: (fetch: typeof globalThis.fetch) => Promise<T>,
@@ -69,7 +73,7 @@ async function withPatchRecording<T>(
     const saved = globalThis.fetch;
     _resetForTest();
     const sink: RecordedCall[] = [];
-    globalThis.fetch = fakeFetchRecordingHeaders(sink);
+    globalThis.fetch = makeRecordingFetch(sink);
     try {
         assert.equal(installNativeFetchIntercept(state), true);
         const result = await fn(globalThis.fetch);
@@ -408,6 +412,44 @@ test("install: TypeError triggers one respawn + retry", async () => {
     }
 });
 
+test("install: onResponse carries THIS dispatch's outgoing headers, per request (#3329)", async () => {
+    const seen: Array<{ url: string; headers?: Record<string, string> }> = [];
+    let n = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        beforeSend: async (_url, init) => {
+            // Stamp a per-request correlation id, exactly like the
+            // incremental adapters do.
+            n += 1;
+            if (init !== undefined) {
+                const h = new Headers(init.headers);
+                h.set("x-bili-turn-id", `t-${n}`);
+                init.headers = h;
+            }
+        },
+        onResponse: (url, _resp, headers) => { seen.push({ url, headers }); },
+    };
+    await withPatchRecording(state, async (fetch) => {
+        // Two dispatches on the SAME provider URL (string + init shape — the
+        // dsh/omp lanes): each must get back its OWN stamped headers.
+        await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+        await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-extra": "second" }, body: "{}" });
+        // Request-object shape (the opencode lane): the host stamps the
+        // correlation id onto the Request itself before fetch.
+        const req = new Request("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "x-req": "r", "x-bili-turn-id": "t-pre" }, body: "{}" });
+        await fetch(req);
+    });
+    assert.equal(seen.length, 3, "onResponse fired once per dispatch");
+    for (const s of seen) assert.equal(s.url, "http://127.0.0.1:8199/v1/messages", "host-requested url stays the key context");
+    assert.equal(seen[0].headers?.["x-bili-turn-id"], "t-1");
+    assert.equal(seen[0].headers?.["content-type"], "application/json", "original outgoing headers ride along");
+    assert.equal(seen[1].headers?.["x-bili-turn-id"], "t-2", "the second same-URL response carries the second dispatch's id, not the first's");
+    assert.equal(seen[1].headers?.["x-extra"], "second");
+    assert.equal(seen[2].headers?.["x-bili-turn-id"], "t-pre", "Request-object inputs carry their own pre-stamped id through the rewrite");
+    assert.equal(seen[2].headers?.["x-req"], "r");
+});
+
 test("install: second install is a no-op while active", async () => {
     const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
     const saved = globalThis.fetch;
@@ -420,6 +462,80 @@ test("install: second install is a no-op while active", async () => {
         globalThis.fetch = saved;
         _resetForTest();
     }
+});
+
+test("install: a hot-reimport rebinds routing to the new instance's state (#3394)", async () => {
+    // Two distinct module instances: A booted first, B is the FRESH state a
+    // host hot-reimport (DSH profile recomposition) re-applies in the SAME
+    // process with no reset in between.
+    const calls = await runHotReplace(async (api) => {
+        const a = api.world("http://127.0.0.1:40901", () => ({ "x-bili-test": "A" }));
+        assert.equal(a.install(), true);
+        // The hot-reimport path: install again with B's state. One chain per
+        // process (returns false) but the live slot must rebind to B.
+        const b = api.world("http://127.0.0.1:40902", () => ({ "x-bili-test": "B" }));
+        assert.equal(b.install(), false);
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    // Routing must follow B — the newest applied instance: B's origin rewrite
+    // AND B's header stamp. Pre-#3394 the chain closed over A → 40901 + "A".
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:40902/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(calls[0].headers["x-bili-test"], "B");
+});
+
+test("install: a same-instance re-activation outranks an older activation's late dispose (#3394)", async () => {
+    // Deactivate/reactivate (#2082/#2101) re-applies the SAME module-level
+    // state object under a fresh context. If activation 1's effect cleanup
+    // fires LATE — after activation 2's apply() already rebound the slot —
+    // object identity cannot tell the activations apart; only the install
+    // generation can. A wrong clear here silently drops routing to direct
+    // until restart: the exact bug class #3394 fixes.
+    const calls = await runHotReplace(async (api) => {
+        const w = api.world("http://127.0.0.1:40903", () => ({ "x-bili-test": "same" }));
+        assert.equal(w.install(), true);
+        // Activation 1's effect runs post-commit: capture its disposer.
+        const disposeActivation1 = w.captureDispose();
+        // Re-activation: same state object, fresh context, no reset in between.
+        assert.equal(w.install(), false);
+        disposeActivation1();
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    // The late dispose must be a no-op: routing still rides the rebound slot.
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:40903/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(calls[0].headers["x-bili-test"], "same");
+});
+
+test("install: the latest activation's own teardown clears the slot to clean direct (#3394)", async () => {
+    const calls = await runHotReplace(async (api) => {
+        const w = api.world("http://127.0.0.1:40904");
+        assert.equal(w.install(), true);
+        w.captureDispose()();
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:8199/v1/messages", "empty slot passes through direct, unrewritten");
+});
+
+test("install: successive hot-reimports keep routing on the newest world, stale disposers stay no-ops (#3617-E①)", async () => {
+    // The shared driver's generalization case beyond the original #3394 trio:
+    // three applied instances (A superseded by B superseded by C) plus A's
+    // LATE dispose landing after C took over — routing must ride C end to end.
+    const calls = await runHotReplace(async (api) => {
+        const a = api.world("http://127.0.0.1:40911", () => ({ "x-bili-test": "A" }));
+        assert.equal(a.install(), true);
+        const disposeA = a.captureDispose();
+        const b = api.world("http://127.0.0.1:40912", () => ({ "x-bili-test": "B" }));
+        assert.equal(b.install(), false);
+        const c = api.world("http://127.0.0.1:40913", () => ({ "x-bili-test": "C" }));
+        assert.equal(c.install(), false);
+        disposeA();
+        await api.request("http://127.0.0.1:8199/v1/messages");
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:40913/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(calls[0].headers["x-bili-test"], "C");
 });
 
 test("install: Request-object input is re-dispatched with the rewritten URL", async () => {
@@ -1042,6 +1158,42 @@ test("#1365 noteRoutedOrigin: records origin, sticky per origin, hook fires on t
     noteRoutedOrigin(state, "not a url");
     assert.equal(state.routedOrigin, "http://127.0.0.1:9999", "malformed input ignored");
     assert.equal(seen.length, 2);
+});
+
+// #3923: spawn-mode lanes (no owner hook) used to absorb routed-channel
+// evidence SILENTLY — a `/bili/` URL baked against a foreign origin kept
+// passing through to its baked instance while raw URLs followed state.origin,
+// splitting one conversation across two live instances with zero signal until
+// someone manually diffed [v=…] tags in the shared log. Now: one error line
+// per foreign origin into bili.log. Warn-only — spawn mode has no recovery
+// policy, so it never rebinds; attach lanes are untouched (their owner hook
+// handles rebinds and the fallback only fires when no hook is armed).
+
+test("#3923 noteRoutedOrigin spawn-mode fallback: foreign origin warns once per origin, never rebinds", () => {
+    const saved = process.env.XDG_STATE_HOME;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3923-routed-"));
+    process.env.XDG_STATE_HOME = root;
+    // XDG_STATE_HOME override replaces the base dir entirely — no .local/state
+    const logFile = path.join(root, "billion-context", "bili.log");
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:18802", ready: Promise.resolve("http://127.0.0.1:18802") };
+        noteRoutedOrigin(state, "http://127.0.0.1:18991/bili/https://api.anthropic.com/v1/messages");
+        noteRoutedOrigin(state, "http://127.0.0.1:18991/bili/http://127.0.0.1:8199/v1/chat/completions");
+        assert.equal(state.routedOrigin, "http://127.0.0.1:18991");
+        assert.equal(state.origin, "http://127.0.0.1:18802", "warn-only: spawn mode never rebinds");
+        let lines = fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("(#3923)"));
+        assert.equal(lines.length, 1, "one line per foreign origin, not per request");
+        assert.match(lines[0], /\[error\]/);
+        assert.ok(lines[0].includes("http://127.0.0.1:18991") && lines[0].includes("http://127.0.0.1:18802"), "names both sides");
+
+        const slashState: NativeInterceptState = { origin: "http://127.0.0.1:18993/", ready: Promise.resolve("http://127.0.0.1:18993/") };
+        noteRoutedOrigin(slashState, "http://127.0.0.1:18993/bili/http://127.0.0.1:8199/v1/messages");
+        lines = fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("(#3923)"));
+        assert.equal(lines.length, 1, "same origin modulo trailing slash is not a mismatch");
+    } finally {
+        if (saved === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = saved;
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 });
 
 test("#1365 pre-gate proof: first routed request records evidence while toolsReady is still pending", async () => {

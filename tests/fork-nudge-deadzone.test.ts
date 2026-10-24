@@ -216,7 +216,10 @@ test("the child's first wire turn sizes on the seeded baseline, not 0 (lane proo
         const deadline = Date.now() + 5_000;
         let nudgeLine: string | undefined;
         for (;;) {
-            nudgeLine = readLog().split("\n").filter((l) => l.includes(child.id)).find((l) => l.includes("nudge"));
+            // #4205: the [headroom] line also says "nudge" (it names the
+            // judge layer) and precedes the decision line on reserving routes —
+            // exclude it or the filter grabs the wrong line.
+            nudgeLine = readLog().split("\n").filter((l) => l.includes(child.id)).find((l) => l.includes("nudge") && !l.includes("[headroom]"));
             if (nudgeLine || Date.now() >= deadline) break;
             await new Promise((resolve) => setTimeout(resolve, 50));
         }

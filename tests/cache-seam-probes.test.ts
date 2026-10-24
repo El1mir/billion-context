@@ -7,6 +7,11 @@
 //   P1 tools array  — the tools list is hashed into the provider prefix; any
 //                     per-request tool-list mutation breaks the cache at
 //                     element 0. (Also pinned matrix-wide via normOf.)
+//   P2 absorb view  — with absorb.contextThresholdPct > 0 the absorb-prompt
+//                     gate is token-count-fed; round-2 must use the SAME
+//                     source as the steady paths or prompts flicker
+//                     mid-history across every fold while the session
+//                     straddles the threshold (#1592 family).
 //   P3 CCR armed    — with compress.ccr.enabled the oversized tool result
 //                     rides the wire as a placeholder; the placeholder element
 //                     must stay byte-identical across folds (round-2 and the
@@ -29,6 +34,7 @@ type Item = Record<string, unknown>;
 type Msg = Record<string, unknown>;
 
 const THRESHOLD = 60 * 1024;
+const ABSORB_PROMPT_FRAGMENT = "[ACP absorb]";
 const CCR_PLACEHOLDER_FRAGMENT = "[acp-stored";
 
 const FILLER = (seed: number, kb: number): string => {
@@ -108,6 +114,7 @@ function startUpstream(captured: string[], plan: Array<number | undefined>): htt
 }
 
 interface RigOpts {
+    absorbThresholdPct?: number;
     ccr?: boolean;
     turns?: number;
     bigToolFrom?: number;
@@ -136,6 +143,7 @@ async function driveChat(sessionId: string, opts: RigOpts): Promise<string[]> {
             compress: {
                 injectTool: true,
                 injectNudge: true,
+                absorb: { enabled: true, contextThresholdPct: opts.absorbThresholdPct ?? 0 },
                 ...(opts.ccr === true ? { ccr: { enabled: true, minToolTokens: 50 } } : {}),
             },
             promptCache: { routing: "auto" },
@@ -228,12 +236,12 @@ function assertPairSeamStable(prev: string, cur: string, label: string): void {
     const emergencyTrunc = JSON.stringify(mb[k] ?? "").includes("[truncated for context space]");
     assert.ok(
         k >= solidA || summaryNew || emergencyTrunc,
-        `${label}: mid-history divergence at message[${k}] of ${ma.length} (round2=${isRound2(b)}) — CCR view flipped between adjacent requests`,
+        `${label}: mid-history divergence at message[${k}] of ${ma.length} (round2=${isRound2(b)}) — absorb/CCR view flipped between adjacent requests`,
     );
 }
 
-test("probe P1: tools array byte-stable across folds (estimate-grade session)", { timeout: 180_000 }, async () => {
-    const bodies = await driveChat("seam-p2", {});
+test("probe P1+P2: tools stable and absorb prompts do not flicker across folds (estimate-grade session, threshold 5%)", { timeout: 180_000 }, async () => {
+    const bodies = await driveChat("seam-p2", { absorbThresholdPct: 0.05 });
     assert.ok(bodies.length >= 10, `expected >= 10 requests, got ${bodies.length}`);
     let folds = 0;
     for (let i = 1; i < bodies.length; i++) {

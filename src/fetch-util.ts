@@ -1,6 +1,7 @@
 import { Agent } from "undici";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail.js";
+import { _resetUpstreamCaForTest, upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
 import {
     upstreamTimeoutMs as knobUpstreamTimeoutMs,
     replayMaxAttempts as knobReplayMaxAttempts,
@@ -76,13 +77,17 @@ export function upstreamTimeoutMs(): number {
 // killed long prefills before this watchdog ever got a chance (#551). Inject an
 // explicit Agent per timeout value so the transport layer matches the watchdog
 // instead of firing first.
-const directDispatchers = new Map<number, Agent>();
+const directDispatchers = new Map<string, Agent>();
 
 function directDispatcher(timeoutMs: number): Agent {
-    let agent = directDispatchers.get(timeoutMs);
+    // #3776: key on the CA identity too so a configured/rotated network.caFile
+    // rotates the cached Agent (and its connect.ca) instead of reusing a stale trust set.
+    const key = `${timeoutMs}\u0000${upstreamCaIdentity()}`;
+    let agent = directDispatchers.get(key);
     if (!agent) {
-        agent = new Agent({ headersTimeout: timeoutMs, bodyTimeout: timeoutMs });
-        directDispatchers.set(timeoutMs, agent);
+        const ca = upstreamExtraCa();
+        agent = new Agent({ headersTimeout: timeoutMs, bodyTimeout: timeoutMs, ...(ca ? { connect: { ca } } : {}) });
+        directDispatchers.set(key, agent);
     }
     return agent;
 }
@@ -92,6 +97,7 @@ export function _resetFetchUtilForTest(): void {
         try { void agent.close().catch(() => undefined); } catch { /* already closed */ }
     }
     directDispatchers.clear();
+    _resetUpstreamCaForTest();
 }
 
 /** undici's fetch accepts a `dispatcher` option (its own Dispatcher type) that
@@ -165,6 +171,10 @@ export async function fetchWithTimeout(
     opts: FetchOptions,
     timeoutMs?: number,
     externalSignal?: AbortSignal,
+    // #3342: true = skip the ALS transport lookup. A plain-HTTP egress issued
+    // from INSIDE an active transport (Responses-WS falling back after a refused
+    // upgrade) must not recurse back into the intercepted WebSocket transport.
+    forceDirect?: boolean,
 ): Promise<{ response: Response; clearTimer: () => void; stopIdleTimer: () => void }> {
     checkOutboundBody(opts.body);
     const effective = timeoutMs ?? upstreamTimeoutMs();
@@ -235,7 +245,7 @@ export async function fetchWithTimeout(
         // which structurally conflicts with the `undici` package's exported
         // Dispatcher — but at runtime they're the same thing. Assert to the
         // concrete RequestInit type (no `as any`) to satisfy the call site.
-        const transport = currentFetchTransport();
+        const transport = forceDirect ? undefined : currentFetchTransport();
         const raw = transport
             ? await transport(url, finalOpts)
             : await fetch(url, finalOpts as RequestInit) as Response;

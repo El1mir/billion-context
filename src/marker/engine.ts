@@ -52,7 +52,7 @@ function stripTextSlot(text: string, counts: RawStripCounts, opts?: { noStatusBo
     if (!opts?.noStatusBody) {
         const body: StatusBodyResult = consumeAcpStatusBody(t);
         if (body.bodies > 0) {
-            t = body.text;
+            t = body.text.trim().length > 0 ? body.text : " ";
             counts.statusBodies += body.bodies;
             counts.statusBodyLines += body.lines;
         }

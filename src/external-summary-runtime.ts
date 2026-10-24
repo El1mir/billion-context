@@ -43,7 +43,12 @@ export class ConfiguredSummaryPlan {
                 const headers: Record<string, string> = target.protocol === "anthropic" ? { "x-api-key": key }
                     : target.protocol === "google" ? { "x-goog-api-key": key }
                     : { authorization: `Bearer ${key}` };
-                return createSummaryHttpCandidate({ ...target, headers, proxyUrl, ...(this.sessionId !== undefined ? { sessionId: this.sessionId } : {}) }, this.settings.budget.maxSummaryBytes * 4 + 65536);
+                // SSE repeats framing/model metadata for every token; those bytes
+                // are not summary content. Keep a bounded transport allowance while
+                // the executor independently enforces maxSummaryBytes on the text.
+                const jsonResponseBytes = this.settings.budget.maxSummaryBytes * 4 + 65536;
+                const responseBytes = target.stream ? Math.max(8 * 1024 * 1024, jsonResponseBytes) : jsonResponseBytes;
+                return createSummaryHttpCandidate({ ...target, headers, proxyUrl, ...(this.sessionId !== undefined ? { sessionId: this.sessionId } : {}) }, responseBytes);
             } catch (error) {
                 // Log WHY this target is unusable (once per signature) so a
                 // misconfigured chain is diagnosable instead of silently degrading

@@ -5,6 +5,8 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
+import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,12 +16,16 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, markIncrementalDead, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
+import { laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import { validateMsgIds } from "../msgid-pin.js";
+import type { DirectSendPrep } from "./native-intercept.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 import { plainHttpTrusted } from "../private-host.js";
-import { allowPrivateHttpProviders } from "../knobs.js";
+import { allowPrivateHttpProviders, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
+import { hostProfileFor } from "../host-profiles.js";
 
 export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
@@ -74,6 +80,7 @@ type ExtensionAPI = {
     on: (event: string, handler: (event: never, ctx: Ctx) => unknown) => void;
     registerTool: (tool: ToolDefinition) => void;
     registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
+    registerMessageRenderer?: (customType: string, renderer: MessageRenderer) => void;
     // #2186: acp_delegate (inlined from billion-context-pi-subagents) injects
     // completion notifications through the host's persistent transcript
     // channel; optional because older hosts and non-pi hosts lack it.
@@ -97,6 +104,12 @@ type ExtensionAPI = {
     // #2322: current session name (pi /name); optional because older hosts
     // lack it (the session_info_changed event is the primary channel).
     getSessionName?: () => string | undefined;
+    // #3542: the ACTIVE tool loadout — the set pi declares to the model and
+    // its dispatcher checks, distinct from the registry (getAllTools). pi's
+    // /tree rewind resets it from the transcript, so a registered tool can be
+    // missing from it; optional because older hosts lack it.
+    getActiveTools?: () => string[];
+    setActiveTools?: (toolNames: string[]) => void;
 };
 
 function agentName(override: string | undefined): string {
@@ -383,6 +396,34 @@ export function replayedMessageCount(ctx: Ctx): number | undefined {
     }
 }
 
+/** #4491 omp msgids wiring: (id, role) of the branch's message entries in
+ *  session order — the hint the fetch-layer incremental planner
+ *  (omp-native) aligns against the ACTUALLY-sent wire messages and carries
+ *  as `msgIds` when they match 1:1. Non-message entries (model_change,
+ *  native-compaction summaries) are skipped — they have no message id, so a
+ *  summary that DID become a wire message leaves the counts short and the
+ *  alignment refuses the whole field (all-or-nothing). An entry without a
+ *  stable id yields an empty one, which the consumer's screen rejects the
+ *  same way. Total: a missing/throwing getBranch yields [] — this request
+ *  cannot vouch ids, and [] forces the degrade instead of leaving a stale
+ *  earlier hint in place. */
+export function ompBranchMsgIdEntries(ctx: Ctx): HostMsgIdHintEntry[] {
+    const out: HostMsgIdHintEntry[] = [];
+    try {
+        const branch = ctx.sessionManager?.getBranch?.();
+        if (!Array.isArray(branch)) return out;
+        for (const entry of branch) {
+            if (entry === null || typeof entry !== "object" || (entry as { type?: unknown }).type !== "message") continue;
+            const id = (entry as { id?: unknown }).id;
+            const role = (entry as { message?: { role?: unknown } | null }).message?.role;
+            out.push({ id: typeof id === "string" ? id : "", role: typeof role === "string" ? role : "" });
+        }
+    } catch {
+        return [];
+    }
+    return out;
+}
+
 // #2583: OMP's Cowork transport (can1357/oh-my-pi 642892ae, proxy handling
 // e22a5ff2) picks egress PER MODEL: default anthropic/anthropic-messages
 // requests go out over node:https DIRECTLY — stable header order, HTTP/1.1,
@@ -407,7 +448,14 @@ export function ompCoworkTransportBypassesFetch(
     // getProxyForProvider("anthropic"): PI_PROXY_ANTHROPIC (raw truthy) || PI_PROXY (trimmed).
     const hasProviderProxy = (env.PI_PROXY_ANTHROPIC ?? "").length > 0;
     const hasGlobalProxy = (env.PI_PROXY ?? "").trim().length > 0;
-    return !hasProviderProxy && !hasGlobalProxy;
+    if (hasProviderProxy || hasGlobalProxy) return false;
+    // HTTPS_PROXY is deliberately NOT routing evidence here: the Cowork
+    // transport's node:https stack ignores env proxies entirely (proven
+    // live 2026-10-17, Anthropic req_011Cg7cujfgv4xLjuRvLMqvg — a loopback
+    // HTTPS_PROXY was set and the stamped body still reached the upstream
+    // direct, 400). Only PI_PROXY / PI_PROXY_ANTHROPIC push Cowork onto
+    // Bun's fetch, where the patch can see and the proxy can consume it.
+    return true;
 }
 
 // Once per process per model — the bypass is a property of the installed host
@@ -445,7 +493,25 @@ function noteOmpCoworkBypass(modelId: string): void {
 // proxy's anonymous prefix-affinity sessions (#309): compression still works,
 // /acp lookup by session id does not — acceptable vs a guaranteed 400.
 export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Record<string, unknown> | undefined {
-    if (agent !== "omp") return undefined;
+    // #3482 site 3: the identity-stamp CHANNEL is a registry property — omp
+    // stamps the body pck, pi stamps x-bili-plugin-conversation in
+    // before_provider_headers (which outranks the body field). No adapter-side
+    // name gate.
+    const profile = hostProfileFor(agent);
+    if (!profile.stampsBodyPromptCacheKey) return undefined;
+    // #2583 (hoisted): the Cowork withhold must gate EVERY stamp path, not
+    // just the unrouted fallback below. On the launcher cert-MITM lane
+    // (HTTPS_PROXY + BILI_MITM_HOSTS) destinationRoutedThroughProxy() is
+    // true, which skipped this check entirely — yet Cowork traffic never
+    // rides globalThis.fetch on that lane either, so the stamp could fire
+    // on a transport the fetch intercept cannot consume and ride verbatim
+    // into Anthropic's strict schema (#1403's 400 on every delegation).
+    // #3482 site 2: whether that transport is even POSSIBLE is a registry
+    // property; the env observation below is the per-request truth.
+    if (profile.coworkTransportPossible && ompCoworkTransportBypassesFetch(ctx.model, process.env)) {
+        noteOmpCoworkBypass(ctx.model?.id ?? (ctx.model?.baseUrl ?? ""));
+        return undefined;
+    }
     if (!destinationRoutedThroughProxy(ctx.model?.baseUrl)) {
         // #1579: native omp mode routes at the FETCH layer — the model
         // baseUrl stays the real upstream, so the launcher-shaped checks
@@ -474,19 +540,6 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
         const base = ctx.model?.baseUrl ?? "";
         const expanded = /\/v\d+\/?$/.test(base) ? `${base.replace(/\/+$/, "")}/chat/completions` : base;
         if (!isModelApiUrl(base) && !isModelApiUrl(expanded)) return undefined;
-        // #2583: the gates above prove the interceptor WOULD rewrite this URL
-        // at the fetch layer — but OMP's Cowork transport never puts default
-        // anthropic/anthropic-messages traffic ON globalThis.fetch in the
-        // first place (node:https direct unless a proxy env is set), so the
-        // rewrite can never fire and the stamped pck would ride verbatim into
-        // Anthropic's strict schema (400 on every delegation). Withhold the
-        // stamp where the transport is proven direct: those requests go
-        // direct anyway (uncompressed, anonymous to the proxy) — soft
-        // identity loss instead of a guaranteed hard failure (#1403).
-        if (ompCoworkTransportBypassesFetch(ctx.model, process.env)) {
-            noteOmpCoworkBypass(ctx.model?.id ?? base);
-            return undefined;
-        }
     }
     const payload = (event as { payload?: unknown } | undefined)?.payload;
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
@@ -546,7 +599,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
         description: tool.description,
         parameters: tool.inputSchema,
         loadMode: "essential",
-        execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+        execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
                 // #2416: read the LIVE base — a native respawn after a proxy
@@ -566,7 +619,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
                 // rebinding (onRoutedOriginObserved) converges env back to the
                 // observed routed origin.
                 const base = proxyBaseForCtx(ctx) ?? proxyBase;
-                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown");
+                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown", toolCallId);
                 // #2204: a business failure (e.g. a refused export) must reach
                 // the host as isError — rendering it as plain success text is
                 // what hid the #2204 write failures from OMP.
@@ -643,6 +696,42 @@ function reassertDroppedTools(pi: ExtensionAPI, state: RegisterState, agent: str
     if (missing.length === 0) return;
     logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the host registry (${missing.join(", ")}) — re-registering (#2708)`);
     for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
+}
+
+// #3542: a pi /tree rewind (navigateTree) resets the ACTIVE tool loadout to what
+// the surviving transcript system entries declare (_restoreToolsFromTranscript),
+// discarding the entry that declared our tools whenever it sits after the rewind
+// target — the normal case, since the manifest handshake is async and lands after
+// the first turn's declaration. The definitions stay in the registry, so #2708's
+// probe sees nothing missing, but pi dispatches on the loadout: every later call
+// fails with "Tool X not found" until restart. session_tree fires right after the
+// reset and before the next _startRun, so re-assert there. Additive-only (names
+// the host currently holds are never removed), mirroring pi's own reload()
+// precedent of re-activating all extension tools. No loadout query/setter (older
+// pi / omp) or a throwing query → no-op, never a blind set.
+function reassertLoadoutAfterTree(pi: ExtensionAPI, state: RegisterState, agent: string): void {
+    const tools = state.registeredTools;
+    if (tools === undefined || tools.length === 0) return;
+    const getActive = pi.getActiveTools;
+    const setActive = pi.setActiveTools;
+    if (typeof getActive !== "function" || typeof setActive !== "function") return;
+    let active: string[];
+    try {
+        const names = getActive.call(pi);
+        if (!Array.isArray(names)) return;
+        active = names.filter((n): n is string => typeof n === "string");
+    } catch {
+        return; // stale ctx — same guard as reassertDroppedTools
+    }
+    const present = new Set(active);
+    const missing = tools.map((t) => t.name).filter((name) => !present.has(name));
+    if (missing.length === 0) return;
+    try {
+        setActive.call(pi, [...active, ...missing]);
+    } catch {
+        return; // setter rejected — never break the navigation
+    }
+    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the active loadout by a tree navigation (${missing.join(", ")}) — re-asserting (#3542)`);
 }
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string, awaitNativeOrigin = true): Promise<void> {
@@ -738,12 +827,83 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     }
 }
 
+// #3304: pi's payload swap happens INSIDE the runner (before_provider_request
+// returns the replacement), so the fetch layer cannot correlate a request by
+// object identity. Instead it sniffs the outgoing body for the incremental
+// envelope — the same shape test the lane's divert runs server-side — and
+// restores the original stashed under the envelope's conversationId. Pi sends
+// model requests strictly sequentially per session (the same invariant
+// pendingIncrementalAcks relies on), so one entry per conversation is exact.
+const PI_ORIGINAL_TTL_MS = 5 * 60_000;
+const piIncrementalOriginals = new Map<string, { body: string; at: number }>();
+
+function stashPiIncrementalOriginal(conversationId: string, payload: unknown): void {
+    const now = Date.now();
+    sweepStale(piIncrementalOriginals, PI_ORIGINAL_TTL_MS);
+    piIncrementalOriginals.set(conversationId, { body: JSON.stringify(payload), at: now });
+}
+
+function takePiIncrementalOriginal(conversationId: string): string | null {
+    const entry = piIncrementalOriginals.get(conversationId);
+    if (entry === undefined || Date.now() - entry.at >= PI_ORIGINAL_TTL_MS) return null;
+    return entry.body;
+}
+
+export function __resetPiIncrementalOriginalsForTests(): void {
+    piIncrementalOriginals.clear();
+}
+
+/** Test-only: seed the stash directly (driving the full extension event
+ *  chain just for this is not worth it). */
+export function __stashPiIncrementalOriginalForTests(conversationId: string, payload: unknown): void {
+    stashPiIncrementalOriginal(conversationId, payload);
+}
+
+/** #3304: prepareDirectSend for the pi/omp extension lanes (pi-native arms
+ *  it on its NativeInterceptState). A body that IS an incremental envelope
+ *  was swapped by maybeIncrementalTurn → restore the stashed original
+ *  (or refuse when the stash aged out); any other body is a standalone
+ *  full-resend request → as-is. */
+export function createPiDirectSendGuard(): (url: string, input: string | URL | Request, init: RequestInit | undefined) => Promise<DirectSendPrep> {
+    return async (_url, input, init) => {
+        let text: string | undefined;
+        try {
+            if (typeof init?.body === "string") {
+                text = init.body;
+            } else if (input instanceof Request) {
+                text = await input.clone().text();
+            }
+        } catch {
+            text = undefined; // unreadable body — treat as standalone
+        }
+        if (text === undefined || text.length === 0) return { outcome: "as-is" };
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(text);
+        } catch {
+            return { outcome: "as-is" };
+        }
+        const sid = incrementalEnvelopeConversationId(parsed);
+        if (sid === undefined) return { outcome: "as-is" };
+        const body = takePiIncrementalOriginal(sid);
+        return body === null ? { outcome: "unrestorable" } : { outcome: "restored", body };
+    };
+}
+
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
-        // #3066: tool-output guardrails (output cap / bash timeout / repetition loop-break); host-independent, wired for pi + omp.
-        wireToolGuardrails(pi);
+        // #3066/#3516: tool-output guardrails (output cap / bash timeout /
+        // repetition loop-break); knobs resolve env > file > default so the
+        // documented BILI_GUARDRAIL_* / guardrails.* switches work end-to-end.
+        // maxBytes maps knob-undefined(disabled) → 0(no cap): wireToolGuardrails
+        // treats undefined as its 50KB default, not as "off".
+        wireToolGuardrails(pi, {
+            bashTimeout: guardrailBashTimeout(),
+            maxBytes: guardrailMaxOutputBytes() ?? 0,
+            repetition: guardrailRepetition(),
+        });
         // #2336: one successful agent-providers report per plugin instance;
         // retried on later session_starts while the proxy base is unknown
         // (native mode resolves it asynchronously).
@@ -907,6 +1067,39 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             };
             pi.on("session_start", (_event, ctx) => repin(ctx));
             pi.on("session_switch", (_event, ctx) => repin(ctx));
+        }
+        if (agent === "pi" && typeof pi.registerMessageRenderer === "function") {
+            pi.registerMessageRenderer("bili-acp-status", (message, { expanded, outputPad }, theme) => {
+                if (expanded) return undefined;
+                const text = typeof message.content === "string" ? message.content
+                    : message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+                const lines = text.split("\n");
+                // Block-detail line shape is owned by the kernel's buildStatusPanel
+                // (kernel/src/panel/panel.ts); if it ever changes, folding degrades to full display.
+                const collapsed = lines.filter((line) => !/^  \[b\d+\] T\d+ /.test(line));
+                if (collapsed.length === lines.length) return undefined;
+                const box = new Box(outputPad ?? 1, 1, (line) => theme.bg("customMessageBg", line));
+                box.addChild(new Text(theme.fg("customMessageLabel", "\x1b[1m[bili-acp-status]\x1b[22m"), 0, 0));
+                box.addChild(new Spacer(1));
+                box.addChild(new Markdown(collapsed.join("\n"), 0, 0, {
+                    heading: (value) => theme.fg("mdHeading", value),
+                    link: (value) => theme.fg("mdLink", value),
+                    linkUrl: (value) => theme.fg("mdLinkUrl", value),
+                    code: (value) => theme.fg("mdCode", value),
+                    codeBlock: (value) => theme.fg("mdCodeBlock", value),
+                    codeBlockBorder: (value) => theme.fg("mdCodeBlockBorder", value),
+                    quote: (value) => theme.fg("mdQuote", value),
+                    quoteBorder: (value) => theme.fg("mdQuoteBorder", value),
+                    hr: (value) => theme.fg("mdHr", value),
+                    listBullet: (value) => theme.fg("mdListBullet", value),
+                    bold: (value) => theme.bold(value),
+                    italic: (value) => theme.italic(value),
+                    underline: (value) => theme.underline(value),
+                    strikethrough: (value) => theme.strikethrough(value),
+                }, { color: (value) => theme.fg("customMessageText", value) }));
+                box.addChild(new Text(theme.fg("dim", "Ctrl+O to expand full ACP report"), 0, 0));
+                return box;
+            });
         }
         if (typeof pi.registerCommand === "function") {
             pi.registerCommand("acp", {
@@ -1206,12 +1399,32 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             if (state.toolsReady !== true) return undefined; // no marker stamped → must not replace
             const payload = event.payload as { messages?: unknown; system?: unknown } | undefined;
             if (payload === null || typeof payload !== "object" || !Array.isArray((payload as { messages?: unknown }).messages)) return undefined;
+            if (!wireMessagesLookAnthropic(payload.messages)) return undefined; // anthropic wire only — OpenAI tool shapes resend full (#3433)
             const sid = sessionIdOf(ctx);
             if (sid === undefined || sid.length === 0) return undefined;
             let proxyBase = proxyBaseForCtx(ctx);
             if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
             if (proxyBase === undefined) return undefined;
             if (!(await probeIncrementalTurns(proxyBase))) return undefined;
+            // #4352: the response-header ack channel is transport-dependent —
+            // pi's after_provider_response only exposes headers for some
+            // provider transports, and a missed ack makes EVERY next turn
+            // re-seed the full history (the 2026-10-22 incident: turn 2 sent
+            // sinceSeq=0 again). Before planning, reconcile any still-pending
+            // un-acked turn by PULLING the lane's receipt and adopting it only
+            // when the boundary hash proves the canonical absorbed OUR last
+            // message — never on mere seq progress (a foreign full-resend can
+            // advance the canonical too).
+            const pendingAck = pendingIncrementalAcks.get(sid);
+            if (pendingAck !== undefined && pendingAck.messages.length > 0) {
+                const receipt = await pullIncrementalReceipt(proxyBase, sid);
+                const expected = incrementalWireHash(pendingAck.messages[pendingAck.messages.length - 1]);
+                if (receipt !== null && receipt.appliedSeq > 0 && receipt.boundary === expected) {
+                    pendingIncrementalAcks.delete(sid);
+                    piIncrementalOriginals.delete(sid);
+                    noteIncrementalAck(sid, receipt.appliedSeq, pendingAck.messages, pendingAck.system);
+                }
+            }
             const plan = planIncrementalTurn({
                 conversationId: sid,
                 // The marker divert uses the ORIGINAL request URL server-side;
@@ -1222,8 +1435,30 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 request: payload as Record<string, unknown>,
             });
             if (plan.mode === "skip") return undefined;
+            // #3304: stash the ORIGINAL payload under this conversation — the
+            // direct-send guard restores it if the proxy dies before the
+            // swapped envelope lands on the wire.
+            stashPiIncrementalOriginal(sid, payload);
             pendingIncrementalAcks.set(sid, { messages: payload.messages as IncrementalWireMessage[], system: "system" in payload ? payload.system : undefined, base: proxyBase });
-            return JSON.parse((plan as { body: string }).body) as unknown;
+            const body = JSON.parse((plan as { body: string }).body) as { messages: IncrementalWireMessage[]; msgIds?: string[] };
+            // #4491 pi msgids wiring: attach the pi session's stable message
+            // ids (aligned to the FULL outgoing wire) sliced to the plan's
+            // delta messages, all-or-nothing — one unresolvable message, a
+            // multi-block delta message (the lane pins 1:1 onto the flattened
+            // core messages and 400s otherwise), or a poison-shaped id leaves
+            // the field off entirely and the turn rides content-derived ids.
+            let branch: unknown;
+            try {
+                branch = ctx.sessionManager?.getBranch?.();
+            } catch {
+                branch = undefined;
+            }
+            const ids = laneMsgIdsForWire(payload.messages, branch);
+            if (ids !== undefined && body.messages.every((m) => lanePinnableContent(m.content))) {
+                const sliced = ids.slice(ids.length - body.messages.length);
+                if (sliced.length === body.messages.length && validateMsgIds(sliced, sliced.length).ok) body.msgIds = sliced;
+            }
+            return body;
         }
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
             if (state.toolsReady !== true) return;
@@ -1253,6 +1488,16 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: (event as { payload?: unknown } | undefined)?.payload });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // #4491 omp msgids: snapshot the branch's stable entry ids BEFORE
+            // any await below — the hint must be the generation of THIS
+            // payload. The fetch-layer planner (omp-native) reads it back by
+            // the prompt_cache_key conversation id and carries `msgIds` only
+            // when the ids align 1:1 with the actually-sent messages; any
+            // mismatch degrades to no field, never a misaligned array.
+            if (agent === "omp") {
+                const hintSid = sessionIdOf(ctx);
+                if (hintSid !== undefined && hintSid.length > 0) noteHostMsgIdHint(hintSid, ompBranchMsgIdEntries(ctx));
+            }
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
@@ -1320,28 +1565,40 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 if (sid === undefined || sid.length === 0) return;
                 const pending = pendingIncrementalAcks.get(sid);
                 if (pending === undefined) return;
-                pendingIncrementalAcks.delete(sid);
                 const status = (event as { status?: unknown }).status;
                 const headers = (event as { headers?: Record<string, unknown> }).headers;
+                const seq = headers?.["x-bili-applied-seq"];
+                if (status === 200 && !(typeof seq === "string" && /^\d+$/.test(seq))) {
+                    // 200 without an ack header CANNOT be the marker'd response —
+                    // the lane stamps x-bili-applied-seq on every diverted
+                    // response that reaches the forward (incremental-lane.ts
+                    // writeHead wrap). It is a concurrent full-resend response
+                    // for this conversation: keep the pending entry for the
+                    // marker'd response still in flight.
+                    return;
+                }
+                pendingIncrementalAcks.delete(sid);
+                piIncrementalOriginals.delete(sid); // #3304: turn settled — original no longer needed
                 if (status === 200) {
-                    const seq = headers?.["x-bili-applied-seq"];
-                    if (typeof seq === "string" && /^\d+$/.test(seq)) {
-                        noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
-                        return;
-                    }
-                    // No ack header = the request did NOT ride the incremental
-                    // divert (marker raced the probe) — leave state untouched.
+                    noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
                     return;
                 }
                 if (status === 409) {
-                    markIncrementalDead(sid);
-                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turn rejected (seq drift) for ${sid} — falling back to full resend for this conversation`);
+                    // #3369: one 409 resets the conversation state — the next
+                    // turn re-seeds with resync:true (never 409s) instead of
+                    // permanently downgrading to full resend. Only a streak of
+                    // consecutive 409s (no ack between) trips the sticky kill.
+                    const verdict = noteIncrementalRejection(sid);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turn rejected (seq drift) for ${sid} — ${verdict === "dead" ? "sticky fallback to full resend (rejection circuit)" : "re-seeding with a full resync next turn"} (#3369)`);
                     return;
                 }
                 if (status === 503) {
-                    markIncrementalDead(sid);
+                    // #3369: 503 means the lane is temporarily unavailable
+                    // (sidecar boot / rollout flip) — the conversation's ack
+                    // state is still valid, so do NOT kill it. Just drop the
+                    // probe cache; the next turn re-probes and resumes.
                     clearIncrementalProbe(pending.base);
-                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turns unavailable on the lane — re-probing next turn`);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turns unavailable on the lane — re-probing next turn (conversation state preserved, #3369)`);
                 }
             } catch (err) {
                 logHostEvent("error", "[native-client]", `bili-plugin(${agent}): incremental ack handling failed (${err instanceof Error ? err.message : String(err)})`);
@@ -1398,6 +1655,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         pi.on("session_shutdown", () => {
             disposeSubagentSelfReg(subagentReg);
         });
+        // #3542: a /tree rewind resets the active loadout from the transcript —
+        // re-assert ours right after the reset (see reassertLoadoutAfterTree).
+        pi.on("session_tree", () => reassertLoadoutAfterTree(pi, state, agent));
         // omp fires session_compact on in-session native compaction (sid does
         // not rotate), so the proxy reuses stale state — notify it to archive
         // the now-unreachable blocks (#395). Fire-and-forget: a failed

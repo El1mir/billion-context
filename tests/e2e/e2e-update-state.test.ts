@@ -290,6 +290,13 @@ test("self-update keeps live compression state: folds survive the OLD→NEW hop 
         const envBase = isolatedEnv(work);
         envBase.BILI_UPDATE_REGISTRY = registry.url;
         envBase.BILI_UPDATE_CHECK_INTERVAL_MS = "1000";
+        // #3619 pins: this suite asserts PERIODIC update mechanics, not stagger
+        // timing — pin the rollout knobs to legacy immediate and point the
+        // policy fetch at an unroutable URL so the remote policy can never
+        // inject a delay/hold into the observed upgrade.
+        envBase.BILI_UPDATE_STAGGER_MIN_MS = "0";
+        envBase.BILI_UPDATE_STAGGER_MAX_MS = "0";
+        envBase.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
         envBase.BILI_PERSIST_DEBOUNCE_MS = "200";
         envBase.BILI_SESSIONS_DIR = sessionsDir;
 

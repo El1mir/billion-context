@@ -24,7 +24,7 @@ for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CON
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 
 // ---------------------------------------------------------------------------
-// Hash parity with the server (#2399): the proxy's publicForkInputMatches
+// Hash parity with the server (#2399): the proxy's publicForkInputCheck
 // rejects a child replay whose prefix hashes drift from the receipt, so the
 // agent-side recipe must stay byte-identical to src/plugin.ts.
 // ---------------------------------------------------------------------------
@@ -335,7 +335,7 @@ test("manifestForkCapable accepts fork protocol v2 manifests (#2671 Phase 2b)", 
 // ---------------------------------------------------------------------------
 // Full chain against a real proxy: an OpenAI-wire dsh parent, adoption via
 // tryForkAdoption, then the child's replayed request must be ACCEPTED (the
-// server's publicForkInputMatches binds the receipt) and a divergent second
+// server's publicForkInputCheck binds the receipt) and a divergent second
 // fork for the same child id must be refused.
 // ---------------------------------------------------------------------------
 

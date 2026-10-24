@@ -1,7 +1,136 @@
 import { MESSAGES } from "./i18n.js";
 
+// #3572 (client half): the server accepts JSONC config files (comments +
+// trailing commas) since the parseBiliConfig fix, but the web editor still
+// strict-parses the draft text in five places — so a user with a JSONC config
+// sees the quick-config panel vanish (#3488) and cannot save. These three pure
+// helpers implement the same tolerance client-side; they live in the TS module
+// (importable by tests) and are inlined into the browser IIFE below via
+// toString(), so there is exactly one implementation.
+export function stripJsoncComments(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        // Comments become spaces (not deleted) so JSON.parse error offsets stay honest.
+        if (c === "/" && d === "/") {
+            while (i < text.length && text.charAt(i) !== "\n") {
+                out += " ";
+                i += 1;
+            }
+            continue;
+        }
+        if (c === "/" && d === "*") {
+            while (i < text.length && !(text.charAt(i) === "*" && text.charAt(i + 1) === "/")) {
+                out += text.charAt(i) === "\n" ? "\n" : " ";
+                i += 1;
+            }
+            out += "  "; // the closing */ — kept as spaces so offsets stay honest
+            i += 2;
+            continue;
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Second pass, string-aware: drop a comma only when the next meaningful char
+// closes the current object/array. Run AFTER stripJsoncComments so commas and
+// closers inside string literals are the only ones left to protect.
+export function stripJsoncTrailingCommas(text: string): string {
+    let out = "";
+    let i = 0;
+    let inString = false;
+    while (i < text.length) {
+        const c = text.charAt(i);
+        if (inString) {
+            out += c;
+            if (c === "\\") {
+                const d = i + 1 < text.length ? text.charAt(i + 1) : "";
+                if (d !== "") {
+                    out += d;
+                    i += 2;
+                    continue;
+                }
+            } else if (c === '"') inString = false;
+            i += 1;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            out += c;
+            i += 1;
+            continue;
+        }
+        if (c === ",") {
+            let j = i + 1;
+            while (j < text.length && " \t\r\n".includes(text.charAt(j))) j += 1;
+            if (j < text.length && (text.charAt(j) === "}" || text.charAt(j) === "]")) {
+                i += 1;
+                continue;
+            }
+        }
+        out += c;
+        i += 1;
+    }
+    return out;
+}
+
+// Strict JSON first so a valid file takes the exact same path as before;
+// fall back to the JSONC tolerance above; a genuinely malformed draft still
+// throws, and the server's parseBiliConfig remains the authoritative check on save.
+export function parseConfigDraft(text: string): unknown {
+    try {
+        return JSON.parse(text);
+    } catch {
+        // fall through to the tolerant path
+    }
+    return JSON.parse(stripJsoncTrailingCommas(stripJsoncComments(text)));
+}
+
+// #3816: does this config draft carry an ENABLED admin relay? Strict on the
+// value (=== true): "true", 1 and other truthy typos do not count. Malformed
+// drafts report false — the parse-error banner owns that state, not this one.
+export function adminRelayActiveInDraft(text: string): boolean {
+    let draft: unknown;
+    try {
+        draft = parseConfigDraft(text);
+    } catch {
+        return false;
+    }
+    if (draft === null || typeof draft !== "object" || Array.isArray(draft)) return false;
+    const sec = (draft as Record<string, unknown>).security;
+    if (sec === null || sec === undefined || typeof sec !== "object" || Array.isArray(sec)) return false;
+    return (sec as Record<string, unknown>).adminRelay === true;
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
+    const stripJsoncComments = ${stripJsoncComments.toString()};
+    const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
+    const parseConfigDraft = ${parseConfigDraft.toString()};
+    const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -19,6 +148,18 @@ export const WEB_CLIENT = `(function () {
             const saved = localStorage.getItem("bili-language");
             if (saved === "en" || saved === "zh-CN") locale = saved;
             else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+        }
+    } catch (e) {}
+    // #3373: when the panel is served through a host relay under a path
+    // prefix (e.g. /app/dsh/__bili/…), the wire root is that prefixed path,
+    // not the site root. Derive it from the document's own pathname — the
+    // only prefix source that survives gateway <base> injection. Direct
+    // serving (/__bili/) keeps the byte-identical root "/__bili".
+    let API_ROOT = "/__bili";
+    try {
+        if (typeof location !== "undefined" && location.pathname) {
+            const m = /^(.*\\/)__bili(\\/|$)/.exec(location.pathname);
+            if (m && m[1] !== undefined) API_ROOT = m[1] + "__bili";
         }
     } catch (e) {}
     function t(key, vars) {
@@ -264,7 +405,9 @@ export const WEB_CLIENT = `(function () {
             const res = await fetch(url, Object.assign({}, opts, ac ? { signal: ac.signal } : {}));
             let body = null;
             try { body = await res.json(); } catch (e) {}
-            if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
+            // #3488: server errors may be objects ({type, message}); String() on
+            // them rendered "[object Object]" in the toast.
+            if (!res.ok) throw new Error(body && body.error ? (typeof body.error === "object" ? String(body.error.message || body.error.type || JSON.stringify(body.error)) : String(body.error)) : "HTTP " + res.status);
             return body;
         } finally {
             if (timer !== null) clearTimeout(timer);
@@ -273,7 +416,7 @@ export const WEB_CLIENT = `(function () {
     async function putCfg(btn, payload) {
         busy(btn, true);
         try {
-            await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+            await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
             toast(t("cfg.saved"), "ok");
             loadConfig();
         } catch (e) {
@@ -336,7 +479,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -344,7 +487,10 @@ export const WEB_CLIENT = `(function () {
     // #1937: server-side paging state for the session list (50 rows per page).
     const SES_PAGE_SIZE = 50;
     let sesPage = 1;
+    let sesPages = 1;
     let sesTotal = 0;
+    let sesUnfilteredTotal = 0;
+    let sesRequestId = 0;
     // #1937: poll failure accounting — exponential backoff (5s → 10s → … cap 60s),
     // one persistent error strip instead of toast spam, and an in-flight guard so
     // slow responses never stack concurrent admin requests.
@@ -389,6 +535,24 @@ export const WEB_CLIENT = `(function () {
         const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
         ["card-quick", "card-file", "summary-settings"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
         document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
+        refreshRelayWarn();
+    }
+    // #3816: the admin-relay warning rides every editor change and the initial
+    // load, so it shows WHILE the user is setting security.adminRelay — before
+    // the save lands — not only afterwards.
+    function refreshRelayWarn() {
+        const el = $("cfg-relay-warn");
+        const fe = $("cfg-file-edit");
+        if (!el || !fe) return;
+        if (adminRelayActiveInDraft(fe.value)) {
+            el.hidden = false;
+            el.classList.add("show");
+            el.textContent = t("cfg.relay_warn");
+        } else {
+            el.hidden = true;
+            el.classList.remove("show");
+            el.textContent = "";
+        }
     }
 
     function sessionTitleCell(s) {
@@ -407,6 +571,7 @@ export const WEB_CLIENT = `(function () {
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
++ (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -463,7 +628,11 @@ export const WEB_CLIENT = `(function () {
         if (compact) {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
-            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + (s.clientHint ? '<span class="mono small">' + escapeHtml(s.clientHint) + "</span>" : '<span class="dim">' + t("common.none") + "</span>") + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
+            const clientHint = s.clientHint ? String(s.clientHint) : "";
+            const clientCell = clientHint
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>"
+                : '<span class="dim">' + t("common.none") + "</span>";
+            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
         tr.addEventListener("click", (ev) => {
@@ -478,9 +647,277 @@ export const WEB_CLIENT = `(function () {
         return tr;
     }
 
+    // #3719: changelog section (overview page, collapsed card) — one fetch per
+    // page load; the server caches with a 10-minute throttle, so this costs at
+    // most one GitHub API hit per 10 minutes fleet-wide.
+    let chlogLoaded = false;
+    // Escaped-plain-text → anchor tags. Function-form replacer on purpose:
+    // URL characters ($, &) would corrupt "string" replacement patterns.
+    function linkifyText(escaped) {
+        return escaped.replace(/(https?:\\/\\/[^\\s<>]+)/g, (u) => '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + "</a>");
+    }
+function changelogCatOf(rawLine) {
+        const s = rawLine.replace(/^\\*?\\s*\\[PR\\]\\s*/i, "").trim();
+        if (/^kernel([(:\\s]|$)/i.test(s)) return "cat_kernel";
+        if (/(^|[.(,\\s])(dsh|pi(?:-subagents)?|codex|claude(?:-code)?|opencode(?:v?\\d)?|hermes|kimi|zcode|trae)([):,\\s]|$)/i.test(s)) return "cat_host";
+        const m = s.match(/^([a-z]+)(\\([^)]*\\))?[:\\s]/);
+        if (m) {
+            const p = m[1].toLowerCase();
+            if (p === "feat" || p === "feature" || p === "improve") return "cat_feat";
+            if (p === "fix" || p === "perf") return "cat_fix";
+            if (p === "docs") return "cat_web";
+            if (p === "ci" || p === "build" || p === "test" || p === "chore" || p === "refactor" || p === "style") return "cat_infra";
+        }
+        if (/(persist|storage|session|sqlite|index\\.db|unified)/i.test(s)) return "cat_store";
+        if (/(self-update|auto-update|update policy|release|publish|stagger|version bump)/i.test(s)) return "cat_upd";
+        if (/\\b(web|panel|i18n|changelog|favicon)\\b/i.test(s)) return "cat_web";
+        return "cat_other";
+    }
+    const CHLOG_CATS = ["cat_feat", "cat_fix", "cat_kernel", "cat_host", "cat_store", "cat_upd", "cat_web", "cat_infra", "cat_other"];
+    // One release body → intro (headings/prose) + categorized bullet groups.
+    function changelogBodyHtml(escaped) {
+        const intro = [];
+        let para = [];
+        const flushPara = () => { if (para.length) { intro.push('<div class="cl-p">' + para.map((s)=>s.replace(/\\*\\*([^*]+)\\*\\*/g,"<strong>$1</strong>")).join("<br>") + "</div>"); para = []; } };
+        const cats = {};
+        for (const raw of escaped.split("\\n")) {
+            const tl = raw.trim();
+            const bm = tl.match(/^(?:[-*]|\\d+[.)])\\s+(.*)$/);
+            if (bm) {
+                flushPara();
+                const item = linkifyText(bm[1]);
+                const key = changelogCatOf(bm[1]);
+                if (!cats[key]) cats[key] = [];
+                cats[key].push(item);
+            } else if (/^#{1,6}\\s/.test(tl)) {
+                flushPara();
+                intro.push('<div class="cl-h">' + linkifyText(tl.replace(/^#{1,6}\\s*/, "")) + "</div>");
+            } else if (tl === "") flushPara();
+            else para.push(linkifyText(tl));
+        }
+        flushPara();
+        let html = intro.join("");
+        for (const key of CHLOG_CATS) {
+            const items = cats[key];
+            if (!items) continue;
+            // Inline t() per key: the #1024 scanner counts literal t("…") refs only.
+            const label = { cat_feat: t("sys.changelog_cat_feat"), cat_fix: t("sys.changelog_cat_fix"), cat_kernel: t("sys.changelog_cat_kernel"), cat_host: t("sys.changelog_cat_host"), cat_store: t("sys.changelog_cat_store"), cat_upd: t("sys.changelog_cat_upd"), cat_web: t("sys.changelog_cat_web"), cat_infra: t("sys.changelog_cat_infra"), cat_other: t("sys.changelog_cat_other") }[key];
+            html += '<div class="cl-cat">' + label + ' <span class="dim">' + items.length + "</span></div>" + items.map(function (x) { return '<div class="cl-li">' + x + "</div>"; }).join("");
+        }
+        return html;
+    }
+    // Version-select → scroll that release open and flash it briefly.
+    function focusChangelogRelease(val) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const want = String(val).replace(/^v/, "");
+        const items = el.querySelectorAll("details.cl-item");
+        if (typeof items.forEach !== "function") return;
+        items.forEach((it) => {
+            const hit = String(it.getAttribute("data-tag") || "").replace(/^v/, "") === want;
+            try { it.open = hit; } catch (_) { /* harness */ }
+            it.classList.remove("cl-flash");
+        });
+        const target = el.querySelector('details.cl-item[data-tag="' + want.replace(/"/g, "") + '"]');
+        if (!target) return;
+        try { target.open = true; } catch (_) { /* harness */ }
+        target.classList.add("cl-flash");
+        if (target.scrollIntoView) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        setTimeout(() => target.classList.remove("cl-flash"), 2500);
+    }
+    function renderChangelog(d) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const rels = (d && typeof d === "object" && Array.isArray(d.releases)) ? d.releases : [];
+        if (!rels.length) {
+            el.textContent = (d && d.error) ? t("sys.changelog_offline") : t("sys.changelog_empty");
+            return;
+        }
+        let html = "";
+        rels.forEach((r, i) => {
+            const tagRaw = String(r.tag || "");
+            const tag = escapeHtml(tagRaw);
+            const dataTag = tagRaw.replace(/^v/, "").replace(/"/g, "");
+            const name = (typeof r.name === "string" && r.name !== r.tag) ? escapeHtml(r.name) + " · " : "";
+            const latest = i === 0 ? ' <span class="badge cl-latest">' + t("sys.changelog_latest") + "</span>" : "";
+            const date = r.publishedAt ? ' <span class="dim">' + escapeHtml(String(r.publishedAt).slice(0, 10)) + "</span>" : "";
+            const view = '<a href="' + escapeHtml(String(r.url || "")) + '" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_view") + "</a>";
+            const body = typeof r.body === "string" && r.body.trim() ? '<div class="cl-body">' + changelogBodyHtml(escapeHtml(r.body)) + '<div class="cl-foot">' + view + "</div></div>" : view;
+            html += '<details class="cl-item" data-tag="' + dataTag + (i === 0 ? '" open>' : '">' ) + '<summary><span class="cl-tag">' + tag + "</span>" + name + latest + date + "</summary>" + body + "</details>";
+        });
+        html += '<div class="cl-actions"><button class="btn sm" id="cl-expand-all" type="button">' + t("up.cl_expand_all") + '</button><button class="btn sm" id="cl-collapse-all" type="button">' + t("up.cl_collapse_all") + '</button><a class="btn sm" href="https://github.com/ranxianglei/billion-context/releases" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_all") + "</a></div>";
+        el.innerHTML = html;
+        const expandAll = $("cl-expand-all");
+        const collapseAll = $("cl-collapse-all");
+        if (expandAll) expandAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = true; } catch (_) { /* harness */ } }));
+        if (collapseAll) collapseAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = false; } catch (_) { /* harness */ } }));
+    }
+    async function loadChangelog() {
+        if (chlogLoaded) return;
+        const el = $("changelog-body");
+        if (!el) return;
+        chlogLoaded = true;
+        el.textContent = t("sys.changelog_loading");
+        try {
+            renderChangelog(await json(API_ROOT + "/changelog"));
+        } catch (e) {
+            // The endpoint itself never errors (fail-soft); reaching here means
+            // the PROXY is unreachable — same offline wording either way.
+            renderChangelog({ releases: [], error: "offline" });
+        }
+    }
+
+    // #3719 phase 2: dedicated 更新/Updates tab — self-update state, pushed
+    // notices, and install/rollback actions. All writes go through the
+    // admin-gated POST /__bili/update/* routes (same json() pattern as
+    // putCfg); one shared in-flight flag keeps ALL action buttons disabled
+    // while any action runs (the server dedupes a second call too).
+    let upBusyAction = false;
+    let upReleases = [];
+    function upSetButtons(on) {
+        [$("up-check"), $("up-upgrade-now"), $("up-install")].forEach((b) => {
+            if (!b) return;
+            b.classList.toggle("busy", on);
+            b.disabled = on;
+        });
+        // Install-selected additionally needs an actual selection.
+        const ins = $("up-install");
+        const sel = $("up-select");
+        if (ins) ins.disabled = on || !(sel && sel.value);
+    }
+    function showUpdateResult(msg, ok) {
+        const el = $("up-result");
+        if (!el || !msg) return;
+        el.hidden = false;
+        el.textContent = msg;
+        el.style.color = ok ? "var(--green)" : "var(--red)";
+    }
+    // Loose numeric compare on major/minor/patch — enough to decide the
+    // rollback confirm without pulling semver into the panel.
+    function upVerParts(v) {
+        return String(v || "").replace(/^v/i, "").split(/[.+]/).slice(0, 3).map((p) => parseInt(p, 10));
+    }
+    function upCmpVer(a, b) {
+        const x = upVerParts(a);
+        const y = upVerParts(b);
+        for (let i = 0; i < 3; i++) {
+            const d = (x[i] || 0) - (y[i] || 0);
+            if (d !== 0) return d < 0 ? -1 : 1;
+        }
+        return 0;
+    }
+    function renderNotices(items) {
+        const el = $("up-notices");
+        if (!el) return;
+        if (!items.length) { el.textContent = t("up.notice_empty"); return; }
+        let html = "";
+        items.slice().reverse().forEach((n) => {
+            const tier = n.tier === "critical" ? "critical" : (n.tier === "recommended" ? "recommended" : "routine");
+            // Fully literal keys below: the i18n dead-key scanner (#1024)
+            // greps t() call sites and would flag a dynamically built
+            // tier-prefix key.
+            const tierLabel = tier === "critical" ? t("up.tier_critical") : (tier === "recommended" ? t("up.tier_recommended") : t("up.tier_routine"));
+            // #3719 item4: locale-aware summary — zh picks summaryZh when the
+            // entry carries one; every other locale (and legacy payloads)
+            // falls back to the English one-liner.
+            const summaryText = (locale === "zh-CN" && typeof n.summaryZh === "string" && n.summaryZh) ? n.summaryZh : String(n.summary || "");
+            html += '<div class="ntc-item"><span class="badge' + (tier === "routine" ? " disk" : " ntc-" + tier) + '">' + escapeHtml(tierLabel) + "</span><span class='mono'>" + escapeHtml(String(n.version || "")) + "</span>" + (n.date ? ' <span class="dim">' + escapeHtml(String(n.date)) + "</span>" : "") + "<br>" + escapeHtml(summaryText) + "</div>";
+        });
+        el.innerHTML = html;
+    }
+    // Newest release known to the panel: the newest pushed notice wins, the
+    // changelog tag list is the fallback (tags arrive newest-first, capped at
+    // what the endpoint returns). Leading "v" is stripped before install —
+    // the updater takes plain semver.
+    function upNewestVersion(notices) {
+        if (notices && notices.length) return String(notices[notices.length - 1].version || "");
+        return String(upReleases[0] || "").replace(/^v/, "");
+    }
+    function applyUpdateButtons(st) {
+        const now = $("up-upgrade-now");
+        const target = upNewestVersion(st && st.notices);
+        if (now) {
+            const lbl = $("up-upgrade-now-label");
+            if (lbl) lbl.textContent = target ? t("up.upgrade_now", { v: target }) : t("up.upgrade_none");
+            now.disabled = upBusyAction || !target;
+        }
+    }
+    function renderUpdateState(st) {
+        if (!st || typeof st !== "object") return;
+        const set = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+        set("up-running", st.running || "?");
+        set("up-disk", st.disk || t("common.none"));
+        set("up-latest", upNewestVersion(st.notices) || t("common.none"));
+        set("up-last-check", st.lastCheckAt ? new Date(st.lastCheckAt).toLocaleString() : t("common.none"));
+        const hint = $("up-pending-hint");
+        if (hint) hint.hidden = !st.pendingRestart;
+        renderNotices(Array.isArray(st.notices) ? st.notices : []);
+        const sel = $("up-select");
+        if (sel) {
+            const cur = sel.value;
+            let opt = '<option value="">' + t("up.select_placeholder") + "</option>";
+            upReleases.forEach((tag) => { opt += '<option value="' + escapeHtml(tag) + '">' + escapeHtml(tag) + "</option>"; });
+            sel.innerHTML = opt;
+            if (cur) sel.value = cur;
+        }
+        applyUpdateButtons(st);
+        // A check/install started from another tab of this process shows in
+        // the snapshot — keep the buttons held down until it settles.
+        if (st.checking || st.installing) upSetButtons(true);
+    }
+    async function loadUpdates() {
+        try {
+            const [st, cl] = await Promise.all([json(API_ROOT + "/update/state"), json(API_ROOT + "/changelog")]);
+            upReleases = (cl && Array.isArray(cl.releases)) ? cl.releases.map((r) => String(r.tag || "")).filter(Boolean) : [];
+            renderUpdateState(st);
+        } catch (e) {
+            // Both endpoints are fail-soft 200s; reaching here = proxy unreachable.
+            toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    async function upInstall(version) {
+        if (upBusyAction || !version) return;
+        const running = $($("up-running") && "up-running") ? $("up-running").textContent.replace(/^v/i, "") : "";
+        if (upCmpVer(version, running) < 0 && !window.confirm(t("up.rollback_confirm", { v: version }))) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        showUpdateResult(t("up.installing", {}), true);
+        try {
+            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: version }) });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.installed", { v: version }), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "install failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+    function upUpgradeNow() { upInstall(upNewestVersion(null).replace(/^v/, "")); }
+    function upInstallSelected() { const sel = $("up-select"); if (sel && sel.value) upInstall(String(sel.value).replace(/^v/, "")); }
+    async function upCheckNow() {
+        if (upBusyAction) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        try {
+            const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+
     async function loadOverview(silent) {
         try {
-            const d = await json("/__bili/overview");
+            const d = await json(API_ROOT + "/overview");
             const o = d.overview || {};
             // #1426: total splits live vs historical (disk-restored pool entries are history);
             // counters without usage samples render "—" instead of a misleading 0; the saved
@@ -549,14 +986,60 @@ export const WEB_CLIENT = `(function () {
                 // carries the MINIMUM fixed version, so each locale can say
                 // "v{version} 或更新版本" / "v{version} or newer" separately.
                 const vars = { version: u.version, summary: u.summary || "" };
+                // #3719 item3: locale-aware summary — zh gets summaryZh when
+                // the entry carries one (release-notes bilingual support).
+                if (locale === "zh-CN" && typeof u.summaryZh === "string" && u.summaryZh) vars.summary = u.summaryZh;
                 const line = u.kind === "ready" ? t("sys.update_ready", vars) : t("sys.update_available", vars);
                 ub.hidden = false;
                 ub.classList.add("show");
                 ub.innerHTML = "<strong>" + t("sys.update") + "</strong> " + escapeHtml(line);
+                // #3719 item3: one-click upgrade straight from the banner when
+                // the fix is still "available" (ready = already on disk, just
+                // restart). Reuses the phase-2 install endpoint + its safety
+                // chain; feedback stays inside the banner.
+                if (u.kind === "available") {
+                    const btn = document.createElement("button");
+                    btn.type = "button";
+                    btn.className = "banner-upgrade-now";
+                    btn.textContent = t("sys.update_now", { version: u.version });
+                    btn.addEventListener("click", async () => {
+                        btn.disabled = true;
+                        btn.textContent = t("sys.updating", {});
+                        try {
+                            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: u.version }) });
+                            if (r && (r.ok || r.already)) btn.textContent = t("sys.update_done", { version: u.version });
+                            else { btn.textContent = String((r && r.error) || "install failed"); btn.disabled = false; }
+                        } catch (e) {
+                            btn.textContent = String((e && e.message) || e);
+                            btn.disabled = false;
+                        }
+                    });
+                    ub.appendChild(btn);
+                }
             } else {
                 ub.hidden = true;
                 ub.classList.remove("show");
                 ub.innerHTML = "";
+            }
+        }
+        // #3619: hold/pinned are the policy BRAKE states (auto-upgrades frozen
+        // fleet-wide) — the issue requires them user-visible with the escape hatch.
+        const upb = $("update-policy-banner");
+        if (upb) {
+            const lines = [];
+            const up = d.updatePolicy;
+            if (up && typeof up === "object") {
+                if (up.hold === true) lines.push(t("sys.policy_hold"));
+                if (typeof up.pinned === "string" && up.pinned) lines.push(t("sys.policy_pinned", { version: up.pinned }));
+            }
+            if (lines.length) {
+                upb.hidden = false;
+                upb.classList.add("show");
+                upb.innerHTML = "<strong>" + t("sys.policy_title") + "</strong> " + lines.map(escapeHtml).join("<br>");
+            } else {
+                upb.hidden = true;
+                upb.classList.remove("show");
+                upb.innerHTML = "";
             }
         }
         const stale = $("stale-banner");
@@ -568,6 +1051,42 @@ export const WEB_CLIENT = `(function () {
             stale.hidden = true;
             stale.classList.remove("show");
             stale.innerHTML = "";
+        }
+        // #3581/#3651: takeover-attribution failure notice — under the #3651
+        // owner contract only DIAGNOSABLE failures reach this surface (threw
+        // episodes report error text + masked endpoint; by-design agentless
+        // lanes never report), so a visible banner always names what failed.
+        // Shown only when traffic is actually going direct: at least one agent
+        // is degraded AND no session is live (live > 0 means compression is
+        // still serving this host, so the bare "0 running" sub-line is not
+        // misleading).
+        const attEl = $("attribution-banner");
+        if (attEl) {
+            const att = d.attribution;
+            const degraded = att && typeof att === "object"
+                ? Object.entries(att).filter(([, a]) => a && typeof a === "object" && a.state !== "ok" && (a.refusals || 0) > 0)
+                : [];
+            // #3581: only meaningful while nothing runs — with live sessions the
+            // takeover is demonstrably working for them.
+            const show = degraded.length > 0 && ((d.overview || {}).live || 0) === 0;
+            if (show) {
+                const [agent, entry] = degraded[0];
+                const sinceText = entry.since > 0 ? new Date(entry.since).toLocaleString() : "?";
+                attEl.hidden = false;
+                attEl.classList.add("show");
+                attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>"
+                    + (entry.error ? '<div class="mono">' + escapeHtml(t("sys.attribution_error", { err: String(entry.error) })) + "</div>" : "")
+                    + "<div>" + escapeHtml(t("sys.attribution_impact", { since: sinceText })) + "</div>"
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("attribution", attEl);
+            } else {
+                attEl.hidden = true;
+                attEl.classList.remove("show");
+                attEl.innerHTML = "";
+            }
         }
         const sb = $("storage-degraded-banner");
         if (sb) {
@@ -585,6 +1104,88 @@ export const WEB_CLIENT = `(function () {
                 sb.hidden = true;
                 sb.classList.remove("show");
                 sb.innerHTML = "";
+            }
+        }
+        const sh = $("snapshot-shadow-banner");
+        if (sh) {
+            const sw = d.snapshotShadow;
+            if (sw && sw.enabled && sw.errors > 0) {
+                sh.hidden = false;
+                sh.classList.add("show");
+                const worstTxt = sw.worst ? "（" + (sw.worst.label ?? sw.worst.sessionId) + "）" : "";
+                sh.innerHTML = "<strong>" + t("sys.snapshot_shadow_title") + "</strong> " + escapeHtml(t("sys.snapshot_shadow", { n: String(sw.errors), worst: worstTxt }))
+                    + '<div style="margin-top:8px;display:flex;gap:8px">'
+                    + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
+                    + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
+                    + "</div>";
+                attachReportButtons("snapshot-shadow", sh);
+            } else {
+                sh.hidden = true;
+                sh.classList.remove("show");
+                sh.innerHTML = "";
+            }
+        }
+        const spb = $("storage-second-process-banner");
+        if (spb) {
+            const sg2 = d.storage;
+            const sp = sg2 && typeof sg2 === "object" ? sg2.secondProcess : null;
+            if (sp && typeof sp.pid === "number") {
+                spb.hidden = false;
+                spb.classList.add("show");
+                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
+                // the machine-global sessions dir is the supported topology —
+                // informational styling, not a corruption alarm.
+                if (sp.benign === true) {
+                    spb.classList.remove("warn");
+                    spb.classList.add("info");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
+                } else {
+                    spb.classList.remove("info");
+                    spb.classList.add("warn");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+                }
+            } else {
+                spb.hidden = true;
+                spb.classList.remove("show");
+                spb.innerHTML = "";
+            }
+        }
+        const sbb = $("split-brain-banner");
+        if (sbb) {
+            // #3923/#3959: a REAL contest — session id + title + both sides'
+            // pid/lane, with a dismiss action that clears the surfaced entry.
+            const sb = d.storage && typeof d.storage === "object" ? d.storage.splitBrain : null;
+            if (sb && typeof sb.sessionId === "string" && sb.self && typeof sb.self.pid === "number" && sb.peer && typeof sb.peer.pid === "number") {
+                sbb.hidden = false;
+                sbb.classList.add("show");
+                const laneOf = (x) => (x && typeof x.lane === "string" && x.lane ? x.lane : t("sys.split_brain_lane_undeclared"));
+                sbb.innerHTML = "<strong>" + escapeHtml(t("sys.split_brain_title")) + "</strong> "
+                    + escapeHtml(t("sys.split_brain", {
+                        title: typeof sb.title === "string" && sb.title ? sb.title : sb.sessionId.slice(0, 8),
+                        sid: sb.sessionId.slice(0, 8),
+                        selfPid: String(sb.self.pid),
+                        selfLane: laneOf(sb.self),
+                        peerPid: String(sb.peer.pid),
+                        peerLane: laneOf(sb.peer),
+                    }))
+                    + '<div style="margin-top:8px"><button id="split-brain-ack-btn" class="btn sm">' + escapeHtml(t("sys.split_brain_ack_btn")) + "</button></div>";
+                const ackBtn = $("split-brain-ack-btn");
+                if (ackBtn) ackBtn.addEventListener("click", async () => {
+                    busy(ackBtn, true);
+                    try {
+                        await json(API_ROOT + "/storage/split-brain/ack", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sb.sessionId }) });
+                        toast(t("sys.split_brain_acked"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e instanceof Error ? e.message : String(e), "err");
+                    } finally {
+                        busy(ackBtn, false);
+                    }
+                });
+            } else {
+                sbb.hidden = true;
+                sbb.classList.remove("show");
+                sbb.innerHTML = "";
             }
         }
         const pt = $("passthrough-banner");
@@ -632,7 +1233,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/conflicts/clear", { method: "POST" });
+                            await json(API_ROOT + "/conflicts/clear", { method: "POST" });
                             toast(t("conflict.cleared"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -691,6 +1292,25 @@ export const WEB_CLIENT = `(function () {
                 pb.innerHTML = "";
             }
         }
+        // #2645: the key-hostile upstream pairs learned by A/B this process
+        // (in-memory only — a restart re-probes and clears them).
+        const kb = $("pck-banner");
+        if (kb) {
+            const pcks = Array.isArray(d.pckSuppressions) ? d.pckSuppressions : [];
+            if (pcks.length > 0) {
+                kb.hidden = false;
+                kb.classList.add("show");
+                const items = pcks.slice(0, 3).map((p) => [
+                    (p.model ? '<span class="mono">' + escapeHtml(p.model) + "</span>: " : "") + '<span class="mono">' + escapeHtml(p.origin) + "</span>",
+                    p.sessions && p.sessions.length > 0 ? t("pck.sessions", { ids: escapeHtml(p.sessions.join(", ")) }) : null,
+                ].filter(Boolean).join(" ")).join(" · ");
+                kb.innerHTML = "<strong>" + t("pck.on") + '</strong> <span class="mono">' + items + "</span> " + t("pck.hint");
+            } else {
+                kb.hidden = true;
+                kb.classList.remove("show");
+                kb.innerHTML = "";
+            }
+        }
         // #2861: host-side metering plugin notice — dismissal is server-side
         // (POST /__bili/host-plugins/dismiss) so one close silences every browser.
         const hb = $("host-plugin-banner");
@@ -704,7 +1324,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
+                            await json(API_ROOT + "/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
                             toast(t("hostplug.dismissed"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -806,24 +1426,32 @@ export const WEB_CLIENT = `(function () {
         }
         detEl.hidden = true;
         listEl.hidden = false;
-        trajState = null;
-        trajRange = null;
+        chartZooms.forEach((z) => { z.state = null; z.range = null; });
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
-    // #1937: the list is server-side paged & filtered — page 1 replaces the
-    // cache, load-more appends the next page, search re-queries with ?q=.
-    async function refreshSessions(showToast) {
+    // #1937：服务端筛选后分页；改变筛选返回首页，翻页替换当前页。
+    async function refreshSessions(showToast, page) {
+        const requestId = ++sesRequestId;
         try {
-            const d = await json(sessionListUrl(1));
+            const requested = Math.max(1, Math.floor(Number(page) || 1));
+            const d = await json(sessionListUrl(requested));
+            if (requestId !== sesRequestId) return true;
+            const total = typeof d.total === "number" ? d.total : (d.sessions || []).length;
+            const pages = Math.max(1, Math.ceil(total / SES_PAGE_SIZE));
+            if (requested > pages) return await refreshSessions(showToast, pages);
             sessionsCache = d.sessions || [];
-            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
-            sesPage = 1;
+            sesTotal = total;
+            sesUnfilteredTotal = typeof d.unfilteredTotal === "number" ? d.unfilteredTotal : sesTotal;
+            sesPage = typeof d.page === "number" ? d.page : requested;
+            sesPages = pages;
             hiddenEmptyN = d.hiddenEmpty || 0;
+            updateFacetOptions(d);
             renderSessionTable();
-            updateLoadMoreBtn();
+            updatePager();
             return true;
         } catch (e) {
+            if (requestId !== sesRequestId) return true;
             lastErrMsg = friendlyMsg(e);
             if (showToast) toast(t("toast.failed", { msg: lastErrMsg }), "err");
             return false;
@@ -832,36 +1460,91 @@ export const WEB_CLIENT = `(function () {
     function sessionListUrl(page) {
         const input = $("ses-search");
         const q = ((input && input.value) || "").trim();
-        return "/__bili/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
+        const protocol = filterValue("ses-protocol");
+        const client = filterValue("ses-client");
+        const state = filterValue("ses-state");
+        return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE +
+            (q ? "&q=" + encodeURIComponent(q) : "") +
+            (protocol ? "&protocol=" + encodeURIComponent(protocol) : "") +
+            (client ? "&client=" + encodeURIComponent(client) : "") +
+            (state ? "&state=" + encodeURIComponent(state) : "");
     }
-    async function loadMoreSessions() {
-        const btn = $("ses-loadmore");
-        if (btn) busy(btn, true);
-        try {
-            const next = sesPage + 1;
-            const d = await json(sessionListUrl(next));
-            sessionsCache = sessionsCache.concat(d.sessions || []);
-            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
-            sesPage = next;
-            renderSessionTable();
-            updateLoadMoreBtn();
-            return true;
-        } catch (e) {
-            lastErrMsg = friendlyMsg(e);
-            toast(t("toast.failed", { msg: lastErrMsg }), "err");
-            return false;
-        } finally {
-            if (btn) busy(btn, false);
+    function filterValue(id) {
+        const el = $(id);
+        return ((el && el.value) || "").trim();
+    }
+    function facetLabel(kind, value) {
+        if (kind === "protocol") return value === "unknown" ? t("ses.filter_unknown") : value;
+        return value;
+    }
+    function fillFacet(id, values, allLabel, kind) {
+        const sel = $(id);
+        if (!sel) return;
+        const active = sel.value || "";
+        const frag = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
+        const all = document.createElement("option");
+        all.value = "";
+        all.textContent = allLabel;
+        frag.appendChild(all);
+        values.forEach((value) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = facetLabel(kind, value);
+            frag.appendChild(opt);
+        });
+        sel.textContent = "";
+        sel.appendChild(frag);
+        if (active) sel.value = active;
+        if (active && sel.value !== active) {
+            const stale = document.createElement("option");
+            stale.value = active;
+            stale.textContent = facetLabel(kind, active);
+            sel.appendChild(stale);
+            sel.value = active;
         }
     }
-    function updateLoadMoreBtn() {
-        const btn = $("ses-loadmore");
-        if (!btn) return;
-        btn.hidden = !(sessionsCache.length < sesTotal);
+    function updateFacetOptions(d) {
+        fillFacet("ses-protocol", Array.isArray(d.protocols) ? d.protocols : [], t("ses.filter_all"), "protocol");
+        fillFacet("ses-client", Array.isArray(d.clients) ? d.clients : [], t("ses.filter_all_clients"), "client");
+    }
+    function hasActiveFilters() {
+        const q = (($("ses-search") && $("ses-search").value) || "").trim();
+        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state"));
+    }
+    function updatePager() {
+        const prev = $("ses-prev");
+        const next = $("ses-next");
+        if (prev) prev.disabled = sesPage <= 1;
+        if (next) next.disabled = sesPage >= sesPages;
+        const label = $("ses-page-label");
+        if (label) label.textContent = t("ses.page_label", { page: sesPage, pages: sesPages });
+    }
+    async function goToSessionPage(page) {
+        const target = Math.min(Math.max(1, page), sesPages);
+        if (target === sesPage) return true;
+        const prev = $("ses-prev");
+        const next = $("ses-next");
+        if (prev) busy(prev, true);
+        if (next) busy(next, true);
+        try {
+            return await refreshSessions(true, target);
+        } finally {
+            if (prev) busy(prev, false);
+            if (next) busy(next, false);
+            updatePager();
+        }
+    }
+    function resetSessionFilters() {
+        const search = $("ses-search");
+        if (search) search.value = "";
+        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
+        return refreshSessions(false, 1);
     }
     function renderSessionTable() {
         const rows = sessionsCache;
-        $("ses-count").textContent = t("ses.count", { count: sesTotal });
+        $("ses-count").textContent = hasActiveFilters()
+            ? t("ses.filtered_count", { shown: sesTotal, total: sesUnfilteredTotal })
+            : t("ses.count", { count: sesTotal });
         const heEl = $("ses-empty-hint");
         if (heEl) {
             if (hiddenEmptyN > 0) { heEl.hidden = false; heEl.textContent = t("ses.empty_hidden", { n: hiddenEmptyN }); }
@@ -886,52 +1569,26 @@ export const WEB_CLIENT = `(function () {
     // #2489: chart geometry shared by the renderer and the brush interaction below.
     const TRAJ_W = 960, TRAJ_H = 260, TRAJ_PL = 56, TRAJ_PR = 16, TRAJ_PT = 14, TRAJ_PB = 26;
     const TRAJ_MIN_SAMPLES = 5;
-    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
-        lines = (lines || []).filter((l) => Boolean(l));
-        if (!lines.length) return "";
-        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
-        const iw = W - PL - PR, ih = H - PT - PB;
-        let maxY = 0;
-        lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
-        if (win && win > maxY) maxY = win * 1.05;
-        if (maxY <= 0) maxY = 1;
-        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
-        const y = (v) => PT + ih - (Math.max(0, v) / maxY) * ih;
-        const dt = (ms) => fmtDT(ms);
-        let grid = "", ticks = "";
-        for (let g = 0; g <= 4; g++) {
-            const v = (maxY / 4) * g;
-            const yy = y(v);
-            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
-            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + fmtW(v) + "</text>";
-        }
-        let area = "M" + x(0).toFixed(1) + "," + y(lines[0].input || 0).toFixed(1);
-        let stroke = "";
-        lines.forEach((l, i) => {
-            area += " L" + x(i).toFixed(1) + "," + y(l.cached || 0).toFixed(1);
-            stroke += (i === 0 ? "M" : "L") + x(i).toFixed(1) + "," + y(l.input || 0).toFixed(1) + " ";
-        });
-        area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
-        // Cache-gap causes: color each sample's un-cached band (input − cached)
-        // by its most likely cause so gaps on the chart explain themselves.
-        // #2929: mirror the ledger's fold cold-tail window — a fold owns the
-        // first sample after it AND the cold continuation (hit < 85%) up to 4
-        // samples, closing on the first warm line. Ledger lines carry foldSeq
-        // directly; the fold-between-times heuristic stays as the opener and
-        // for pre-#2929 ledgers whose lines have no foldSeq. The tail counter
-        // arms ONLY on that opener path: foldSeq-stamped lines are the
-        // ledger's own attribution and must not re-arm, or the chart keeps
-        // coloring comp up to 4 lines past the ledger retiring the window.
+    // #3484: per-sample miss-cause palette + labels shared by the trajectory gap bands
+    // (#2929) and the hit-rate line markers — one definition so both charts paint the
+    // same bucket membership the economics card aggregates.
+    const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
+    const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
+    // #2929/#3484: per-sample causes follow the LEDGER's authoritative attribution
+    // (foldSeq / seam / prov), not a parallel heuristic — the charts paint the same
+    // bucket membership the economics card aggregates. The gap heuristic remains only
+    // as the legacy fallback for old ledgers whose lines carry no attribution fields.
+    // The fold cold-tail window mirrors the ledger's own: a fold owns the first sample
+    // after it AND the cold continuation (hit < 85%) up to 4 samples, closing on the
+    // first warm line. Ledger lines carry foldSeq directly; the fold-between-times
+    // heuristic stays as the opener and for pre-#2929 ledgers without foldSeq. The
+    // tail counter arms ONLY on that opener path: foldSeq-stamped lines are the
+    // ledger's own attribution and must not re-arm, or the chart keeps coloring comp
+    // up to 4 lines past the ledger retiring the window.
+    function classifyLineCauses(lines, folds) {
         const GAP_MS = 600_000;
-        // #2929: per-sample causes follow the LEDGER's authoritative attribution
-        // (foldSeq / seam / prov), not a parallel heuristic — the chart paints
-        // the same bucket membership the economics card aggregates. The gap
-        // heuristic remains only as the legacy fallback for old ledgers whose
-        // lines carry no attribution fields.
-        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
-        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
         let foldTailClaims = 0;
-        const causes = lines.map((l, i) => {
+        return lines.map((l, i) => {
             if (i === 0) return !(l.cached || 0) ? "cold" : "new";
             const p = lines[i - 1];
             const missed = (l.input || 0) - (l.cached || 0);
@@ -961,6 +1618,102 @@ export const WEB_CLIENT = `(function () {
             if (l.foldSeq == null && l.seam === undefined && l.prov === undefined && (l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "rest";
             return "new";
         });
+    }
+    // #2489/#3484: vertical event marks shared by both detail charts. Folds stay
+    // dashed red, seams solid red (#1609 visual language); burst-folds share
+    // (near-)identical timestamps and thus the same pixel — merge them into one
+    // marker per pixel-bucket so stacked marks don't ghost into doubled lines.
+    function foldMarkLines(folds, lines, x, PT, ih) {
+        let foldMarks = "";
+        const foldBuckets = [];
+        (folds || []).forEach((f) => {
+            let idx = -1;
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
+            if (idx < 0) idx = lines.length - 1;
+            const fx = x(idx);
+            const bk = foldBuckets.find((b) => Math.abs(b.fx - fx) <= 1.5);
+            if (bk) bk.items.push(f); else foldBuckets.push({ fx, items: [f] });
+        });
+        foldBuckets.forEach((bk) => {
+            const n = bk.items.length;
+            const seqs = bk.items.map((m) => m.seq != null ? "#" + m.seq : "").filter(Boolean).slice(0, 5).join("·");
+            foldMarks += '<line x1="' + bk.fx.toFixed(1) + '" y1="' + PT + '" x2="' + bk.fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
+                + t("det.fold_short") + (n > 1 ? " ×" + n : "") + (seqs ? " " + seqs + (bk.items.length > 5 ? "…" : "") + " · " : " ") + fmtDT(bk.items[0].at) + " · " + fmtW(bk.items.reduce((a, m) => a + (m.S || 0), 0)) + "</title></line>";
+        });
+        return foldMarks;
+    }
+    // #1609: cache-seam suspects (#1606) get SOLID red marks at the first sample at/after
+    // the divergence time — folds stay dashed, so both read in the same visual language.
+    function seamMarkLines(seamEvents, lines, x, PT, ih) {
+        let seamMarks = "";
+        (seamEvents || []).forEach((ev) => {
+            if (!ev || !(ev.at > 0)) return;
+            let idx = -1;
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= ev.at) { idx = i; break; } }
+            if (idx < 0) idx = lines.length - 1;
+            const fx = x(idx);
+            const hit = typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) : "?";
+            const lcp = fmtB(ev.lcpBytes || 0);
+            const msg = ev.msgIndex != null ? ev.msgIndex : "?";
+            const prev = ev.prevMsgs != null ? ev.prevMsgs : "?";
+            const cur = ev.curMsgs != null ? ev.curMsgs : "?";
+            seamMarks += '<line x1="' + fx.toFixed(1) + '" y1="' + PT + '" x2="' + fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.8"><title>'
+                + t("det.seam_mark_tip", { seq: ev.seq != null ? ev.seq : "?", at: fmtDT(ev.at), hit, lcp, msg, prev, cur }) + "</title></line>";
+        });
+        return seamMarks;
+    }
+    // #2929/#3484: pixel-driven seq ticks shared by both detail charts — every band must map
+    // to a visible index, not "somewhere between 5 and 10". Thinning is PIXEL-driven, not
+    // count-driven: real sessions carry hundreds/thousands of samples (~0.4px/sample), where
+    // any flat count step either mosaics the axis or drops to two naked numbers. Vertical
+    // (rotated) ticks reclaim the unused Y range; hold a constant ≥24px HORIZONTAL pitch.
+    // NO Math.max(barW,1) floor — that clamps sub-pixel bars UP to 1 and silently disables
+    // thinning exactly on the dense sessions this exists for.
+    function seqTickLines(lines, x, W, H, PL, PR) {
+        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
+        const tStep = Math.max(1, Math.ceil(24 / barW));
+        const xtArr = [];
+        for (let i = lines.length - 1; i >= 0; i -= tStep) {
+            const l = lines[i];
+            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
+        }
+        const xt = xtArr.join("");
+        const xtTime =
+            (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[0].at) + "</text>" : "")
+            + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[lines.length - 1].at) + "</text>" : "");
+        return xt + xtTime;
+    }
+    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
+        lines = (lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return "";
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        let maxY = 0;
+        lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
+        if (win && win > maxY) maxY = win * 1.05;
+        if (maxY <= 0) maxY = 1;
+        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
+        const y = (v) => PT + ih - (Math.max(0, v) / maxY) * ih;
+        const dt = (ms) => fmtDT(ms);
+        let grid = "", ticks = "";
+        for (let g = 0; g <= 4; g++) {
+            const v = (maxY / 4) * g;
+            const yy = y(v);
+            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
+            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + fmtW(v) + "</text>";
+        }
+        let area = "M" + x(0).toFixed(1) + "," + y(lines[0].input || 0).toFixed(1);
+        let stroke = "";
+        lines.forEach((l, i) => {
+            area += " L" + x(i).toFixed(1) + "," + y(l.cached || 0).toFixed(1);
+            stroke += (i === 0 ? "M" : "L") + x(i).toFixed(1) + "," + y(l.input || 0).toFixed(1) + " ";
+        });
+        area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
+        // Cache-gap causes: color each sample's un-cached band (input − cached)
+        // by its most likely cause so gaps on the chart explain themselves.
+        // Classification lives in classifyLineCauses (#2929/#3484) — shared with
+        // the hit-rate line markers so both charts name the same buckets.
+        const causes = classifyLineCauses(lines, folds);
         let bands = "", hovers = "";
         const swSeg = lines.length === 1 ? iw : iw / (lines.length - 1);
         lines.forEach((l, i) => {
@@ -980,41 +1733,8 @@ export const WEB_CLIENT = `(function () {
                 + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitPctLine
                 + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
         });
-        let foldMarks = "";
-        // Burst-folds share (near-)identical timestamps and thus the same pixel — merge them
-        // into one marker per pixel-bucket so stacked marks don't ghost into doubled lines.
-        const foldBuckets = [];
-        (folds || []).forEach((f) => {
-            let idx = -1;
-            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
-            if (idx < 0) idx = lines.length - 1;
-            const fx = x(idx);
-            const bk = foldBuckets.find((b) => Math.abs(b.fx - fx) <= 1.5);
-            if (bk) bk.items.push(f); else foldBuckets.push({ fx, items: [f] });
-        });
-        foldBuckets.forEach((bk) => {
-            const n = bk.items.length;
-            const seqs = bk.items.map((m) => m.seq != null ? "#" + m.seq : "").filter(Boolean).slice(0, 5).join("·");
-            foldMarks += '<line x1="' + bk.fx.toFixed(1) + '" y1="' + PT + '" x2="' + bk.fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
-                + t("det.fold_short") + (n > 1 ? " ×" + n : "") + (seqs ? " " + seqs + (bk.items.length > 5 ? "…" : "") + " · " : " ") + dt(bk.items[0].at) + " · " + fmtW(bk.items.reduce((a, m) => a + (m.S || 0), 0)) + "</title></line>";
-        });
-        // #1609: cache-seam suspects (#1606) get SOLID red marks at the first sample at/after
-        // the divergence time — folds stay dashed, so both read in the same visual language.
-        let seamMarks = "";
-        (seamEvents || []).forEach((ev) => {
-            if (!ev || !(ev.at > 0)) return;
-            let idx = -1;
-            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= ev.at) { idx = i; break; } }
-            if (idx < 0) idx = lines.length - 1;
-            const fx = x(idx);
-            const hit = typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) : "?";
-            const lcp = fmtB(ev.lcpBytes || 0);
-            const msg = ev.msgIndex != null ? ev.msgIndex : "?";
-            const prev = ev.prevMsgs != null ? ev.prevMsgs : "?";
-            const cur = ev.curMsgs != null ? ev.curMsgs : "?";
-            seamMarks += '<line x1="' + fx.toFixed(1) + '" y1="' + PT + '" x2="' + fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.8"><title>'
-                + t("det.seam_mark_tip", { seq: ev.seq != null ? ev.seq : "?", at: dt(ev.at), hit, lcp, msg, prev, cur }) + "</title></line>";
-        });
+        const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
+        const seamMarks = seamMarkLines(seamEvents, lines, x, PT, ih);
         let ceiling = "";
         if (win && win > 0) {
             const yy = y(win);
@@ -1036,32 +1756,69 @@ export const WEB_CLIENT = `(function () {
             baseline = '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="#8b949e" stroke-width="1" stroke-dasharray="2 4"/>'
                 + '<text x="' + PL + '" y="' + Math.max(10, yy - 4).toFixed(1) + '" font-size="9.5" fill="#8b949e">' + t(baseMeasured ? "det.legend_base" : "det.legend_base_est") + " " + fmtW(baseVal) + "</text>";
         }
-        // #2929: per-sample seq labels — every band must map to a visible
-        // index, not "somewhere between 5 and 10". Thinning is PIXEL-driven,
-        // not count-driven: real sessions carry hundreds/thousands of samples
-        // (~0.4px/sample), where any flat count step either mosaics the axis
-        // or drops to two naked numbers. Vertical (rotated) ticks reclaim the
-        // unused Y range; hold a constant ≥24px HORIZONTAL pitch.
-        // (#2929 cont.) NO Math.max(barW,1) here — that floor clamps
-        // sub-pixel bars UP to 1 and silently disables thinning exactly on
-        // the dense sessions this exists for.
-        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
-        const tStep = Math.max(1, Math.ceil(24 / barW));
-        const xtArr = [];
-        for (let i = lines.length - 1; i >= 0; i -= tStep) {
-            const l = lines[i];
-            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
-        }
-        const xt = xtArr.join("");
-        const xtTime =
-            (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + dt(lines[0].at) + "</text>" : "")
-            + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + dt(lines[lines.length - 1].at) + "</text>" : "");
+        const xt = seqTickLines(lines, x, W, H, PL, PR);
         return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
             + '<path d="' + area + '" fill="var(--accent)" opacity="0.18"/>'
             + bands
             + hovers
             + '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>'
-            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + xtTime + "</svg>";
+            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + "</svg>";
+    }
+    // #3484: per-request cache hit-rate line — the trend view the numeric cards lack
+    // (overview/list/card show one aggregate; this shows which rounds dipped and how far).
+    // Y axis is fixed 0–100% so drops read at a glance; non-"new" samples get a cause dot
+    // from the exact ledger-backed classification the trajectory bands paint, and the
+    // hover column names the cause. Same geometry and brush-zoom contract as trajectorySvg.
+    function hitRateSvg(lines, folds, seamEvents) {
+        lines = (lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return "";
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
+        const y = (pct) => PT + ih - (Math.max(0, Math.min(100, pct)) / 100) * ih;
+        const dt = (ms) => fmtDT(ms);
+        // Ledger lines carry hitPct; older ledgers compute it from input/cached.
+        // Zero-input samples have no defined rate — break the line there.
+        const hp = (l) => l.hitPct != null ? l.hitPct : ((l.input || 0) > 0 ? ((l.cached || 0) / l.input) * 100 : null);
+        let grid = "", ticks = "";
+        for (let g = 0; g <= 4; g++) {
+            const v = 25 * g;
+            const yy = y(v);
+            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
+            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + v + "%</text>";
+        }
+        const causes = classifyLineCauses(lines, folds);
+        let stroke = "", started = false;
+        lines.forEach((l, i) => {
+            const v = hp(l);
+            if (v == null) { started = false; return; }
+            stroke += (started ? "L" : "M") + x(i).toFixed(1) + "," + y(v).toFixed(1) + " ";
+            started = true;
+        });
+        let dots = "", hovers = "";
+        const swSeg = lines.length === 1 ? iw : iw / (lines.length - 1);
+        lines.forEach((l, i) => {
+            const c = causes[i];
+            const v = hp(l);
+            const x0 = Math.max(PL, x(i) - swSeg / 2), x1 = Math.min(W - PR, x(i) + swSeg / 2);
+            if (v != null && c !== "new") dots += '<circle cx="' + x(i).toFixed(1) + '" cy="' + y(v).toFixed(1) + '" r="2.5" fill="' + CAUSE_COLOR[c] + '"/>';
+            const hitTxt = v == null ? t("common.none") : v.toFixed(1) + "%";
+            hovers += '<rect x="' + x0.toFixed(1) + '" y="' + PT + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + ih + '" fill="transparent"><title>'
+                + (l.seq != null ? "#" + l.seq + " · " : "") + dt(l.at)
+                + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitTxt
+                + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
+        });
+        // Accent placeholder dot only when the sample carries no cause dot of its own —
+        // a 1-line cold session must keep its cold color, not an accent dot on top.
+        const singleDot = lines.length === 1 && hp(lines[0]) != null && causes[0] === "new"
+            ? '<circle cx="' + x(0).toFixed(1) + '" cy="' + y(hp(lines[0])).toFixed(1) + '" r="3" fill="var(--accent)"/>'
+            : "";
+        const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
+        const seamMarks = seamMarkLines(seamEvents, lines, x, PT, ih);
+        const xt = seqTickLines(lines, x, W, H, PL, PR);
+        return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
+            + (stroke.trim() ? '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>' : "")
+            + dots + singleDot + hovers + foldMarks + seamMarks + ticks + xt + "</svg>";
     }
     function legendItem(style, label, dashed) {
         if (dashed) return '<span><span class="dot" style="background:none;border-top:2px dashed #cf222e;height:0;border-radius:0;width:14px"></span>' + label + "</span>";
@@ -1086,147 +1843,175 @@ export const WEB_CLIENT = `(function () {
     function detailSeamActive(seam) {
         return !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
     }
-    // #2489: zoom-to-selection over the context-trajectory chart. The data is already
+    // #2489/#3484: zoom-to-selection over the detail charts. The data is already
     // client-side, so zooming re-renders the SAME renderer over a filtered slice — no
     // server round-trip, and an un-zoomed view stays byte-identical to the full render.
-    let trajState = null;   // { lines, folds, seams, win, baseIn } of the rendered detail
-    let trajRange = null;   // absolute [i0, i1] into trajState.lines, or null = full view
-    let trajDrag = null;    // in-flight brush gesture
-    function trajVisible() {
-        if (!trajState) return null;
-        const L = trajState.lines;
-        let a = 0, b = L.length - 1;
-        if (trajRange) {
-            a = Math.max(0, Math.min(L.length - 1, trajRange[0]));
-            b = Math.max(a, Math.min(L.length - 1, trajRange[1]));
-        }
-        const lines = L.slice(a, b + 1);
-        // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
-        // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
-        // the byte-parity acceptance criterion pins). Time-filtering only applies to a
-        // ZOOMED window, where a foreign mark would land on the wrong sample.
-        if (!trajRange) return { lines, folds: trajState.folds || [], seams: trajState.seams || [], offset: a };
-        const t0 = lines[0] ? (lines[0].at || 0) : 0;
-        const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
-        return {
-            lines,
-            folds: (trajState.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
-            seams: (trajState.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
-            offset: a,
-        };
-    }
-    function trajRender() {
-        const wrap = $("traj-chart");
-        const v = trajVisible();
-        if (!wrap || !v) return;
-        wrap.innerHTML = v.lines.length ? trajectorySvg(v.lines, v.folds, trajState.win, trajState.baseIn, v.seams) : "";
-        trajUpdateStatus(v);
-    }
-    function trajUpdateStatus(v) {
-        const st = $("traj-status");
-        if (!st) return;
-        if (!trajRange || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
-        const L = trajState.lines;
-        const a = v.offset, b = v.offset + v.lines.length - 1;
-        const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
-        const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
-        const times = v.lines.map((l) => l.at).filter(Boolean);
-        st.hidden = false;
-        st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
-            + '<button id="traj-reset" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
-        const rb = $("traj-reset");
-        if (rb) rb.addEventListener("click", () => trajSetRange(null));
-    }
-    function trajSetRange(r) {
-        trajRange = r && r[1] > r[0] ? [r[0], r[1]] : null;
-        trajRender();
-    }
-    function trajIdxFromX(x, n) {
+    // One gesture machinery serves both charts (context trajectory + cache hit rate):
+    // identical geometry and interaction; each instance supplies element ids, its
+    // state and its renderer.
+    function chartIdxFromX(x, n) {
         if (n <= 1) return 0;
         const iw = TRAJ_W - TRAJ_PL - TRAJ_PR;
         return Math.max(0, Math.min(n - 1, Math.round(((x - TRAJ_PL) / iw) * (n - 1))));
     }
-    function trajLocalX(wrap, ev) {
-        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
-        if (!r || !(r.width > 0)) return null;
-        const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
-        return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+    const chartZooms = [];   // live instances — Esc resets any zoomed chart (#2489 behavior)
+    function makeChartZoom(cfg) {
+        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg, link?: { members } }
+        const z = { range: null, drag: null, state: null, cfg };
+        z.visible = function visible() {
+            if (!z.state) return null;
+            const L = z.state.lines;
+            let a = 0, b = L.length - 1;
+            if (z.range) {
+                a = Math.max(0, Math.min(L.length - 1, z.range[0]));
+                b = Math.max(a, Math.min(L.length - 1, z.range[1]));
+            }
+            const lines = L.slice(a, b + 1);
+            // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
+            // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
+            // the byte-parity acceptance criterion pins). Time-filtering only applies to a
+            // ZOOMED window, where a foreign mark would land on the wrong sample.
+            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], offset: a };
+            const t0 = lines[0] ? (lines[0].at || 0) : 0;
+            const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
+            return {
+                lines,
+                folds: (z.state.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
+                seams: (z.state.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+                offset: a,
+            };
+        };
+        function updateStatus(v) {
+            const st = $(cfg.statusId);
+            if (!st) return;
+            if (!z.range || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
+            const L = z.state.lines;
+            const a = v.offset, b = v.offset + v.lines.length - 1;
+            const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
+            const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
+            const times = v.lines.map((l) => l.at).filter(Boolean);
+            st.hidden = false;
+            st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
+                + '<button id="' + cfg.resetId + '" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
+            const rb = $(cfg.resetId);
+            if (rb) rb.addEventListener("click", () => z.setRange(null));
+        }
+        z.render = function render() {
+            const wrap = $(cfg.elId);
+            const v = z.visible();
+            if (!wrap || !v) return;
+            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams) : "";
+            updateStatus(v);
+        };
+        z.setRange = function setRange(r) {
+            const nr = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const same = (nr === null && z.range === null) || (nr !== null && z.range !== null && nr[0] === z.range[0] && nr[1] === z.range[1]);
+            if (same) return;
+            z.range = nr;
+            z.render();
+            // #4317: linked charts share ONE brush window — a selection or reset on either
+            // re-renders its peers over the same sample indices. The length guard keeps a
+            // stale peer bound to another session's ledger out of the propagation.
+            if (cfg.link && z.state) cfg.link.members.forEach((m) => { if (m !== z && m.state && m.state.lines.length === z.state.lines.length) m.setRange(nr); });
+        };
+        function localX(wrap, ev) {
+            const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+            if (!r || !(r.width > 0)) return null;
+            const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
+            return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+        }
+        function overlayShow(wrap, xa, xb) {
+            if (!z.drag || !z.drag.overlay) return;
+            const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+            if (!r || !(r.width > 0)) return;
+            const o = z.drag.overlay;
+            o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
+            o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
+            o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
+            o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
+        }
+        function onDown(ev) {
+            if (!z.state || ev.button !== 0) return;
+            const wrap = $(cfg.elId);
+            const v = z.visible();
+            if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
+            ev.preventDefault();
+            const x0 = localX(wrap, ev);
+            if (x0 == null) return;
+            const o = document.createElement("div");
+            o.className = "chart-brush";
+            wrap.appendChild(o);
+            z.drag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
+            overlayShow(wrap, x0, x0);
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+        }
+        function onMove(ev) {
+            if (!z.drag) return;
+            const x = localX($(cfg.elId), ev);
+            if (x == null) return;
+            z.drag.cur = x;
+            overlayShow($(cfg.elId), z.drag.x0, x);
+        }
+        function onUp(ev) {
+            document.removeEventListener("mousemove", onMove);
+            document.removeEventListener("mouseup", onUp);
+            if (!z.drag) return;
+            const d0 = z.drag;
+            z.drag = null;
+            if (d0.overlay) d0.overlay.remove();
+            const x1 = localX($(cfg.elId), ev);
+            if (x1 == null) return;
+            const i0 = chartIdxFromX(Math.min(d0.x0, x1), d0.n);
+            const i1 = chartIdxFromX(Math.max(d0.x0, x1), d0.n);
+            if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
+            if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
+            z.setRange([d0.offset + i0, d0.offset + i1]);
+        }
+        z.bind = function bind(state) {
+            z.state = state && state.lines.length ? state : null;
+            z.range = null;
+            const wrap = $(cfg.elId);
+            if (!wrap || !z.state) { z.render(); return; }
+            wrap.addEventListener("mousedown", onDown);
+            wrap.addEventListener("dblclick", () => z.setRange(null));
+            z.render();
+        };
+        chartZooms.push(z);
+        if (cfg.link) cfg.link.members.push(z);
+        return z;
     }
-    function trajOverlayShow(wrap, xa, xb) {
-        if (!trajDrag || !trajDrag.overlay) return;
-        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
-        if (!r || !(r.width > 0)) return;
-        const o = trajDrag.overlay;
-        o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
-        o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
-        o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
-        o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
-    }
-    function trajOnDown(ev) {
-        if (!trajState || ev.button !== 0) return;
-        const wrap = $("traj-chart");
-        const v = trajVisible();
-        if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
-        ev.preventDefault();
-        const x0 = trajLocalX(wrap, ev);
-        if (x0 == null) return;
-        const o = document.createElement("div");
-        o.className = "chart-brush";
-        wrap.appendChild(o);
-        trajDrag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
-        trajOverlayShow(wrap, x0, x0);
-        document.addEventListener("mousemove", trajOnMove);
-        document.addEventListener("mouseup", trajOnUp);
-    }
-    function trajOnMove(ev) {
-        if (!trajDrag) return;
-        const x = trajLocalX($("traj-chart"), ev);
-        if (x == null) return;
-        trajDrag.cur = x;
-        trajOverlayShow($("traj-chart"), trajDrag.x0, x);
-    }
-    function trajOnUp(ev) {
-        document.removeEventListener("mousemove", trajOnMove);
-        document.removeEventListener("mouseup", trajOnUp);
-        if (!trajDrag) return;
-        const d0 = trajDrag;
-        trajDrag = null;
-        if (d0.overlay) d0.overlay.remove();
-        const x1 = trajLocalX($("traj-chart"), ev);
-        if (x1 == null) return;
-        const i0 = trajIdxFromX(Math.min(d0.x0, x1), d0.n);
-        const i1 = trajIdxFromX(Math.max(d0.x0, x1), d0.n);
-        if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
-        if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
-        trajSetRange([d0.offset + i0, d0.offset + i1]);
-    }
+    const trajAux = { win: 0, baseIn: 0 };
+    // #4317: both detail charts plot the SAME request timeline in two projections —
+    // one shared brush window keeps them in lockstep (select on either, both follow).
+    const detailChartLink = { members: [] };
+    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
+    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", link: detailChartLink, render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
     function bindTrajectoryBrush(d) {
-        trajState = null;
-        trajRange = null;
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
-        if (!lines.length) return;
         const seam = detailSeam(ledger);
-        trajState = {
-            lines,
-            folds: ledger.folds || [],
-            seams: detailSeamActive(seam) && seam ? seam.events : [],
-            win: d.contextWindow || 0,
-            baseIn: d.systemPromptTokens || 0,
-        };
-        const wrap = $("traj-chart");
-        if (!wrap) return;
-        wrap.addEventListener("mousedown", trajOnDown);
-        wrap.addEventListener("dblclick", () => trajSetRange(null));
-        trajRender();
+        trajAux.win = d.contextWindow || 0;
+        trajAux.baseIn = d.systemPromptTokens || 0;
+        trajZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
+    }
+    function bindHitRateChart(d) {
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        const seam = detailSeam(ledger);
+        hitZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
     }
     window.bili_trajSvg = trajectorySvg;
-    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: trajIdxFromX, visible: () => trajVisible(), range: () => trajRange };
+    window.bili_hitSvg = hitRateSvg;
+    window.bili_causes = classifyLineCauses;
+    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
+    window.bili_hitZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => hitZoom.visible(), range: () => hitZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
         const lead = String(b.summary || "").split("\\n").map((s) => s.trim()).find(Boolean) || "";
-        return lead.length > 48 ? lead.slice(0, 48) + "…" : lead || b.blockId;
+        const plain = lead.replace(/^#{1,6}\\s*/, "").replace(/^[*>-]+\\s*/, "");
+        return plain.length > 48 ? plain.slice(0, 48) + "…" : plain || b.blockId;
     }
     function detailBadges(d) {
         const live = d.live && !d.restored;
@@ -1376,11 +2161,355 @@ export const WEB_CLIENT = `(function () {
         return html.join("");
     }
     window.bili_renderHandoffMd = renderHandoffMd;
+    // #3917: compression-structure tree — nested by parentBlockId (an active
+    // block's children are the blocks it folded); roots are blocks whose parent
+    // is no longer folded. Nodes carry the kernel's own accounting:
+    // compressedTokens (what the block absorbed), summaryTokens (what replaced
+    // it), summaryBytes (the rendered artifact) and the mNNNNN span it covers.
+    function blockTreeStats(blocks) {
+        const tiers = {};
+        let active = 0;
+        let coverTokens = 0;
+        let summaryTokens = 0;
+        blocks.forEach(function (b) {
+            const tier = Number(b.tier) || 1;
+            tiers[tier] = (tiers[tier] || 0) + 1;
+            if (b.active) active += 1;
+            coverTokens += Number(b.compressedTokens) || 0;
+            summaryTokens += Number(b.summaryTokens) || 0;
+        });
+        return { tiers: tiers, active: active, coverTokens: coverTokens, summaryTokens: summaryTokens };
+    }
+    function blockTreeShape(blocks) {
+        const byId = {};
+        blocks.forEach(function (b) { byId[b.blockId] = b; });
+        const children = {};
+        const roots = [];
+        blocks.forEach(function (b) {
+            const pid = b.parentBlockId;
+            if (pid && byId[pid] && pid !== b.blockId) (children[pid] = children[pid] || []).push(b);
+            else roots.push(b);
+        });
+        return { children: children, roots: roots };
+    }
+    // #3917: at-a-glance view of the same folds. Layered (roots first, each fold
+    // one level beyond the block that absorbed it), edges drawn as beziers — a
+    // knowledge-graph-ish shape for reading structure, while the list view stays
+    // the place to read concrete messages. Modest trees are scaled down to fit
+    // the card; pathologically WIDE ones used to be scaled the same way and
+    // became sub-pixel smears (a 161-leaf session fits ≈ 0.05 ⇒ 6px boxes), so
+    // those rotate: depth runs along x, sibling stacks pile along y at full node
+    // size (#4173).
+    const GRAPH_NODE_W = 118;
+    const GRAPH_NODE_H = 36;
+    const GRAPH_GAP_X = 16;
+    const GRAPH_LEVEL_H = 84;
+    const GRAPH_FIT_W = 1120;
+    // #4173 review: the in-page live map draws with tighter nodes so long
+    // sessions stay one readable drawing; every other call site keeps the
+    // original full-size metrics byte-for-byte.
+    const MAP_NODE_W = 92;
+    const MAP_NODE_H = 30;
+    const MAP_GAP_X = 8;
+    const MAP_LEVEL_H = 46;
+    const FULL_METRICS = { w: GRAPH_NODE_W, h: GRAPH_NODE_H, gx: GRAPH_GAP_X, lh: GRAPH_LEVEL_H };
+    const MAP_METRICS = { w: MAP_NODE_W, h: MAP_NODE_H, gx: MAP_GAP_X, lh: MAP_LEVEL_H };
+    function blockGraphLayout(blocks, m) {
+        m = m || FULL_METRICS;
+        const shape = blockTreeShape(blocks);
+        const nodes = [];
+        const links = [];
+        let cursor = 0;
+        let maxDepth = 0;
+        const place = function (b, depth) {
+            if (depth > 40) return null;
+            const kids = shape.children[b.blockId] || [];
+            const childNodes = [];
+            kids.forEach(function (k) {
+                const kid = place(k, depth + 1);
+                if (kid) childNodes.push(kid);
+            });
+            let x;
+            if (!childNodes.length) {
+                x = cursor;
+                cursor += m.w + m.gx;
+            } else {
+                x = (childNodes[0].x + childNodes[childNodes.length - 1].x) / 2;
+            }
+            const node = { b: b, x: x, y: depth * m.lh };
+            nodes.push(node);
+            if (depth > maxDepth) maxDepth = depth;
+            childNodes.forEach(function (c) { links.push([node, c]); });
+            return node;
+        };
+        const roots = shape.roots.length ? shape.roots : blocks;
+        roots.forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
+        return { nodes: nodes, links: links, width: cursor - m.gx, height: maxDepth * m.lh + m.h };
+    }
+    // #4173: vertical mirror of blockGraphLayout — depth is the x-axis and the
+    // shared cursor packs sibling stacks along y. Chosen when a tree is far
+    // wider than it is tall: rotating puts the long dimension on the one axis
+    // the page scrolls, keeping every box at natural size (the in-page map's
+    // tighter metrics arrive from the caller).
+    function blockGraphLayoutVertical(blocks, m) {
+        m = m || FULL_METRICS;
+        const shape = blockTreeShape(blocks);
+        const nodes = [];
+        const links = [];
+        let cursor = 0;
+        let maxDepth = 0;
+        const place = function (b, depth) {
+            if (depth > 40) return null;
+            const kids = shape.children[b.blockId] || [];
+            const childNodes = [];
+            kids.forEach(function (k) {
+                const kid = place(k, depth + 1);
+                if (kid) childNodes.push(kid);
+            });
+            let y;
+            if (!childNodes.length) {
+                y = cursor;
+                cursor += m.h + m.gx;
+            } else {
+                y = (childNodes[0].y + childNodes[childNodes.length - 1].y) / 2;
+            }
+            const node = { b: b, x: depth * (m.w + m.gx), y: y };
+            nodes.push(node);
+            if (depth > maxDepth) maxDepth = depth;
+            childNodes.forEach(function (c) { links.push([node, c]); });
+            return node;
+        };
+        const roots = shape.roots.length ? shape.roots : blocks;
+        roots.forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
+        return { nodes: nodes, links: links, width: maxDepth * (m.w + m.gx) + m.w, height: cursor - m.gx };
+    }
+    // #4173: orientation shared by the full graph and the in-pane tree map —
+    // flat unless the tree overflows the card AND rotation shortens the long
+    // dimension; small trees stay byte-identical to the original rendering.
+    function graphLayouts(blocks, m) {
+        const lh = blockGraphLayout(blocks, m);
+        const lv = lh.width > GRAPH_FIT_W ? blockGraphLayoutVertical(blocks, m) : null;
+        const vertical = !!lv && lv.height < lh.width;
+        return { layout: vertical ? lv : lh, vertical: vertical };
+    }
+    // Bezier for one parent→child edge in either orientation — shared by every
+    // #4173 drawing (static graph and live in-pane map) so they always agree.
+    function graphEdgePath(l, pad, vertical, m) {
+        m = m || FULL_METRICS;
+        if (vertical) {
+            const x1 = l[0].x + pad + m.w;
+            const y1 = l[0].y + pad + m.h / 2;
+            const x2 = l[1].x + pad;
+            const y2 = l[1].y + pad + m.h / 2;
+            const mx = (x1 + x2) / 2;
+            return "M" + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2;
+        }
+        const x1 = l[0].x + pad + m.w / 2;
+        const y1 = l[0].y + pad + m.h;
+        const x2 = l[1].x + pad + m.w / 2;
+        const y2 = l[1].y + pad;
+        const my = (y1 + y2) / 2;
+        return "M" + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2;
+    }
+    // #4173: "wrapped" switches this same labeled drawing into in-pane map mode:
+    // it carries its NATURAL pixel size (width/height attrs) so the pane can
+    // show it 1:1 inside a scrollable viewport; zoom resizes the wrapping
+    // .tm-inner box (the svg fills it via CSS), which keeps scroll ranges
+    // honest while the browser scales the drawing uniformly.
+    function buildGraphSvg(blocks, wrapped, m) {
+        m = m || FULL_METRICS;
+        const g = graphLayouts(blocks, m);
+        const layout = g.layout;
+        const vertical = g.vertical;
+        if (!layout.nodes.length) return { html: "", vertical: false, width: 0, height: 0 };
+        const pad = 14;
+        const W = Math.ceil(layout.width + pad * 2);
+        const H = Math.ceil(layout.height + pad * 2);
+        const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
+        const parts = [];
+        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + (wrapped ? " tm-svg" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + (wrapped ? W : Math.round(W * fit)) + '" height="' + (wrapped ? H : Math.round(H * fit)) + '" preserveAspectRatio="xMidYMid meet" role="img">');
+        if (wrapped) parts.push('<g class="tm-g">');
+        // compact rows carry the two text lines closer together
+        const idY = m.h >= 36 ? 15 : 12;
+        const metaY = m.h >= 36 ? 28 : 22;
+        layout.links.forEach(function (l) {
+            parts.push('<path class="g-edge" d="' + graphEdgePath(l, pad, vertical, m) + '" fill="none"/>');
+        });
+        layout.nodes.forEach(function (n) {
+            const b = n.b;
+            const tierNum = Number(b.tier) || 1;
+            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
+            const ratio = b.compressedTokens > 0 && b.summaryTokens > 0 ? (100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%" : "";
+            const meta = fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
+            // #4173 review: the message span (mXXXX-mYYYY) belongs on the node,
+            // not only in the list row; tokens stay in the hover tooltip.
+            const rr = refRangeOf(b);
+            parts.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
+                + "<title>" + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + meta + " \u00b7 " + blockTopic(b)) + "</title>"
+                + '<rect width="' + m.w + '" height="' + m.h + '" rx="9"></rect>'
+                + '<text class="g-id" x="10" y="' + idY + '">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum) + "</text>"
+                + '<text class="g-meta" x="10" y="' + metaY + '">' + escapeHtml(rr || meta) + "</text>"
+                + "</g>");
+        });
+        if (wrapped) parts.push("</g>");
+        parts.push("</svg>");
+        return { html: parts.join(""), vertical: vertical, width: W, height: H };
+    }
+    // #4173: the scrollable inner frame of the in-pane tree map — sized at the
+    // drawing's natural pixels; treeMapApply() resizes it when zooming.
+    function treeMapInnerHtml(graph) {
+        if (!graph.html) return "";
+        return '<div class="tm-inner" data-nw="' + graph.width + '" data-nh="' + graph.height + '" style="width:' + graph.width + 'px;height:' + graph.height + 'px;">' + graph.html + "</div>";
+    }
+    function treeMapApply(view) {
+        const inner = view.querySelector(".tm-inner");
+        if (!inner) return;
+        const k = view.__vm ? view.__vm.k : 1;
+        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
+        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
+        inner.style.width = (nw * k) + "px";
+        inner.style.height = (nh * k) + "px";
+    }
+    function treeMapFit(view) {
+        const inner = view.querySelector(".tm-inner");
+        if (!inner) return;
+        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
+        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
+        if (!nw || !nh) return;
+        // #4173 review: the map flows with the page, so Fit shrinks the whole
+        // tree into roughly the current viewport and centers it there.
+        const w = Math.max(320, document.documentElement.clientWidth - 120);
+        const h = Math.max(320, window.innerHeight - 180);
+        view.__vm = { k: Math.min(1, Math.min(w / nw, h / nh) * 0.98) };
+        treeMapApply(view);
+        const r = inner.getBoundingClientRect();
+        window.scrollBy(0, (r.top + (nh * view.__vm.k) / 2) - window.innerHeight / 2);
+    }
+    function refRangeOf(b) {
+        if (!b.startRef) return "";
+        return b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : String(b.startRef);
+    }
+    function blockNodeHtml(b, shape, idx, depth) {
+        const kids = shape.children[b.blockId] || [];
+        const tierNum = Number(b.tier) || 1;
+        // #4173 review: rows start COLLAPSED — a 200-block session must not
+        // open as a wall of expanded cards. The tree-map click opens the
+        // target row for you; <summary> expands any row on demand.
+        const openAttr = "";
+        const badge = b.active
+            ? '<span class="badge ok">' + t("det.block_active") + "</span>"
+            : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
+        const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
+        const refRange = refRangeOf(b);
+        const meta = ["T" + tierNum, fmtW(b.compressedTokens) + " → " + fmtW(b.summaryTokens)];
+        if (b.compressedTokens > 0 && b.summaryTokens > 0) meta.push((100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%");
+        meta.push(fmtB(b.summaryBytes));
+        if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+        if (refRange) meta.push(refRange);
+        meta.push(timeAgo(b.createdAt));
+        // #4173 review: long summaries open as five clamped lines + a show-all
+        // button. Closed <details> rows have no layout, so whether the clamp
+        // actually cut anything is measured once on first expand (below).
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + '</div>'
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
+        const bid = escapeHtml(b.blockId);
+        let html = '<details class="block-item block-node tier-' + (tierNum > 3 ? "n" : String(tierNum)) + '" data-bid="' + bid + '"' + openAttr + ">"
+            + '<summary><span class="bid">' + bid + "</span>" + badge + extBadge
+            + '<span class="topic">' + escapeHtml(blockTopic(b)) + "</span>"
+            + '<span class="meta">' + escapeHtml(meta.join(" · ")) + "</span>"
+            + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button>"
+            + "</summary>"
+            + '<div class="body md">' + bodyInner + "</div>"
+            + '<div class="blk-content-bar">'
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
+            + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
+            + "</div>"
+            + '<div class="blk-content" id="blk-content-' + bid + '" hidden></div>';
+        // #3917: the messages this block folded, one leaf per mNNNNN ref. The
+        // preview is all the tree needs; the bytes arrive on the first click
+        // (the lazy endpoint), so a wide session never ships its transcript.
+        const msgs = b.directMessages || [];
+        if (msgs.length) {
+            html += '<ul class="blk-msgs">';
+            msgs.forEach(function (m) {
+                if (m.missing) {
+                    html += '<li><div class="msg-row missing"><span class="mref mono">' + escapeHtml(m.ref) + '</span><span class="mprev">' + t("det.tree_msg_gone") + "</span></div></li>";
+                    return;
+                }
+                const tags = m.toolName ? '<span class="badge">' + escapeHtml(m.toolName) + "</span>" : "";
+                html += '<li><button class="msg-row" data-ref="' + escapeHtml(m.ref) + '">'
+                    + '<span class="mref mono">' + escapeHtml(m.ref) + "</span>"
+                    + '<span class="badge">' + escapeHtml(m.role || "") + "</span>" + tags
+                    + '<span class="mprev">' + escapeHtml(m.preview || "") + "</span></button>"
+                    + '<div class="msg-body" hidden></div></li>';
+            });
+            html += "</ul>";
+        } else if (Number(b.directMessageCount) > 0) {
+            html += '<div class="dim small" style="margin:2px 0 8px 24px">' + t("det.tree_msgs_unavailable") + "</div>";
+        }
+        if (depth < 32) kids.forEach(function (k) { html += blockNodeHtml(k, shape, idx, depth + 1); });
+        return html + "</details>";
+    }
+    function buildTreePane(blocks) {
+        const parts = [];
+        parts.push('<div class="card"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: blocks.filter(function (b) { return b.active; }).length }) + '</span></div><div class="card-b">');
+        if (!blocks.length) {
+            parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div></div></div>");
+            return parts.join("");
+        }
+        const stats = blockTreeStats(blocks);
+        const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
+    parts.push('<div class="tree-stats mono small">'
+            + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
+            + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
+            + "<span>" + escapeHtml(t("det.tree_split", { x: fmtW(stats.coverTokens), y: fmtW(stats.summaryTokens), p: stats.coverTokens > 0 ? (100 * stats.summaryTokens / stats.coverTokens).toFixed(1) + "%" : t("common.none") })) + "</span>"
+            + (tierBits.length ? "<span>" + escapeHtml(tierBits.join(" · ")) + "</span>" : "")
+            + "</div>");
+        parts.push('<div class="tree-actions"><button id="blocks-copy" class="btn sm">' + t("det.blocks_copy_md") + '</button><button id="blocks-dl" class="btn sm">' + t("det.blocks_download") + "</button></div>");
+        const shape = blockTreeShape(blocks);
+        const idxOf = {};
+        blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
+        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + '</button><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm" hidden>' + t("det.tree_map_fit") + "</button></div>");
+        const mapGraph = buildGraphSvg(blocks, true, MAP_METRICS);
+        // #4173 review: the live map comes FIRST (总揽全局), the full block
+        // list stacks below it — with the old order the map ended up under a
+        // screen of detail rows.
+        parts.push('<div class="tm-view" id="tree-graph" hidden>' + treeMapInnerHtml(mapGraph)
+            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_legend") + '</div></div>');
+        parts.push('<div class="tree-list" id="tree-list">');
+        parts.push('<div class="block-tree">');
+        const rootBlocks = shape.roots.length ? shape.roots : blocks;
+        rootBlocks.forEach(function (b) { parts.push(blockNodeHtml(b, shape, idxOf[b.blockId] || 0, 0)); });
+        parts.push("</div>");
+        parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
+        parts.push("</div>");
+        parts.push("</div></div>");
+        return parts.join("");
+    }
     function buildDetailHtml(d) {
         const parts = [];
+        // Hoisted above the page head so the tab count badge can share the same
+        // array (originally declared further down, inside the tree pane).
+        const blocks = d.blockDetails || [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
         parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
+        // #3917: the detail page splits into panes — overview (identity, usage,
+        // cache economics), the compression tree, and the handoff document. The
+        // blocks card moved out of the overview into its own tier-tree pane.
+        parts.push('<div class="det-tabs" id="det-tabs">'
+            + '<button class="det-tab active" data-pane="overview">' + t("det.tab_overview") + "</button>"
+            + '<button class="det-tab" data-pane="blocks">' + t("det.tab_blocks") + (blocks.length ? ' <span class="hint">' + blocks.length + "</span>" : "") + "</button>"
+            + '<button class="det-tab" data-pane="handoff">' + t("det.tab_handoff") + "</button>"
+            + "</div>");
+        parts.push('<div class="det-pane" data-pane="overview">');
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.identity") + '</span></div><div class="card-b"><dl class="kv">');
         // Full title wraps in place, is hoverable (title attr) and carries a copy button.
         parts.push('<div class="k">' + t("common.title") + '</div><div class="v" title="' + escapeHtml(d.title || "") + '">' + (d.title ? escapeHtml(d.title) + ' <button id="title-copy" class="btn sm">' + t("common.copy") + "</button>" : '<span class="faint">' + t("common.none") + "</span>") + "</div>");
@@ -1390,6 +2519,7 @@ export const WEB_CLIENT = `(function () {
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
         if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
+if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + (d.keepalive.cadenceMs >= 60_000 ? Math.round(d.keepalive.cadenceMs / 60_000) + "min" : Math.round(d.keepalive.cadenceMs / 1000) + "s") + " · " + t("det.keepalive_pings") + " " + d.keepalive.pingCount + (d.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(d.keepalive.lastHitAt).toISOString()) : ""), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
         // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render
@@ -1467,6 +2597,7 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxMark + ": " + fmtW(ctxVal) + "</div>");
         }
         if ((d.retrieveCalls || 0) > 0) parts.push('<div class="dim small" style="margin-top:10px">' + t("det.ccr") + ' · <span class="mono">' + t("det.ccr_detail", { calls: d.retrieveCalls, hits: d.retrieveHits || 0, misses: d.retrieveMisses || 0 }) + "</span></div>");
+        if ((d.wholeBlockRestores || 0) > 0 || (d.rangeRestores || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.decompress") + ' · <span class="mono">' + t("det.decompress_detail", { blocks: d.wholeBlockRestores || 0, precise: d.wholeBlockRestoresPreciseAvailable || 0, ranges: d.rangeRestores || 0 }) + "</span></div>");
         if ((d.storedBytes || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.store") + ' · <span class="mono">' + fmtB(d.storedBytes) + ((d.storeBytesSaved || 0) > 0 ? " / " + fmtB(d.storeBytesSaved) + " " + t("common.saved") : "") + "</span></div>");
         parts.push("</div></div>");
         const ledger = d.ledger || {};
@@ -1480,7 +2611,7 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div class="chart-empty">' + t("det.trajectory_empty") + "</div>");
         } else {
             parts.push('<div class="chart-status" id="traj-status" hidden></div>');
-            // #2489: the wrap starts empty — bindTrajectoryBrush() → trajRender() fills it,
+            // #2489: the wrap starts empty — bindTrajectoryBrush() fills it on bind,
             // so every chart state (full and zoomed) comes from the single render path.
             parts.push('<div class="chart-wrap" id="traj-chart"></div>');
             parts.push('<div class="chart-legend">');
@@ -1511,6 +2642,29 @@ export const WEB_CLIENT = `(function () {
                 parts.push(legendItem("background:#9aa1a8", t("det.cause_ttl")));
             }
             if (d.systemPromptTokens || lines.length >= 20) parts.push(legendItem("border:1.5px solid #8b949e;background:#f2f5f7;", d.systemPromptTokens ? t("det.legend_base") : t("det.legend_base_est")));
+            parts.push("</div>");
+            parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
+            if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
+        }
+        parts.push("</div></div>");
+        // #3484: hit-rate trend — same data as the trajectory chart above, plotted as
+        // per-request hit % so dips (and their causes) read at a glance.
+        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.hitrate") + '</span><span class="hint">' + t("det.hitrate_sub") + '</span></div><div class="card-b">');
+        if (!lines.length) {
+            parts.push('<div class="chart-empty">' + t("det.hitrate_empty") + "</div>");
+        } else {
+            parts.push('<div class="chart-status" id="hit-status" hidden></div>');
+            parts.push('<div class="chart-wrap" id="hit-chart"></div>');
+            const hrCauses = classifyLineCauses(lines, ledger.folds || []);
+            const present = {};
+            hrCauses.forEach((c) => { if (c !== "new") present[c] = true; });
+            parts.push('<div class="chart-legend">');
+            parts.push(legendItem("background:var(--accent)", t("det.legend_hitline")));
+            ["comp", "cold", "seam", "pt", "ps", "rw", "ci", "rest"].forEach((c) => {
+                if (present[c]) parts.push(legendItem("background:" + CAUSE_COLOR[c], t(CAUSE_KEY[c])));
+            });
+            if ((ledger.folds || []).length > 0) parts.push(legendItem("#cf222e", t("det.legend_fold"), true));
+            if (seamActive && seam.events.length > 0) parts.push(legendItem("#cf222e", t("det.legend_seam")));
             parts.push("</div>");
             parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
@@ -1650,30 +2804,9 @@ export const WEB_CLIENT = `(function () {
             parts.push("</tbody></table></div>");
         }
         parts.push("</div></div>");
-        const blocks = d.blockDetails || [];
         // #2904: no-ceiling output-budget pin — surface at the top of the detail
         // so GUI users see WHY long turns truncate (the /acp twin).
         if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
-        const activeBlocks = blocks.filter((b) => b.active).length;
-        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: activeBlocks }) + '</span></div><div class="card-b blocks-list">');
-        if (!blocks.length) {
-            parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div>");
-        } else {
-            // #1426: copy-all / download blocks-markdown actions
-            parts.push('<div style="display:flex;gap:8px;margin-bottom:10px"><button id="blocks-copy" class="btn sm">' + t("det.blocks_copy_md") + '</button><button id="blocks-dl" class="btn sm">' + t("det.blocks_download") + "</button></div>");
-            blocks.forEach((b, i) => {
-                // #1426: expose the compressed conversation span (mNNNNN refs) when the kernel tagged it
-                const refRange = b.startRef ? (b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : b.startRef) : null;
-                // Active = still inside the current context window; inactive = archived history.
-                const badge = b.active
-                    ? '<span class="badge ok">' + t("det.block_active") + "</span>"
-                    : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
-                // External summary chain wrote the summary — mirrors /acp's "⚡ext" marker.
-                const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
-                parts.push('<details class="block-item"><summary><span class="bid">' + escapeHtml(b.blockId) + '</span>' + badge + extBadge + '<span class="topic">' + escapeHtml(blockTopic(b)) + '</span><span class="meta">T' + String(b.tier) + " · " + fmtW(b.compressedTokens) + " · " + timeAgo(b.createdAt) + (refRange ? " · " + escapeHtml(refRange) : "") + '</span><button class="btn sm blk-copy" data-bi="' + i + '" style="margin-left:auto">' + t("common.copy") + '</button></summary><div class="body md">' + renderBlockMd(b.summary || "") + "</div></details>");
-            });
-        }
-        parts.push("</div></div>");
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
@@ -1688,7 +2821,10 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div style="margin-top:10px"><button id="session-conflicts-clear" class="btn sm">' + t("det.conflicts_clear") + "</button></div>");
             parts.push("</div></div>");
         }
-        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
+        parts.push("</div>");
+        parts.push('<div class="det-pane" data-pane="blocks" hidden>' + buildTreePane(blocks) + "</div>");
+        parts.push('<div class="det-pane" data-pane="handoff" hidden>');
+        parts.push('<div class="card"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
         // #1426: copy / download actions over the rendered handoff document
         parts.push('<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><button id="handoff-copy-md" class="btn sm">' + t("det.handoff_copy_md") + '</button><button id="handoff-dl" class="btn sm">' + t("det.handoff_download") + "</button></div>");
         if (d.handoffTruncated) parts.push('<div class="banner warn show" style="margin:0 0 10px">' + t("det.handoff_truncated") + "</div>");
@@ -1696,6 +2832,7 @@ export const WEB_CLIENT = `(function () {
         else if (d.handoffHtml) parts.push('<div class="handoff">' + d.handoffHtml + "</div>");
         else parts.push('<div class="dim small">' + t("common.empty") + "</div>");
         parts.push("</div></div>");
+        parts.push("</div>");
         return parts.join("");
     }
     async function loadDetail(id) {
@@ -1703,7 +2840,7 @@ export const WEB_CLIENT = `(function () {
         host.innerHTML = '<div class="empty"><span class="spin"></span> ' + t("common.loading") + "</div>";
         let d = null;
         try {
-            d = await json("/__bili/sessions/" + encodeURIComponent(id) + "/detail");
+            d = await json(API_ROOT + "/sessions/" + encodeURIComponent(id) + "/detail");
         } catch (e) {}
         if (!d) {
             host.innerHTML = '<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>"
@@ -1714,15 +2851,20 @@ export const WEB_CLIENT = `(function () {
             host.innerHTML = buildDetailHtml(d);
             bindHandoffActions(d);
             bindBlocksActions(d);
+            bindBlockContentActions(d);
+            bindTreeModeActions();
+            bindDetTabs();
+            bindTreeMap();
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
+            bindHitRateChart(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
                     busy(cc, true);
                     try {
-                        await json("/__bili/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
+                        await json(API_ROOT + "/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
                         toast(t("det.conflicts_cleared"), "ok");
                         await loadDetail(id);
                     } catch (e) {
@@ -1793,7 +2935,7 @@ export const WEB_CLIENT = `(function () {
         if (hit && Date.now() - hit.at < DIAG_CACHE_MS) return bindReport(hit.d, copyBtn, issueLink);
         busy(copyBtn, true);
         try {
-            const d = await json("/__bili/diagnostics?topic=" + encodeURIComponent(topic));
+            const d = await json(API_ROOT + "/diagnostics?topic=" + encodeURIComponent(topic));
             diagCache[topic] = { at: Date.now(), d };
             bindReport(d, copyBtn, issueLink);
         } catch (e) {
@@ -1863,7 +3005,7 @@ export const WEB_CLIENT = `(function () {
         if (mdBtn) mdBtn.addEventListener("click", async function () {
             busy(mdBtn, true);
             try {
-                var r = await json("/__bili/session-report?format=md&" + q);
+                var r = await json(API_ROOT + "/session-report?format=md&" + q);
                 if (!r || typeof r.md !== "string") throw new Error("no report");
                 downloadUrl(URL.createObjectURL(new Blob([r.md], { type: "text/markdown;charset=utf-8" })), base + ".md");
             } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(mdBtn, false); }
@@ -1871,7 +3013,7 @@ export const WEB_CLIENT = `(function () {
         if (pngBtn) pngBtn.addEventListener("click", async function () {
             busy(pngBtn, true);
             try {
-                var r = await json("/__bili/session-report?format=svg&" + q);
+                var r = await json(API_ROOT + "/session-report?format=svg&" + q);
                 if (!r || !r.svg) throw new Error("no report");
                 var blob = await svgToPngBlob(r.svg, r.w || 920, r.h || 800);
                 downloadUrl(URL.createObjectURL(blob), base + ".png");
@@ -1901,12 +3043,210 @@ export const WEB_CLIENT = `(function () {
             btn.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); copyText(buildBlockMd(b), btn); });
         });
     }
+    // #3917: pane switcher for the detail page — the last-used pane survives a
+    // reload so a user who lives on the tree does not re-click every visit.
+    function bindDetTabs() {
+        const tabs = $("det-tabs");
+        if (!tabs) return;
+        const panes = document.querySelectorAll("#session-detail-view .det-pane");
+        const show = (want) => {
+            tabs.querySelectorAll(".det-tab").forEach((b) => b.classList.toggle("active", b.getAttribute("data-pane") === want));
+            panes.forEach((p) => { p.hidden = p.getAttribute("data-pane") !== want; });
+        };
+        tabs.querySelectorAll(".det-tab").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const want = btn.getAttribute("data-pane") || "overview";
+                show(want);
+                try { sessionStorage.setItem("bili-det-pane", want); } catch (e) {}
+            });
+        });
+        let saved = "overview";
+        try { saved = sessionStorage.getItem("bili-det-pane") || "overview"; } catch (e) {}
+        show(saved === "blocks" || saved === "handoff" ? saved : "overview");
+    }
+    // #3917: lazy raw-content loader per block — the tree ships summary + numbers
+    // only; the conversation bytes behind a block come on demand. "one" is what
+    // decompress(block) hands back, "full" is the whole covered span.
+    function bindBlockContentActions(d) {
+        document.querySelectorAll(".blk-content-btn").forEach((btn) => {
+            btn.addEventListener("click", async (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                const bid = btn.getAttribute("data-bid") || "";
+                const view = btn.getAttribute("data-view") === "full" ? "full" : "one";
+                const box = $("blk-content-" + bid);
+                if (!box) return;
+                // #4173 review: pressing the same button again collapses the
+                // raw view (it used to be one-way, so users were stuck).
+                if (!box.hidden && box.getAttribute("data-view") === view) { box.hidden = true; return; }
+                if (box.getAttribute("data-state") === "ok" && box.getAttribute("data-view") === view) { box.hidden = false; return; }
+                box.hidden = false;
+                box.setAttribute("data-state", "loading");
+                box.innerHTML = '<div class="empty small"><span class="spin"></span> ' + t("common.loading") + "</div>";
+                busy(btn, true);
+                try {
+                    const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(d.id) + "/block-content?blockId=" + encodeURIComponent(bid) + "&view=" + view);
+                    box.setAttribute("data-state", "ok");
+                    box.setAttribute("data-view", view);
+                    const head = '<div class="blk-content-meta mono small">' + escapeHtml(t("det.tree_orig_meta", { n: r.count, b: fmtB(r.totalBytes) })) + (r.truncated ? ' <span class="warn-text">' + escapeHtml(t("det.tree_orig_truncated", { b: fmtB(r.bytes) })) + "</span>" : "") + "</div>";
+                    box.innerHTML = head + '<pre class="blk-content-pre mono small">' + escapeHtml(r.text) + "</pre>";
+                } catch (e) {
+                    box.setAttribute("data-state", "err");
+                    const msg = String(e && e.message ? e.message : e);
+                    box.innerHTML = '<div class="dim small">' + escapeHtml(msg.indexOf("no-content-snapshot") >= 0 ? t("det.tree_orig_missing") : msg) + "</div>";
+                } finally {
+                    busy(btn, false);
+                }
+            });
+        });
+        // #3917: message leaves — first click fetches that one message's text.
+        document.querySelectorAll(".msg-row").forEach((btn) => {
+            btn.addEventListener("click", async (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                const row = btn.closest("li");
+                const box = row ? row.querySelector(".msg-body") : null;
+                if (!box) return;
+                if (!box.hidden) { box.hidden = true; return; }
+                if (box.getAttribute("data-state") === "ok") { box.hidden = false; return; }
+                box.hidden = false;
+                box.setAttribute("data-state", "loading");
+                box.innerHTML = '<div class="empty small"><span class="spin"></span> ' + t("common.loading") + "</div>";
+                try {
+                    const ref = btn.getAttribute("data-ref") || "";
+                    const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(d.id) + "/message?ref=" + encodeURIComponent(ref));
+                    box.setAttribute("data-state", "ok");
+                    const meta = '<div class="blk-content-meta mono small">' + (r.toolName ? escapeHtml(r.toolName) + " · " : "") + escapeHtml(fmtB(r.totalBytes)) + (r.truncated ? ' <span class="warn-text">' + escapeHtml(t("det.tree_orig_truncated", { b: fmtB(r.bytes) })) + "</span>" : "") + "</div>";
+                    box.innerHTML = meta + '<pre class="blk-content-pre mono small">' + escapeHtml(r.text) + "</pre>";
+                } catch (e) {
+                    box.setAttribute("data-state", "err");
+                    const msg = String(e && e.message ? e.message : e);
+                    box.innerHTML = '<div class="dim small">' + escapeHtml(msg.indexOf("unknown-message") >= 0 ? t("det.tree_msg_gone") : msg) + "</div>";
+                }
+            });
+        });
+        // #4173 review: measure each clamped summary when its row first opens —
+        // a closed <details> has no layout, so the cut-or-not verdict can only
+        // happen here; rows the clamp never shortened lose their button.
+        document.querySelectorAll(".block-node").forEach(function (det) {
+            det.addEventListener("toggle", function () {
+                if (!det.open) return;
+                const body = det.querySelector(":scope > .body.md");
+                if (!body || body.__sumChk) return;
+                body.__sumChk = 1;
+                let sum = null, btn = null;
+                for (let i = 0; i < body.children.length; i++) {
+                    const c = body.children[i];
+                    if (c.classList.contains("blk-sum")) sum = c;
+                    if (c.classList.contains("blk-sum-toggle")) btn = c;
+                }
+                if (!sum || !btn) return;
+                if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
+                btn.addEventListener("click", function () {
+                    const clamped = sum.classList.toggle("clamp");
+                    btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
+                });
+            });
+        });
+    }
+    // #3917: the compression pane carries two readings of the same data — the
+    // list (read concrete messages) and the graph (read the overall shape).
+    // Clicking a graph node jumps back to that block's expanded row in the list.
+    function bindTreeModeActions() {
+        const list = $("tree-list");
+        const graph = $("tree-graph");
+        if (!list || !graph) return;
+        const btns = Array.prototype.slice.call(document.querySelectorAll(".tree-mode"));
+        const setMode = function (mode) {
+            const g = mode === "graph";
+            // #4173 review: graph mode STACKS the live map above the full
+            // block list (总揽全局 + 看细节 in one screen); list mode just
+            // hides the drawing. The list is never hidden anymore — it used
+            // to be, which read as "all the per-block details were lost".
+            list.hidden = false;
+            graph.hidden = !g;
+            // #4173 review: Fit only makes sense while the tree drawing is visible.
+            const fit = $("tm-fit");
+            if (fit) fit.hidden = !g;
+            btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === mode); });
+        };
+        btns.forEach(function (b) {
+            b.addEventListener("click", function (ev) {
+                ev.preventDefault();
+                setMode(b.getAttribute("data-mode") === "graph" ? "graph" : "list");
+            });
+        });
+        // #4173 review: default to the live map stacked over the list.
+        setMode("graph");
+    }
+    // #4173: the in-pane live tree panorama. The drawing renders at NATURAL
+    // size (a block box is always 118x36 px, labels readable) inside a
+    // natively scrollable viewport — pathological trees (very wide OR very
+    // tall) stay legible instead of meeting into smears. All interaction
+    // binds on the stable #tree-graph container (event delegation) because the
+    // 5s poller swaps its innerHTML. The map flows WITH the page (a plain
+    // wheel scrolls the document over it); Ctrl/⌘-wheel or trackpad pinch
+    // zooms around the cursor by resizing .tm-inner, #tm-fit shrinks the whole
+    // tree into the current viewport, double-click restores natural size, and
+    // a plain click on a node jumps to that block's row in the list below.
+    // Zoom state (view.__vm) survives re-renders.
+    function bindTreeMap() {
+        const view = $("tree-graph");
+        if (!view) return;
+        const fb = $("tm-fit");
+        if (fb) fb.addEventListener("click", function () { treeMapFit(view); });
+        view.addEventListener("dblclick", function () { view.__vm = null; treeMapApply(view); });
+        view.addEventListener("wheel", function (e) {
+            if (!e.ctrlKey) return; // a plain wheel keeps scrolling the page
+            e.preventDefault();
+            const inner = view.querySelector(".tm-inner");
+            if (!inner) return;
+            const old = view.__vm ? view.__vm.k : 1;
+            const k2 = Math.max(0.02, Math.min(8, old * Math.exp(-e.deltaY * 0.0015)));
+            if (k2 === old) return;
+            const r0 = inner.getBoundingClientRect();
+            const px = (e.clientX - r0.left) / old;
+            const py = (e.clientY - r0.top) / old;
+            view.__vm = { k: k2 };
+            treeMapApply(view);
+            const r1 = inner.getBoundingClientRect();
+            // hold the world point under the cursor still while the page reflows
+            window.scrollBy((r1.left + px * k2) - (r0.left + px * old), (r1.top + py * k2) - (r0.top + py * old));
+        }, { passive: false });
+        let downAt = null;
+        view.addEventListener("pointerdown", function (e) {
+            if (e.button !== 0) return;
+            downAt = { x: e.clientX, y: e.clientY };
+        });
+        view.addEventListener("pointerup", function (e) {
+            if (!downAt) return;
+            const moved = Math.abs(e.clientX - downAt.x) > 3 || Math.abs(e.clientY - downAt.y) > 3;
+            downAt = null;
+            if (moved) return;
+            // The page can scroll under a pressed finger, so the node under
+            // the pointer has to be hit-tested by point rather than target.
+            let el = e.target;
+            try { el = document.elementFromPoint(e.clientX, e.clientY) || e.target; } catch (err) {}
+            const n = el && el.closest ? el.closest("[data-bid]") : null;
+            if (!n) return;
+            const bid = n.getAttribute("data-bid");
+            const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
+            if (!row) return;
+            row.open = true;
+            row.classList.add("flash");
+            // #4173 review: land at the TOP of the block — long rows used to
+            // scroll to their middle and looked lost.
+            row.scrollIntoView({ block: "start", behavior: "smooth" });
+            setTimeout(function () { row.classList.remove("flash"); }, 1600);
+        });
+        view.addEventListener("pointercancel", function () { downAt = null; });
+    }
     function bindCacheReportActions(d) {
         const copyB = $("cacherpt-copy");
         const dlB = $("cacherpt-dl");
         if (!copyB || !dlB) return;
         const grab = async () => {
-            const r = await json("/__bili/cache-report?session=" + encodeURIComponent(d.id));
+            const r = await json(API_ROOT + "/cache-report?session=" + encodeURIComponent(d.id));
             const rep = r && Array.isArray(r.reports) && r.reports[0] ? r.reports[0].report : null;
             if (!rep) throw new Error("no cache report for this session yet");
             return rep;
@@ -2009,7 +3349,7 @@ export const WEB_CLIENT = `(function () {
 
     async function loadConfig() {
         try {
-            const cfg = await json("/__bili/config");
+            const cfg = await json(API_ROOT + "/config");
             const cfgPathEl = $("cfg-path");
             if (cfgPathEl) cfgPathEl.textContent = cfg.path || t("common.empty");
             const fileBtn = $("copy-cfg-file");
@@ -2075,7 +3415,7 @@ export const WEB_CLIENT = `(function () {
         if (!box) return;
         let data;
         try {
-            data = await json("/__bili/resign");
+            data = await json(API_ROOT + "/resign");
         } catch (e) {
             const el = document.createElement("div");
             el.className = "dim small";
@@ -2142,7 +3482,7 @@ export const WEB_CLIENT = `(function () {
         box.innerHTML = "";
         const fe = $("cfg-file-edit");
         let draft = {};
-        try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
+        try { const p = parseConfigDraft(fe && fe.value ? fe.value : "{}"); draft = p && typeof p === "object" && !Array.isArray(p) ? p : {}; } catch (e) { return; }
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
@@ -2156,7 +3496,7 @@ export const WEB_CLIENT = `(function () {
         }
         function freshDraft() {
             try {
-                const p = JSON.parse(fe && fe.value ? fe.value : "{}");
+                const p = parseConfigDraft(fe && fe.value ? fe.value : "{}");
                 if (!p || typeof p !== "object" || Array.isArray(p)) return {};
                 return p;
             } catch (e) { quickBroken(true); return null; }
@@ -2165,6 +3505,9 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
+            imgRow.inp.checked = draft.imageRescale !== false;
+            const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
+            abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -2190,6 +3533,9 @@ export const WEB_CLIENT = `(function () {
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
             mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+            const ds = (draft.dsh && typeof draft.dsh === "object" && !Array.isArray(draft.dsh)) ? draft.dsh : null;
+            dshCtxRow.inp.checked = ds ? ds.contextTab !== false : true;
+            dshLblInp.value = (ds && typeof ds.contextTabLabel === "string") ? ds.contextTabLabel : "";
         }
         function commit(mutate) {
             const fresh = freshDraft();
@@ -2244,6 +3590,52 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
+        const imgRow = row("quick-imgrescale", t("cfg.q_imgrescale"));
+        qCtrls.push(imgRow.inp);
+        imgRow.inp.addEventListener("change", () => commit((d) => { if (imgRow.inp.checked) delete d.imageRescale; else d.imageRescale = false; }));
+        const imgHint = document.createElement("span");
+        imgHint.className = "dim small";
+        imgHint.textContent = t("cfg.q_imgrescale_hint");
+        imgRow.ctl.appendChild(imgHint);
+        const dshCtxRow = row("quick-dsh-ctxtab", t("cfg.q_dsh_ctxtab"));
+        qCtrls.push(dshCtxRow.inp);
+        dshCtxRow.inp.addEventListener("change", () => commit((d) => {
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (dshCtxRow.inp.checked) delete ds.contextTab; else ds.contextTab = false;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const dshCtxHint = document.createElement("span");
+        dshCtxHint.className = "dim small";
+        dshCtxHint.textContent = t("cfg.q_dsh_ctxtab_hint");
+        dshCtxRow.ctl.appendChild(dshCtxHint);
+        const dshLblInp = textRow("quick-dsh-ctxtab-label", t("cfg.q_dsh_ctxtab_label"));
+        qCtrls.push(dshLblInp);
+        dshLblInp.addEventListener("change", () => commit((d) => {
+            const v = dshLblInp.value.trim();
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (v.length > 0) ds.contextTabLabel = v; else delete ds.contextTabLabel;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const abRow = row("quick-absorb", t("cfg.q_absorb"));
+        qCtrls.push(abRow.inp);
+        abRow.inp.addEventListener("change", () => commit((d) => {
+            if (abRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                const a = d.compress.absorb;
+                d.compress.absorb = (a && typeof a === "object" && !Array.isArray(a)) ? a : {};
+                d.compress.absorb.enabled = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.absorb;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const abHint = document.createElement("span");
+        abHint.className = "dim small";
+        abHint.textContent = t("cfg.q_absorb_hint");
+        abRow.ctl.appendChild(abHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
@@ -2461,8 +3853,10 @@ export const WEB_CLIENT = `(function () {
         const box = $("summary-fields"), fe = $("cfg-file-edit");
         if (!box || !fe) return;
         const status = Object.assign({}, cfg.externalSummaryCredentials || {});
+        // #3488: five-state view; falls back to the legacy boolean on old servers.
+        const detail = cfg.externalSummaryCredentialStatus || {};
         function read() {
-            const draft = JSON.parse(fe.value || "{}");
+            const draft = parseConfigDraft(fe.value || "{}");
             if (!draft || typeof draft !== "object" || Array.isArray(draft)) throw new Error(t("cfg.invalid_json"));
             return draft;
         }
@@ -2566,15 +3960,22 @@ export const WEB_CLIENT = `(function () {
                     const row = document.createElement("div"); row.className = "summary-actions";
                     const ref = typeof recipe.credentialRef === "string" ? "secret:" + recipe.credentialRef : typeof recipe.apiKeyEnv === "string" ? "env:" + recipe.apiKeyEnv : null;
                     const label = document.createElement("span"); label.textContent = name + " · " + (ref || "—"); row.appendChild(label);
-                    const badge = document.createElement("span"); badge.className = "badge " + (ref && status[ref] ? "ok" : "disk"); badge.textContent = ref && status[ref] ? t("summary.key_set") : t("summary.key_missing"); row.appendChild(badge);
+                    // #3488: distinguish "not set" from "set but unusable" and
+                    // "store broken" — all of them used to render as 未配置.
+                    const state = ref ? detail[ref] : undefined;
+                    const badgeState = state !== undefined ? state : (ref && status[ref]) ? "configured" : "missing";
+                    const badge = document.createElement("span");
+                    badge.className = "badge " + (badgeState === "configured" ? "ok" : badgeState === "missing" ? "disk" : "warn");
+                    badge.textContent = badgeState === "configured" ? t("summary.key_set") : badgeState === "missing" ? t("summary.key_missing") : badgeState === "invalid_value" ? t("summary.key_invalid") : badgeState === "store_unreadable" ? t("summary.key_unreadable") : t("summary.key_bad_ref");
+                    row.appendChild(badge);
                     if (ref && ref.indexOf("secret:") === 0) {
                         const key = field(row, "summary-key-" + name, t("summary.key"), "", () => {}, "password");
                         key.autocomplete = "new-password"; key.disabled = !!cfg.parseError;
                         async function saveKey(btn, value) {
                             busy(btn, true);
                             try {
-                                const result = await json("/__bili/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
-                                key.value = ""; status[ref] = result.configured;
+                                const result = await json(API_ROOT + "/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
+                                key.value = ""; status[ref] = result.configured; detail[ref] = result.configured ? "configured" : "missing";
                                 render();
                                 toast(t("summary.key_saved"), "ok");
                             } catch (e) { toast(e.message, "err"); } finally { busy(btn, false); }
@@ -2602,7 +4003,7 @@ export const WEB_CLIENT = `(function () {
     }
     async function loadUpstream(cfg) {
         let up = null;
-        try { up = await json("/__bili/upstream"); } catch (e) {}
+        try { up = await json(API_ROOT + "/upstream"); } catch (e) {}
         // #1426: mode/proxy are editable form fields again, not read-only labels
         const mode = (up && up.mode) || cfg.upstreamProxyMode || "auto";
         document.querySelectorAll('input[name="proxy-mode"]').forEach((el) => { el.checked = el.value === mode; });
@@ -2634,7 +4035,7 @@ export const WEB_CLIENT = `(function () {
         const q = (qEl.value || "").trim();
         try {
             const linesSel = $("log-lines");
-            const d = await json("/__bili/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
+            const d = await json(API_ROOT + "/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
             $("log-path").textContent = d.path || t("logs.empty");
             $("copy-log-path").dataset.copy = d.path || "";
             $("log-count").textContent = d.total > 0
@@ -2668,7 +4069,7 @@ export const WEB_CLIENT = `(function () {
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
@@ -2688,11 +4089,12 @@ export const WEB_CLIENT = `(function () {
         if (name === "overview") loadOverview();
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
+        else if (name === "updates") loadUpdates();
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
     // #2489: Esc resets a zoomed trajectory view from anywhere on the page.
-    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && trajRange) trajSetRange(null); });
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") chartZooms.forEach((z) => { if (z.range) z.setRange(null); }); });
 
     function initStaticHandlers() {
         const tog = $("language-toggle");
@@ -2712,12 +4114,30 @@ export const WEB_CLIENT = `(function () {
         const search = $("ses-search");
         if (search) {
             let sesTimer = null;
-            search.addEventListener("input", () => { clearTimeout(sesTimer); sesTimer = setTimeout(() => refreshSessions(false), 300); });
+            search.addEventListener("input", () => { clearTimeout(sesTimer); sesTimer = setTimeout(() => refreshSessions(false, 1), 300); });
         }
         const sref = $("ses-refresh");
-        if (sref) sref.addEventListener("click", () => refreshSessions(true));
-        const lm = $("ses-loadmore");
-        if (lm) lm.addEventListener("click", loadMoreSessions);
+        if (sref) sref.addEventListener("click", () => refreshSessions(true, sesPage));
+        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => {
+            const el = $(id);
+            if (el) el.addEventListener("change", () => refreshSessions(false, 1));
+        });
+        const reset = $("ses-reset-filters");
+        if (reset) reset.addEventListener("click", resetSessionFilters);
+        const prev = $("ses-prev");
+        if (prev) prev.addEventListener("click", () => goToSessionPage(sesPage - 1));
+        const next = $("ses-next");
+        if (next) next.addEventListener("click", () => goToSessionPage(sesPage + 1));
+        // #3719 phase 2: 更新/Updates tab actions — check now / upgrade now /
+        // install selected. One shared in-flight flag (see upSetButtons).
+        const uchk = $("up-check");
+        if (uchk) uchk.addEventListener("click", () => upCheckNow());
+        const unow = $("up-upgrade-now");
+        if (unow) unow.addEventListener("click", () => upUpgradeNow());
+        const usel = $("up-select");
+        const unins = $("up-install");
+        if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; focusChangelogRelease(usel.value); });
+        if (unins) unins.addEventListener("click", () => upInstallSelected());
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
@@ -2728,7 +4148,7 @@ export const WEB_CLIENT = `(function () {
             busy(ldl, true);
             try {
                 const q = ($("log-search").value || "").trim();
-                const r = await fetch("/__bili/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
+                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2749,7 +4169,7 @@ export const WEB_CLIENT = `(function () {
             try {
                 // Full unfiltered log (rotated .old + current) regardless of the
                 // search box — the honest "download everything" path.
-                const r = await fetch("/__bili/logs?raw=1&all=1");
+                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2768,7 +4188,7 @@ export const WEB_CLIENT = `(function () {
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);
             try {
-                const r = await json("/__bili/upstream/test", { method: "POST" });
+                const r = await json(API_ROOT + "/upstream/test", { method: "POST" });
                 // #1426: an HTTP >= 400 answer still proves the network path works — auth is the
                 // client's job, so report reachability instead of a flat failure
                 const st = $("up-state");
@@ -2800,7 +4220,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sq, { file: raw });
         });
@@ -2812,7 +4232,7 @@ export const WEB_CLIENT = `(function () {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
             let parsed;
-            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            try { parsed = parseConfigDraft(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sf, { file: raw });
         });
@@ -2820,7 +4240,7 @@ export const WEB_CLIENT = `(function () {
         if (cp) cp.addEventListener("click", async () => {
             busy(cp, true);
             try {
-                await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
+                await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
                 toast(t("toast.passthrough_cleared"), "ok");
                 loadConfig();
             } catch (e) {
@@ -2857,8 +4277,44 @@ export const WEB_CLIENT = `(function () {
         });
     }
 
+    // #4173: keep the in-pane tree panorama live while a session detail is open.
+    // Decorative lane: failures keep the last good frame and never touch the
+    // error strip or the #1937 backoff ladder (always resolves true). Re-renders
+    // only when the block population actually changed; the viewer's zoom
+    // (view.__vm) is restored on top of each rebuild.
+    let mapBusy = false;
+    let lastMapSig = "";
+    async function refreshTreeMap() {
+        if (mapBusy) return true;
+        const view = $("tree-graph");
+        if (!view) return true;
+        const m = location.hash.match(new RegExp("^#/session/(.+)$"));
+        if (!m) return true;
+        mapBusy = true;
+        try {
+            const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(m[1]) + "/tree");
+            if (r && Array.isArray(r.blocks)) {
+                const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : "") + ":" + (b.directBlockIds || []).join(","); }).join("|");
+                if (sig !== lastMapSig) {
+                    lastMapSig = sig;
+                    // #4173 review: swap only the drawing frame so the pane's other
+                    // children (the legend row) survive live refreshes.
+                    view.querySelectorAll(".tm-inner").forEach(function (el) { el.remove(); });
+                    view.insertAdjacentHTML("afterbegin", treeMapInnerHtml(buildGraphSvg(r.blocks, true, MAP_METRICS)));
+                    treeMapApply(view);
+                }
+            }
+        } catch (e) {
+            /* decorative lane — keep the stale frame */
+        } finally {
+            mapBusy = false;
+        }
+        return true;
+    }
+
     hydrate();
     initStaticHandlers();
+    loadChangelog();
     route();
     // #1937: failures back off exponentially (5s → 10s → … cap 60s) with a
     // persistent error strip instead of silent toast-spam retries, and a slow
@@ -2873,8 +4329,10 @@ export const WEB_CLIENT = `(function () {
             // restarting server cannot spam toasts from background views.
             let ok = current === "overview" ? await loadOverview() : await loadOverview(true);
             // A paged-down or searched list must not be clobbered by the background refresh.
-            if (current === "sessions" && $("session-detail-view").hidden && sessionsCache.length <= SES_PAGE_SIZE) ok = (await refreshSessions(false)) && ok;
+            if (current === "sessions" && $("session-detail-view").hidden && sesPage === 1 && !hasActiveFilters()) ok = (await refreshSessions(false, 1)) && ok;
             else if (current === "logs") ok = (await loadLogs()) && ok;
+            // #4173: session DETAIL view → keep the in-pane tree panorama live.
+            else if (current === "sessions") ok = (await refreshTreeMap()) && ok;
             if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
             else {
                 pollFailures += 1;

@@ -24,7 +24,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { dshProfileDirs } from "./dsh-channel.js";
+import { dshProfileDirs, parseDshPatchEntries } from "./dsh-channel.js";
 import { stateDir } from "./paths.js";
 
 interface HostPluginNotice {
@@ -94,9 +94,9 @@ function readProfileManifest(dir: string): Record<string, unknown> | undefined {
 }
 
 // True when the profile patch layer carries `- id: <loaderId>` with a
-// `disabled: true` line inside its block. Line-forgiving like #2462's scan:
-// any top-level list item that is not an `- id:` entry resets attribution, so
-// a stray `disabled:` line cannot leak into the wrong entry.
+// `disabled: true` line inside its block. Delegates to the shared dsh-channel
+// entry scanner (#3838) so this gate and the #2462 cost-advisory scan share
+// one parsing discipline instead of drifting apart.
 function patchDisabled(patchFile: string, loaderId: string): boolean {
     let text: string;
     try {
@@ -104,25 +104,7 @@ function patchDisabled(patchFile: string, loaderId: string): boolean {
     } catch {
         return false;
     }
-    const itemRe = /^\s*-\s*id\s*:\s*(\S+)/;
-    const listItemRe = /^\s*-\s/;
-    const disabledRe = /^\s+disabled\s*:\s*true\b/;
-    let current: string | undefined;
-    for (const line of text.split(/\r?\n/)) {
-        const m = line.match(itemRe);
-        if (m) {
-            let v = m[1];
-            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-            current = v.trim();
-            continue;
-        }
-        if (listItemRe.test(line)) {
-            current = undefined;
-            continue;
-        }
-        if (current === loaderId && disabledRe.test(line)) return true;
-    }
-    return false;
+    return parseDshPatchEntries(text).some((e) => e.id === loaderId && e.disabled);
 }
 
 export function detectHostPluginNotices(env: NodeJS.ProcessEnv = process.env): HostPluginNotice[] {

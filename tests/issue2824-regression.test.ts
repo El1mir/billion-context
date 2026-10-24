@@ -226,3 +226,30 @@ test("#2824: guarded path ≡ unconditional build across the corpus", () => {
         assert.deepStrictEqual(guarded, unconditional, `${fx.name}: guarding must not change the index`);
     }
 });
+
+test("#2824: a converter throw degrades the index fail-open but WARNS, never silently", async () => {
+    // The #3642 single-object-content TypeError hid precisely because the
+    // catch returned an empty index with zero signal — image recovery was
+    // silently off for every session carrying that shape. The catch must
+    // stay fail-open (request path unaffected) but emit one warn per error
+    // signature so the next wire-tolerance break cannot hide.
+    const { setLogCapture } = await import("../src/logger.ts");
+    const warns: string[] = [];
+    setLogCapture((_level, msg) => { warns.push(msg); });
+    try {
+        // A body shape that makes the converter itself throw: a Proxy that
+        // explodes on property access — the conversion cannot get past the
+        // first read, exercising the catch directly.
+        const bomb = new Proxy({}, {
+            get() { throw new TypeError("wire bomb"); },
+        });
+        const idx = buildIncomingImageIndex(bomb, "openai", createInitialState(), "warn-probe");
+        assert.equal(idx.size, 0, "fail-open: empty index, no throw");
+        assert.ok(
+            warns.some((w) => w.includes("[image-restore] inbound index conversion failed") && w.includes("#2824")),
+            `expected the visibility warn, got: ${JSON.stringify(warns)}`,
+        );
+    } finally {
+        setLogCapture(null);
+    }
+});

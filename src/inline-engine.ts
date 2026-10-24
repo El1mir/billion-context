@@ -17,6 +17,7 @@ import { handle } from "./server/handle.js";
 import { withFetchTransport } from "./fetch-transport.js";
 import type { FetchOptions } from "./fetch-util.js";
 import { log as loggerLog } from "./logger.js";
+import { buildProxyFailureResponse, isExpectedFailFast } from "./upstream-fail.js";
 
 /** Pseudo-origin of the inline lane. Never DNS-resolved: any request reaching
  *  this host is served in-process by installInlineTransport before egress. */
@@ -263,17 +264,23 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
             const e = err as { name?: string; message?: string };
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) ctx.log("info", `client aborted mid-stream: ${msg}`);
-            else if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
-            else ctx.log("error", msg);
+            // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
+            // throttled [warn] at the throw site is the canonical record.
+            else if (!isExpectedFailFast(err)) {
+                if (err instanceof Error && err.stack) ctx.log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
+                else ctx.log("error", msg);
+            }
             // A destroyed res belongs to an aborted caller whose promise
             // carries the abort reason — the body stream is errored, so writing
             // an error frame here would throw on the dead controller; rethrow
             // so the caller sees the abort instead of a phantom response.
             if (res.destroyed) throw err;
             if (!res.headersSent) {
-                const status = msg.includes("exceeds") ? 413 : 502;
-                res.writeHead(status, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg }));
+                // #4254: shared egress builder — renders identically to startServer
+                // (this lane now also emits the structured upstreamFailure diag).
+                const { status, headers, body } = buildProxyFailureResponse(msg, err);
+                res.writeHead(status, headers);
+                res.end(body);
             } else {
                 res.end();
             }

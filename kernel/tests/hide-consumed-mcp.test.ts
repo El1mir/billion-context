@@ -89,8 +89,11 @@ test("#2970 L2: active synthetic-id carrier survives beyond the orphan window", 
   const r = hideConsumedCompressCalls(state, msgs, isMcp);
   const kept = new Set(r.messages.map((m) => m.toolCallId));
   assert.ok(kept.has("tool_a"), "active synthetic-id carrier must survive");
-  assert.ok(!kept.has("tool_b"), "oldest true orphan still capped at two");
-  assert.ok(kept.has("tool_c") && kept.has("tool_d"), "newest two orphans kept");
+  assert.equal(r.hidden, 0, "no fold pending -> nothing swept (#3769)");
+  assert.ok(
+    kept.has("tool_b") && kept.has("tool_c") && kept.has("tool_d"),
+    "orphans remain visible until a real fold",
+  );
 });
 
 test("#2970 L2: inactive synthetic-id carrier is hidden (stale receipt cleanup)", () => {
@@ -112,7 +115,7 @@ test("#2970 L2: inactive synthetic-id carrier is hidden (stale receipt cleanup)"
   assert.equal(r.hidden, 2, "call + result removed");
 });
 
-test("#2970/#2362: mcp__bili__compress orphans keep only the newest two", () => {
+test("#2970/#2362: mcp__bili__compress orphans stay visible between folds (#3769)", () => {
   const state = createInitialState();
   const msgs: CoreMessage[] = [];
   for (const id of ["o1", "o2", "o3", "o4"]) {
@@ -121,8 +124,11 @@ test("#2970/#2362: mcp__bili__compress orphans keep only the newest two", () => 
 
   const r = hideConsumedCompressCalls(state, msgs, isMcp);
   const kept = new Set(r.messages.map((m) => m.toolCallId));
-  assert.ok(!kept.has("o1") && !kept.has("o2"), "older orphans hidden");
-  assert.ok(kept.has("o3") && kept.has("o4"), "newest two kept");
+  assert.equal(r.hidden, 0, "quiet turn sweeps nothing (#3769)");
+  assert.ok(
+    ["o1", "o2", "o3", "o4"].every((id) => kept.has(id)),
+    "all orphans remain visible until a real fold (#3769)",
+  );
 });
 
 test("#2970: active synthetic-id carrier's long summary is stubbed", () => {

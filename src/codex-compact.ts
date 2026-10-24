@@ -3,6 +3,20 @@ import type { CompressionBlock } from "acp-kernel";
 import { statusInputBaseline, type Session } from "./session.js";
 import { codexCompactMode as knobCodexCompactMode } from "./knobs.js";
 
+// #3686: the x-bili-plugin marker name is read DIRECTLY here instead of via
+// plugin.js — plugin.ts reaches this module's top-level constants through
+// loop/tag-echo-filter.ts, so importing it back would close an ESM cycle and
+// crash on the TDZ of CODEX_FORGED_HANDOFF_HEADER. Same discipline as
+// session-id.ts / anon-provenance.ts reading the wire literal.
+const BILI_PLUGIN_MARKER = "x-bili-plugin";
+
+function declaredPluginAgent(headers: Record<string, string | string[] | undefined>): string | undefined {
+    const v = headers[BILI_PLUGIN_MARKER];
+    const s = Array.isArray(v) ? v[0] : v;
+    const t = typeof s === "string" ? s.trim() : undefined;
+    return t !== undefined && t.length > 0 ? t : undefined;
+}
+
 export const CODEX_COMPACT_ID_PREFIX = "fc_bili_";
 export const CODEX_COMPACT_SENTINEL = "bili:acp:";
 
@@ -40,6 +54,31 @@ export function isCodexClient(headers: Record<string, string | string[] | undefi
     if (typeof s !== "string") return false;
     if (CODEX_UA_PREFIXES.some((p) => s.toLowerCase().startsWith(p))) return true;
     return s.split(/\s+/).some((t) => t.startsWith("codex"));
+}
+
+/** #3686: HOST-POLICY codex identity — deliberately distinct from the
+ *  wire-profile isCodexClient above. An explicit bili plugin marker declares
+ *  the requesting host authoritatively: a native host that ships a
+ *  codex-shaped UA for relay compatibility (pi over a strict codex relay) is
+ *  still THAT host, and must not inherit codex-only compaction policy (the 0.9
+ *  health bar, forge/reconcile lanes, CCR/image disarm, compact-trigger
+ *  dispatch, codex-table window alignment, instructions-fingerprint keying).
+ *  No marker → fall back to the UA guess exactly as before, so headerless
+ *  clients keep their detection unchanged. Wire-shape decisions (the
+ *  preflight summary payload's codex CLI signature, #2733) stay on the raw
+ *  isCodexClient: the relay validates what the presented bytes claim, not who
+ *  bili believes is home. */
+export function isCodexHost(headers: Record<string, string | string[] | undefined>): boolean {
+    const agent = declaredPluginAgent(headers);
+    if (agent !== undefined) return agent === "codex";
+    return isCodexClient(headers);
+}
+
+/** #3686: whether the codex-intercept health bar (CODEX_COMPACT_HEALTH_RATIO)
+ *  applies to this request — the single gate behind every lowered-bar site
+ *  (preflight overflow target, growth-fold nudge caps). */
+export function codexHealthBarApplies(headers: Record<string, string | string[] | undefined>): boolean {
+    return isCodexHost(headers) && codexCompactMode() === "intercept";
 }
 
 export function hasCompactionTrigger(input: unknown): boolean {

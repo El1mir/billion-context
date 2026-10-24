@@ -39,7 +39,7 @@ import { openSqliteDatabase } from "../src/storage/driver.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 // Hermeticity pin (same pattern as the other storage suites): pin BOTH tiers
-// so every leg controls its own mode explicitly (absent defaults to shadow).
+// so every leg controls its own mode explicitly (absent defaults to full, #3818).
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-wa-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(hermetic, "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "legacy";

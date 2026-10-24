@@ -42,6 +42,52 @@ export function dshProfileDirs(env: NodeJS.ProcessEnv = process.env): string[] {
     return entries.filter((e) => e.isDirectory() && e.name !== "node_modules").map((e) => path.join(profiles, e.name));
 }
 
+// — cordis.patch.yml entry parsing (#3838) ————————————————————————————————
+
+interface DshPatchEntry {
+    /** Loader id as written in the `- id:` line (surrounding quotes stripped). */
+    id: string;
+    /** True when the entry's own block carries an indented `disabled: true` line. */
+    disabled: boolean;
+}
+
+/** Parse top-level `- id:` entries out of cordis.patch.yml content. Line-based
+ *  and forgiving — a malformed line simply yields no entry. A new `- id:` line
+ *  or ANY other top-level list item closes the previous entry, so a stray
+ *  `disabled:` line cannot leak into the wrong block; only an INDENTED
+ *  `disabled: true` inside the entry's own block counts as disabling it
+ *  (#3838: the #2462 cost-advisory scan ignored the flag entirely and fired
+ *  for explicitly disabled plugins). Duplicate ids are kept per occurrence —
+ *  callers decide how duplicates combine. The single source of truth for
+ *  patch-layer enablement semantics: both the #2462 cost advisory and the
+ *  #2861 host-plugin notice scan through this so they can never drift apart. */
+export function parseDshPatchEntries(text: string): DshPatchEntry[] {
+    const itemRe = /^\s*-\s*id\s*:\s*(\S+)/;
+    const listItemRe = /^\s*-\s/;
+    const disabledRe = /^\s+disabled\s*:\s*true\b/;
+    const out: DshPatchEntry[] = [];
+    let current: DshPatchEntry | undefined;
+    for (const line of text.split(/\r?\n/)) {
+        const m = line.match(itemRe);
+        if (m) {
+            if (current) out.push(current);
+            let v = m[1];
+            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+            v = v.trim();
+            current = v.length > 0 ? { id: v, disabled: false } : undefined;
+            continue;
+        }
+        if (listItemRe.test(line)) {
+            if (current) out.push(current);
+            current = undefined;
+            continue;
+        }
+        if (current && disabledRe.test(line)) current.disabled = true;
+    }
+    if (current) out.push(current);
+    return out;
+}
+
 // — legacy managed-block migration (#966) ————————————————————————————————————
 
 // Pre-unification installs wrote this block into every profile's
@@ -151,40 +197,60 @@ export function dshProfileDependsOnBili(profileDir: string): boolean {
  *  undefined when the manifest now declares the installed version (written or
  *  already in step), or a short reason when it was left untouched — callers
  *  log, never throw on this. */
-export function syncDshProfileManifestSpec(profileDir: string, installedVersion: string): string | undefined {
+interface DshManifestSpecPlan {
+    /** "rewrite": package.json must be replaced with nextRaw. "keep": no write. */
+    action: "keep" | "rewrite";
+    /** Short reason when the spec was left alone (callers log, never throw). */
+    reason?: string;
+    /** The new dependencies[billion-context] value (action === "rewrite" only). */
+    nextSpec?: string;
+    /** Full replacement manifest content, 2-space JSON + trailing newline. */
+    nextRaw?: string;
+}
+
+/** Pure planning half of syncDshProfileManifestSpec (#3496 split): decide what
+ *  the manifest SHOULD become without touching disk, so the caller can commit
+ *  manifest + lockfile changes as one transaction (all-or-nothing planning).
+ *  Rules are byte-identical to the pre-split function: only ^x.y.z / x.y.z
+ *  forms are rewritten (style preserved); local pins, dist-tags, ranges and
+ *  tilde specs are respected; already-in-step specs produce no rewrite. */
+export function planDshProfileManifestSpec(profileDir: string, installedVersion: string): DshManifestSpecPlan {
     const file = path.join(profileDir, "package.json");
     let raw: string;
     try {
         raw = fs.readFileSync(file, "utf8");
     } catch {
-        return "no readable package.json";
+        return { action: "keep", reason: "no readable package.json" };
     }
     let doc: { dependencies?: Record<string, unknown> };
     try {
         doc = JSON.parse(raw) as { dependencies?: Record<string, unknown> };
     } catch {
-        return "malformed package.json";
+        return { action: "keep", reason: "malformed package.json" };
     }
     const deps = doc.dependencies;
-    if (!deps || typeof deps[DSH_PACKAGE] !== "string") return "no billion-context dependency declared";
+    if (!deps || typeof deps[DSH_PACKAGE] !== "string") return { action: "keep", reason: "no billion-context dependency declared" };
     const spec = deps[DSH_PACKAGE];
-    if (!isRegistryDepSpec(spec)) return `local pin ${spec} respected`;
+    if (!isRegistryDepSpec(spec)) return { action: "keep", reason: `local pin ${spec} respected` };
     const m = spec.match(/^\^?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/);
-    if (!m) return `non-version spec ${spec} respected`;
-    if (m[1] === installedVersion) return undefined; // already in step — no rewrite
-    deps[DSH_PACKAGE] = spec.startsWith("^") ? `^${installedVersion}` : installedVersion;
-    // #2972-M1: write atomically (tmp sibling + rename, same discipline as
-    // persist.ts #2674) — a crash/power-loss mid-write must leave the host-owned
-    // dsh manifest byte-identical, never a torn package.json that breaks dsh's
-    // plugin reconcile. The tmp sits beside the target (same volume ⇒ rename atomic).
+    if (!m) return { action: "keep", reason: `non-version spec ${spec} respected` };
+    if (m[1] === installedVersion) return { action: "keep" }; // already in step — no rewrite
+    const nextSpec = spec.startsWith("^") ? `^${installedVersion}` : installedVersion;
+    deps[DSH_PACKAGE] = nextSpec;
+    return { action: "rewrite", nextSpec, nextRaw: JSON.stringify(doc, null, 2) + "\n" };
+}
+
+/** Atomic text write (tmp sibling + fsync + rename). #2972-M1: a crash or
+ *  power loss mid-write must leave the target byte-identical, never a torn
+ *  file that breaks dsh's plugin reconcile; the fsync before rename (#3157)
+ *  closes the write-but-not-rename window too. Returns undefined on success
+ *  or the OS error message. */
+function atomicWriteText(file: string, content: string): string | undefined {
     const tmp = `${file}.${process.pid}.tmp`;
     try {
-        // fsync before rename (#3157): #2972-M1 made this atomic but a crash
-        // between write and rename still left the host-owned dsh manifest as a
-        // size-correct VDL=0 zero file — same gap, now closed.
         const fd = fs.openSync(tmp, "w");
         try {
-            fs.writeFileSync(fd, JSON.stringify(doc, null, 2) + "\n");
+            fs.writeFileSync(fd, content);
             fs.fsyncSync(fd);
         } finally {
             fs.closeSync(fd);
@@ -192,9 +258,16 @@ export function syncDshProfileManifestSpec(profileDir: string, installedVersion:
         fs.renameSync(tmp, file);
     } catch (e) {
         try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ }
-        return `manifest write failed: ${e instanceof Error ? e.message : String(e)}`;
+        return e instanceof Error ? e.message : String(e);
     }
     return undefined;
+}
+
+export function syncDshProfileManifestSpec(profileDir: string, installedVersion: string): string | undefined {
+    const plan = planDshProfileManifestSpec(profileDir, installedVersion);
+    if (plan.action !== "rewrite") return plan.reason;
+    const err = atomicWriteText(path.join(profileDir, "package.json"), plan.nextRaw!);
+    return err !== undefined ? `manifest write failed: ${err}` : undefined;
 }
 
 /** The version of the profile's installed billion-context copy, or undefined

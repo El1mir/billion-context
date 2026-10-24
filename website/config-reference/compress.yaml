@@ -132,6 +132,26 @@ entries:
     desc_zh: "可折叠片段的最小字符数；更短的永不折叠。"
     site_en: "Smallest foldable range, in characters (kernel default ≈5000) — shorter ranges never fold."
     site_zh: "可折叠片段的最小字符数（内核默认约 5000），更短的永不折叠。"
+  - key: compress.maxSummaryLength
+    type: number
+    default: "kernel 20000"
+    group: compress
+    id: cw.msl
+    render: compress-row
+    desc_en: "Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded."
+    desc_zh: "单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。"
+    site_en: "Hard cap, in characters, on one generated summary (kernel default 20000): longer replies are rejected whole by the kernel check or the external-summary executor. External summarizers receive this exact cap in their instructions (#3635); 0 disables the cap."
+    site_zh: "单条生成摘要的硬上限，单位为字符（内核默认 20000）：超长的回复由内核检查或外部摘要执行器整段拒绝。外部摘要模型的指令中会写明这个确切上限（#3635）；0 禁用上限。"
+  - key: compress.minSummaryLength
+    type: number
+    default: "kernel 50"
+    group: compress
+    id: cw.mnl
+    render: compress-row
+    desc_en: "Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635)."
+    desc_zh: "生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。"
+    site_en: "Floor, in characters, for generated summaries (kernel default 50): shorter replies are rejected whole; 0 disables the floor. External summarizers are held to the same floor (#3635)."
+    site_zh: "生成摘要的下限，单位为字符（内核默认 50）：过短的回复被整段拒绝；0 禁下限。外部摘要模型受同一下限约束（#3635）。"
   - key: compress.reconcile
     type: "\"off\" | \"warn\" | \"repair\""
     default: "\"repair\""
@@ -219,10 +239,10 @@ entries:
     group: compress
     id: ct.rules
     render: compress-row
-    desc_en: "Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command."
-    desc_zh: "通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。"
-    site_en: "Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command."
-    site_zh: "默认关：通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护。pi/omp 提供 /acp-rule 命令。"
+    desc_en: "Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface."
+    desc_zh: "通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。"
+    site_en: "Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode."
+    site_zh: "默认关：通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护。pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下无效。"
   - key: compress.injectTool
     type: boolean
     default: "true"
@@ -255,6 +275,16 @@ entries:
     desc_zh: "丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
     site_en: "{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
     site_zh: "{ drop?, threshold? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
+  - key: compress.absorb
+    type: object
+    default: "opt-in (disabled)"
+    group: compress
+    id: co.absorb
+    render: obj-item
+    desc_en: "Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify."
+    desc_zh: "可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。"
+    site_en: "<code>absorb</code> — opt-in instant distillation of tool results into short abstracts; originals go to the content store; by default only image-bearing results qualify (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, mediaOnly (default true), toolName \"absorb\"</span>)."
+    site_zh: "<code>absorb</code> —— 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库；默认仅图片类结果参与（<span class='mech'>enabled, minToolTokens(默认 1000), contextThresholdPct, excludeTools, mediaOnly(默认 true), toolName \"absorb\"</span>）。"
   - key: compress.ccr
     type: object
     default: "enabled in proxy mode since v2"
@@ -325,6 +355,16 @@ entries:
     desc_zh: "w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。"
     site_en: "<code>priceProfile</code> — <span class='mech'>w / r / q</span> ratios normalized to the input price (write / cache-read / output); unset ⇒ models.dev $/Mtok registry rows, kernel fallback {1, 0.1, 4}. Report-only — never affects triggers or the wire."
     site_zh: "<code>priceProfile</code> —— <span class='mech'>w / r / q</span> 相对输入价的比率（写入/缓存读/输出）；未设置 ⇒ 取 models.dev $/Mtok 注册表行，内核兜底 {1, 0.1, 4}。仅供报告，不影响触发条件或线上行为。"
+  - key: compress.externalSummary
+    type: object
+    default: "opt-in (disabled)"
+    group: compress
+    id: co.es
+    render: obj-item
+    desc_en: "Sends compression summaries to separately configured models referenced from the providers table; whole-chain replace semantics at all three compress levels."
+    desc_zh: "把压缩摘要交给 providers 表引用的独立配置模型；三级 compress 均为整链替换语义。"
+    site_en: "<code>externalSummary</code> — optional chain of external summary models, each target a \"provider/model\" reference into the <code>providers</code> table; disabled unless <code>enabled</code> is true, targets tried in order with fall-through (<span class='mech'>enabled, targets, budget {totalTimeoutMs, targetTimeoutMs, maxSummaryBytes}, concurrency, autoFold, autoFoldTargetTokens</span>). Whole-chain replace semantics at all three compress levels."
+    site_zh: "<code>externalSummary</code> —— 可选的外部摘要模型链，每个目标为指向 <code>providers</code> 表的 \"provider/model\" 引用；<code>enabled</code> 为 true 才启用，目标按顺序尝试、失败落到下一个（<span class='mech'>enabled, targets, budget {totalTimeoutMs, targetTimeoutMs, maxSummaryBytes}, concurrency, autoFold, autoFoldTargetTokens</span>）。三级 compress 均为整链替换语义。"
   - key: compress.acknowledgePromptsRisk
     type: boolean
     default: "false"
@@ -335,6 +375,42 @@ entries:
     desc_zh: "必须先置 true，自定义 prompts 才会生效。"
     site_en: "<code>acknowledgePromptsRisk</code> — must be true before custom prompts take effect."
     site_zh: "<code>acknowledgePromptsRisk</code> —— 必须先置 true，自定义 prompts 才会生效。"
+  - key: compress.absorb.enabled
+    type: boolean
+    default: "false"
+    group: compress
+    desc_en: "Enable the absorb distillation block."
+    desc_zh: "启用 absorb 蒸馏块。"
+  - key: compress.absorb.minToolTokens
+    type: number
+    default: "1000"
+    group: compress
+    desc_en: "Minimum estimated token size of a tool result eligible for absorption."
+    desc_zh: "可被吸收的工具结果的最小估算 token 大小。"
+  - key: compress.absorb.contextThresholdPct
+    type: "number | %"
+    default: "unset"
+    group: compress
+    desc_en: "Only absorb when context usage passes this share of the window."
+    desc_zh: "仅当上下文使用率超过窗口该占比时才吸收。"
+  - key: compress.absorb.excludeTools
+    type: "string[]"
+    default: "[]"
+    group: compress
+    desc_en: "Tool names excluded from absorption."
+    desc_zh: "排除出吸收范围的工具名。"
+  - key: compress.absorb.toolName
+    type: string
+    default: "\"absorb\""
+    group: compress
+    desc_en: "Registered name of the absorb tool."
+    desc_zh: "absorb 工具的注册名。"
+  - key: compress.absorb.mediaOnly
+    type: boolean
+    default: "true"
+    group: compress
+    desc_en: "Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result."
+    desc_zh: "仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。"
   - key: compress.ccr.enabled
     type: boolean
     default: "true (proxy mode)"

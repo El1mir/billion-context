@@ -218,7 +218,7 @@ describe("escalation semantics (#2915) — the #2821 death spiral stays closed",
             assert.equal(r.unmatched, 1, `${gen}: only the changed preamble id is honest loss`);
             assert.equal(r.reaped, 0, `${gen}: no zombie reap`);
         }
-        assert.ok(!logs.some((l) => l.msg.includes("compression substrate appears destroyed")),
+        assert.ok(!logs.some((l) => l.msg.includes("fold epoch confirmation required")),
             "the #2821 verdict must never fire for re-mint churn");
         assert.ok(session.metadata.foldDriftEscalated === undefined, "escalation latch never sets");
         assert.ok(session.metadata.foldDriftStreak === undefined || session.metadata.foldDriftStreak === 0,
@@ -266,7 +266,7 @@ describe("escalation semantics (#2915) — the #2821 death spiral stays closed",
             assert.equal(r.byPos, 11, `${gen}: positional copy regenerated — order carries the re-mint`);
             assert.equal(r.unmatched, 1, `${gen}: only the changed preamble`);
         }
-        assert.ok(!logs.some((l) => l.msg.includes("compression substrate appears destroyed")));
+        assert.ok(!logs.some((l) => l.msg.includes("fold epoch confirmation required")));
     });
 });
 
@@ -357,7 +357,7 @@ describe("escalation latch recovery (review gap ②) — upgrade-in-place heals"
         }
         assert.equal(session.metadata.foldDriftEscalated, true, "latched after 3 consecutive total-drift passes");
         assert.equal(session.metadata.foldDriftStreak, 3);
-        assert.equal(logs.filter((l) => l.msg.includes("compression substrate appears destroyed")).length, 1,
+        assert.equal(logs.filter((l) => l.msg.includes("fold epoch confirmation required")).length, 1,
             "#2297: exactly ONE error line per episode");
 
         // healthy resend of the ORIGINAL bytes: missing=0 → noop, and the

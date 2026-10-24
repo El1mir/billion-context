@@ -8,7 +8,7 @@ import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { maybeAdoptResume } from "../src/fork-adoption.ts";
+import { maybeAdoptResume, maybeAdoptDerivedFork, incomingCoreMessages } from "../src/fork-adoption.ts";
 import type { Session } from "../src/session.ts";
 import { listSessions } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
@@ -363,4 +363,93 @@ test("derived fork inherits parent refs and blocks via message-id intersection",
 
     // Parent session must stay untouched (copy-on-fork).
     assert.ok(r.parentUntouched, "parent session must stay untouched");
+});
+
+/**
+ * #3351: the weak-link gate must mirror the boot sweep's discipline — close
+ * ONLY when blocks were actually adopted. Pre-fix, maybeAdoptDerivedFork set
+ * derivedBlocksAdopted=true unconditionally right after maybeAdoptResume, so a
+ * multi-hop grandchild whose registered parent was still young (zero folds) at
+ * first contact permanently lost eligibility: the link lands exactly once
+ * (handle.ts gates it on derivedFromSessionId === undefined) and the
+ * prematurely-persisted marker made every later boot sweep skip it. These pin
+ * the gate discipline directly at the changed seam; the restart convergence is
+ * covered by the lineage-reconcile-boot suite (AC9/AC12).
+ */
+
+function sharedWireBody(): { parsed: unknown; ids: string[] } {
+    const parsed = {
+        messages: [
+            { role: "user", content: "shared turn one" },
+            { role: "assistant", content: "shared reply one" },
+        ],
+    };
+    const msgs = incomingCoreMessages("openai", parsed);
+    assert.ok(msgs && msgs.length === 2, "wire body must yield two core messages");
+    return { parsed, ids: msgs!.map((m) => m.id) };
+}
+
+function blankSession(id: string): Session {
+    return {
+        id,
+        metadata: {},
+        // A real session always carries a content store; supply an empty one so
+        // contentStoreOf short-circuits instead of probing the (disabled) store.
+        contentStore: { version: 1, byHash: {}, byRef: {} },
+        state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, tokenSnapshot: {}, nextBlockId: 1, nextRunId: 1 },
+        blockContents: new Map(),
+    } as unknown as Session;
+}
+
+function seedParentRefs(parent: Session, ids: string[]): void {
+    parent.state.messageRefs.byRaw = { [ids[0]!]: "m00001", [ids[1]!]: "m00002" };
+    parent.state.messageRefs.byRef = { m00001: ids[0]!, m00002: ids[1]! };
+}
+
+test("#3351: weak-link gate stays OPEN when the registered parent has no blocks at first contact", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const { parsed, ids } = sharedWireBody();
+    const [idA] = [ids[0]!, ids[1]!];
+    assert.ok(ids[0] && ids[1] && ids[0] !== ids[1], "core message ids must be distinct");
+
+    const parent = blankSession("P");
+    seedParentRefs(parent, ids);
+    assert.equal(parent.state.blocks.length, 0, "precondition: parent is young (no folds yet)");
+
+    const child = blankSession("G");
+    child.metadata.derivedFromSessionId = "P";
+    maybeAdoptDerivedFork({ session: child, parent, protocol: "openai", parsed, upstreamOrigin: "http://127.0.0.1", enabled: true, log: () => {} });
+
+    assert.ok(idA in child.state.messageRefs.byRaw, "refs-only inheritance still happens against a young parent");
+    assert.equal(child.state.blocks.length, 0, "no block adopted from a block-less parent");
+    assert.notEqual(child.metadata.derivedBlocksAdopted, true, "#3351: gate must stay OPEN so a later boot can adopt once the parent folds");
+});
+
+test("#3351: weak-link gate CLOSES when the registered parent has fully-present blocks", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const { parsed, ids } = sharedWireBody();
+
+    const parent = blankSession("P");
+    seedParentRefs(parent, ids);
+    parent.state.blocks.push({
+        blockId: "b1",
+        runId: 1,
+        tier: 1,
+        active: true,
+        summary: "summary over the shared prefix",
+        directMessageIds: [ids[0]!],
+        effectiveMessageIds: [...ids],
+        directBlockIds: [],
+        createdAt: 0,
+        compressedTokens: 900,
+    } as unknown as (typeof parent.state.blocks)[number]);
+    parent.blockContents.set("b1", { full: { text: "summary over the shared prefix", count: 1 }, one: null } as never);
+
+    const child = blankSession("G");
+    child.metadata.derivedFromSessionId = "P";
+    maybeAdoptDerivedFork({ session: child, parent, protocol: "openai", parsed, upstreamOrigin: "http://127.0.0.1", enabled: true, log: () => {} });
+
+    assert.equal(child.state.blocks.length, 1, "block adopted from a folded parent");
+    assert.equal(child.metadata.derivedBlocksAdopted, true, "gate closes on real block adoption");
+    assert.ok(child.blockContents.has("b1"), "adopted block carries its stored content");
 });

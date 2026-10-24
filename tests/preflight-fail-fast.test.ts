@@ -8,10 +8,13 @@ process.env.NODE_ENV = "test";
 // exponential backoff — these tests are about the post-retry behavior.
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 
-import { defaultConfig, type Config } from "acp-kernel";
+import { createCore, defaultConfig, type Config } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { type CompressSettings, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { METADATA_FOLD_COVERAGE } from "../src/fold-reconcile.ts";
+import { getSession } from "../src/session.ts";
+import { normalizeUpstreamOrigin } from "../src/util.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 // #301: when preflight (overflow) compression cannot proceed — the summary
@@ -88,6 +91,19 @@ function makeUpstreamOk(calls?: Call[]): http.Server {
     });
 }
 
+// #4185: zero-evidence identified sessions with a DETERMINISTIC exhaustion
+// (nothing compressible left after maximum folding) now forward once for
+// upstream arbitration instead of failing fast locally. The seeded pins below
+// are exactly that shape, so each carries a settled usage baseline to keep
+// exercising the evidence-driven verdict; relay-dependent failures (429'd or
+// empty summaries) stay on the classic path and need no seeding.
+function seedEvidence(sessionId: string, upstreamPort: number): void {
+    const s = getSession(sessionId);
+    s.stats.lastInputTokens = 100;
+    s.stats.lastInputTokensSource = "usage";
+    s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(`http://127.0.0.1:${upstreamPort}`);
+}
+
 function startProxy(upstreamPort: number, models: Record<string, { context: number }>, kernelOverrides?: Partial<Config>, compressOverrides?: Partial<CompressSettings>): Promise<http.Server> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -116,6 +132,55 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
     } as ProxyOptions);
 }
 
+test("Responses short wire projection preserves main folds through the full request pipeline", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstreamOk(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort, { "gpt-short-wire": { context: 400_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const post = async (input: unknown[]) => {
+        const response = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`, {
+            method: "POST", headers: { "content-type": "application/json", "x-acp-session": "short-wire-pipeline" },
+            body: JSON.stringify({ model: "gpt-short-wire", stream: true, max_output_tokens: 1024, input }),
+        });
+        const body = await response.text();
+        assert.equal(response.status, 200, body.slice(0, 300));
+    };
+    try {
+        const main = Array.from({ length: 24 }, (_, i) => ({ type: "message", role: i % 2 ? "assistant" : "user", content: `main turn ${i} ${"x".repeat(2000)}` }));
+        await post(main);
+        const session = getSession("short-wire-pipeline");
+        const messages = session.lastMessages;
+        assert.ok(messages && messages.length >= 24);
+        session.state = createCore().applyCompression({
+            ranges: [{ startRef: "m00001", endRef: "m00007", summary: "Compressed main history: seven early turns preserved the investigation, implementation decisions, and verified test evidence." }],
+            messages, state: session.state, config: defaultConfig(400_000),
+        }).state;
+        assert.equal(session.state.blocks.length, 1);
+        await post(main);
+        const blockIds = session.state.blocks.map((b) => b.blockId);
+        const coverage = structuredClone(session.metadata[METADATA_FOLD_COVERAGE]);
+        assert.ok(coverage);
+        const short = Array.from({ length: 6 }, (_, i) => ({
+            type: "message", role: "user",
+            content: Array.from({ length: 13 }, (_, j) => ({ type: "input_text", text: `utility ${i} part ${j}` })),
+        }));
+        for (let i = 0; i < 4; i++) await post(short);
+        assert.deepEqual(session.metadata[METADATA_FOLD_COVERAGE], coverage, "auxiliary projection must not accumulate deletion evidence");
+        assert.deepEqual(session.state.blocks.map((b) => b.blockId), blockIds);
+        await post(main);
+        assert.deepEqual(session.state.blocks.map((b) => b.blockId), blockIds);
+        assert.ok(session.state.blocks.every((b) => b.active), "returning main history reactivates every retained fold");
+    } finally {
+        proxy.close(); proxy.closeIdleConnections?.();
+        upstream.close(); upstream.closeIdleConnections?.();
+        await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+    }
+});
+
 test("e2e #301: overflow + summary upstream 429 → structured 503, over-window payload NOT forwarded", async () => {
     const calls: Call[] = [];
     // The preflight summarization call hits the same rate-limited upstream as
@@ -133,6 +198,8 @@ test("e2e #301: overflow + summary upstream 429 → structured 503, over-window 
         // Fresh session: a ~13k-token history against a 10k window — the
         // payload itself overflows, preflight fires, its summarization call
         // 429s. The proxy must fail fast, NOT forward the over-window body.
+        // (#4185) the 429 is relay-dependent, so the identified-fresh escape
+        // stays closed and this pin needs no evidence seeding.
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-429-sess" },
@@ -225,7 +292,7 @@ test("e2e #301: payload fits the window + preflight 429 → request still forwar
     }
 });
 
-test("e2e #301: over-window payload with nothing compressible → structured 502, no summary call, no forward", async () => {
+test("e2e #301: over-window payload with nothing compressible → structured 413 (#3461), no summary call, no forward", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
@@ -243,6 +310,7 @@ test("e2e #301: over-window payload with nothing compressible → structured 502
 
     try {
         const filler = "FILLER_".repeat(7000);
+        seedEvidence("preflight-exhausted-sess", upstreamPort);
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-exhausted-sess" },
@@ -256,7 +324,7 @@ test("e2e #301: over-window payload with nothing compressible → structured 502
                 ],
             }),
         });
-        assert.equal(r.status, 502, "fail-fast 502 when nothing is compressible");
+        assert.equal(r.status, 413, "fail-fast 413 when nothing is compressible (#3461: deterministic exhaustion is non-retryable)");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string; retryable?: boolean } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.equal(json.error?.retryable, false);
@@ -391,6 +459,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
 
     try {
         const filler = "FILLER_".repeat(7000);
+        seedEvidence("preflight-shrink-sess", upstreamPort);
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-shrink-sess" },
@@ -404,7 +473,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
                 ],
             }),
         });
-        assert.equal(r.status, 502, "fail-fast 502 when nothing is compressible under the shrunken window");
+        assert.equal(r.status, 413, "fail-fast 413 when nothing is compressible under the shrunken window (#3461)");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         const msg = json.error?.message ?? "";
@@ -420,6 +489,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
         const proxyPlain = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, { protectedTools: ["bash"] });
         await once(proxyPlain, "listening");
         const plainPort = (proxyPlain.address() as { port: number }).port;
+        seedEvidence("preflight-shrink-plain-sess", upstreamPort);
         const r2 = await fetch(`http://127.0.0.1:${plainPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-shrink-plain-sess" },
@@ -433,7 +503,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
                 ],
             }),
         });
-        assert.equal(r2.status, 502);
+        assert.equal(r2.status, 413);
         const msg2 = (JSON.parse(await r2.text()) as { error?: { message?: string } }).error?.message ?? "";
         assert.ok(!msg2.includes("full window"), `no shrink note when the window was not operator-shrunk (got: ${msg2})`);
         proxyPlain.close();
@@ -474,6 +544,7 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
 
     try {
         const filler = "FILLER_".repeat(7000);
+        seedEvidence("preflight-headroom-sess", upstreamPort);
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-headroom-sess" },
@@ -487,7 +558,7 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
                 ],
             }),
         });
-        assert.equal(r.status, 502, "fail-fast 502 when nothing is compressible under the headroom-shrunk window");
+        assert.equal(r.status, 413, "fail-fast 413 when nothing is compressible under the headroom-shrunk window (#3461)");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         const msg = json.error?.message ?? "";

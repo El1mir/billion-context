@@ -24,6 +24,7 @@ const root = process.cwd();
 const ENTRY_FILES = new Set([
     "src/index.ts",
     "src/mcp.ts",
+    "src/claude-mcp-entry.ts",
     "src/claude-native-bootstrap.ts",
     "src/agent/pi.ts",
     "src/agent/pi-native.ts",
@@ -33,6 +34,7 @@ const ENTRY_FILES = new Set([
     "src/agent/opencode-native.ts",
     "src/agent/dsh-acp.ts",
     "src/agent/dsh-native.ts",
+    "src/agent/dsh-compaction-gate.ts",
     "src/kimi/native-mcp.ts",
     "src/kimi/bootstrap-hook.ts",
     "src/zcode/mcp-entry.ts",
@@ -80,6 +82,16 @@ const WAIVERS = new Map([
     // inside src/session.ts (callers use them structurally); the functions
     // themselves have cross-file refs (admin.ts, tests/) and need none.
     ["src/session.ts", new Set(["ResidentFieldBreakdown", "MemoryReport"])],
+    // #3754 install attribution: the /__bili/status lastInstall payload
+    // interface is referenced only inside src/update.ts (admin.ts consumes it
+    // structurally via Awaited<ReturnType<typeof getLastInstall>>); keep the
+    // export so the wire shape stays named at its definition site.
+    ["src/update.ts", new Set(["LastInstallRecord"])],
+    // #3962 gate telemetry: the coverage record crosses the gate/dsh-native
+    // BUNDLE boundary on the globalThis channel — consumers use it
+    // structurally through dshCompactionGateTelemetry()'s return type; keep
+    // the export so the channel payload stays named at its definition site.
+    ["src/agent/dsh-compaction-disable.ts", new Set(["DshCompactionGateTelemetry"])],
 ]);
 
 const findings = [];

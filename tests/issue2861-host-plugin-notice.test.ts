@@ -214,7 +214,7 @@ test("#2861: wiring drift guards (seam export, banner slot, i18n refs, payload f
     for (const k of ['t("hostplug.on")', 't("hostplug.desc")', 't("hostplug.hint")', 't("hostplug.dismiss_btn")', 't("hostplug.dismissed")']) {
         assert.ok(WEB_CLIENT.includes(k), `i18n key ${k} referenced literally (dead-key lint)`);
     }
-    assert.ok(WEB_CLIENT.includes("/__bili/host-plugins/dismiss"), "dismiss POST target present");
+    assert.ok(WEB_CLIENT.includes('API_ROOT + "/host-plugins/dismiss"'), "dismiss POST target present");
     const here = dirname(fileURLToPath(import.meta.url));
     const adminSrc = fs.readFileSync(join(here, "..", "src", "server", "admin.ts"), "utf8");
     assert.ok(adminSrc.includes("hostPluginNotices: visibleHostPluginNotices(process.env)"), "overview payload carries the field");

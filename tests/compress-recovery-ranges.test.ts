@@ -183,11 +183,24 @@ test("#3192: a dropped message's DEAD ref is never re-advertised by the receipt 
     const rejected = request(ctx, "m00001", "m00005");
     assert.equal(rejected.outcome, "refused");
     assert.match(rejected.text, /cannot be anchored/);
-    // No advertised compressible span may cross the dead ref m00005.
-    assert.doesNotMatch(rejected.text, /m0000[1-4]\s*[–-]\s*m0000[5-9]/);
-    // The only live span bracketed the dead ref -> stop instruction, not a doomed retry span.
-    assert.match(rejected.text, /continue the task without compressing/);
-    assert.doesNotMatch(rejected.text, /use these refs exactly as listed/);
+    // No advertised compressible span may cross the dead ref m00005 — the red gate
+    // on the unfixed kernel (it advertised one span m00001–m00007 crossing m00005).
+    const advertised = advertisedRanges(rejected.text);
+    assert.ok(advertised.length > 0, `receipt must advertise the surviving sub-spans: ${rejected.text}`);
+    for (const [start, end] of advertised) {
+        assert.ok(!spanContains(start, end, 5), `${start}..${end} must not span the dead ref m00005`);
+    }
+    // The kernel SPLIT around the hole into adjacent live sub-spans (not a whole-span
+    // drop): the run before the hole ends at/before m00004, the run after starts at/
+    // after m00006. Both present proves the split rather than a silent drop.
+    assert.ok(
+        advertised.some(([start, end]) => Number(start.slice(1)) <= 4 && Number(end.slice(1)) <= 4),
+        `pre-hole sub-span must be advertised: ${JSON.stringify(advertised)}`,
+    );
+    assert.ok(
+        advertised.some(([start, end]) => Number(start.slice(1)) >= 6 && Number(end.slice(1)) >= 6),
+        `post-hole sub-span must be advertised: ${JSON.stringify(advertised)}`,
+    );
 
     // Receipt and acp_status share ONE eligibility source (liveCompressionRanges);
     // pin that source so the two surfaces cannot drift apart again (#2778 promise).

@@ -12,7 +12,9 @@ import type { ExtensionAPI as PiExtensionAPI, ExtensionContext as PiExtensionCon
 import type { KeyId } from "@earendil-works/pi-tui";
 import {
     ACP_DELEGATE_PROMPT,
+    addPromptSection,
     DEFAULT_DELEGATE_POLICY,
+    DELEGATE_PROMPT_SECTION,
     DELEGATE_STAND_DOWN_MESSAGE,
     delegateStatusWidget,
     findPiSubagentsInstalls,
@@ -64,12 +66,6 @@ function releaseEmbedded(): void {
 function hasBuildContextEntries(ctx: unknown): boolean {
     const sm = (ctx as { sessionManager?: unknown } | undefined)?.sessionManager as { buildContextEntries?: unknown } | undefined;
     return typeof sm?.buildContextEntries === "function";
-}
-
-function normalizeSystemPrompt(input: string | string[] | undefined): string {
-    if (input === undefined) return "";
-    if (Array.isArray(input)) return input.join("\n");
-    return input;
 }
 
 // #2230 config-home: map the `pi.subagents` section of billion-context.json
@@ -219,10 +215,8 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
 
     pi.on("before_agent_start", (rawEvent) => {
         if (!state.policy.enabled || state.stoodDown) return;
-        const event = rawEvent as unknown as { systemPrompt?: string | string[] };
         const text = state.delegatePrompt !== undefined ? state.delegatePrompt : ACP_DELEGATE_PROMPT;
         if (typeof text !== "string") return;
-        const base = normalizeSystemPrompt(event.systemPrompt);
-        return { systemPrompt: `${base}\n\n${text}` };
+        return addPromptSection(rawEvent, DELEGATE_PROMPT_SECTION, text);
     });
 }

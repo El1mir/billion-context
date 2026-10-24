@@ -13,6 +13,24 @@ import {
     type GuardrailOptions,
 } from "../src/agent/tool-guardrails.ts";
 import type { ExtensionAPI } from "../src/agent/pi.ts";
+import { guardrailBashTimeout } from "../src/knobs.ts";
+
+function withEnv(env: Record<string, string | undefined>, fn: () => void): void {
+    const saved: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(env)) {
+        saved[k] = process.env[k];
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+    }
+    try {
+        fn();
+    } finally {
+        for (const [k, v] of Object.entries(saved)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+    }
+}
 
 type TextPart = { type: "text"; text: string };
 type NonTextPart = { type: string } & Record<string, unknown>;
@@ -34,8 +52,9 @@ test("resolveBashTimeout returns undefined when the default is disabled (0 / neg
     assert.equal(resolveBashTimeout({}, Number.NaN), undefined);
 });
 
-test("resolveBashTimeout falls back to the 60s built-in default when default is undefined", () => {
-    assert.equal(resolveBashTimeout({}, undefined), 60);
+test("resolveBashTimeout does NOT inject when the default is undefined (no built-in fallback, #3331)", () => {
+    assert.equal(resolveBashTimeout({}, undefined), undefined);
+    assert.equal(resolveBashTimeout({ timeout: undefined }, undefined), undefined);
 });
 
 test("capToolOutput leaves small output untouched (returns undefined)", () => {
@@ -171,6 +190,37 @@ test("wireToolGuardrails applies the documented 50KB default when maxBytes is un
     const t = textOf(ret.content[0]);
     assert.match(t, /\[ACP guardrail/);
     assert.ok(Buffer.byteLength(t, "utf8") < 60 * 1024, "payload must be truncated near the 50KB default");
+});
+
+test("wireToolGuardrails is pass-through: no opts means NO injection (the 60s default lives in guardrailBashTimeout so 0 can disable end-to-end)", () => {
+    const w = wireRepetition();
+    const call = { toolName: "bash", toolCallId: "b1", input: { command: "npm install" } as { command: string; timeout?: number } };
+    w.call(call);
+    assert.equal(call.input.timeout, undefined, "wireToolGuardrails itself must not re-default — knobs own the default");
+});
+test("pi lane end-to-end: guardrailBashTimeout() default injects 60 (#3066 anti-hang), 0 disables", () => {
+    assert.equal(guardrailBashTimeout(), 60, "#3066 owner default — unsupervised bash hung pi sessions for a day");
+    withEnv({ BILI_GUARDRAIL_BASH_TIMEOUT: "0" }, () => {
+        assert.equal(guardrailBashTimeout(), undefined, "0 = pi-native no injection");
+    });
+    const w = wireRepetition({ bashTimeout: guardrailBashTimeout() });
+    const call = { toolName: "bash", toolCallId: "b1", input: { command: "npm install" } as { command: string; timeout?: number } };
+    w.call(call);
+    assert.equal(call.input.timeout, 60);
+});
+
+test("wireToolGuardrails injects the configured bashTimeout when the model omitted timeout", () => {
+    const w = wireRepetition({ bashTimeout: 90 });
+    const call = { toolName: "bash", toolCallId: "b1", input: { command: "npm install" } as { command: string; timeout?: number } };
+    w.call(call);
+    assert.equal(call.input.timeout, 90);
+});
+
+test("wireToolGuardrails never overrides an explicit per-call timeout", () => {
+    const w = wireRepetition({ bashTimeout: 90 });
+    const call = { toolName: "bash", toolCallId: "b2", input: { command: "sleep", timeout: 600 } };
+    w.call(call);
+    assert.equal(call.input.timeout, 600);
 });
 
 test("wireToolGuardrails keeps an explicit maxBytes: 0 as disable", () => {

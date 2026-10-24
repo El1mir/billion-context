@@ -29,7 +29,7 @@ import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { piPackageStrings } from "../plugin-install.js";
-import { createBiliPlugin } from "./pi.js";
+import { createBiliPlugin, createPiDirectSendGuard } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { loadConfigFile } from "../config.js";
 import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
@@ -118,6 +118,10 @@ function errMessage(err: unknown): string {
 }
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+// #3304: the pi extension swaps payloads inside its runner — the guard
+// sniffs the outgoing envelope and restores the stashed original before any
+// direct-send fall-back reaches the real upstream.
+state.prepareDirectSend = createPiDirectSendGuard();
 
 async function bootstrap(): Promise<string | undefined> {
     try {
@@ -161,8 +165,12 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  fallback origin, or undefined when nothing came up. */
 export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
     // #1365: routed evidence outranks the planned origin — probe where the
-    // model channel actually points, not where the env says it should.
-    const home = state.routedOrigin ?? attachOrigin;
+    // model channel actually points, not where the env says it should. An
+    // EXPLICIT BILLION_CONTEXT_ATTACH outranks both: it names the plugin API
+    // endpoint directly, and a routed model origin may be a plain model-only
+    // path (e.g. an admin-gated port) that never exposes the plugin manifest.
+    const explicitAttachOrigin = nativeAttachOrigin(process.env);
+    const home = explicitAttachOrigin ?? state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
     if (version !== undefined) {
         // Restore the readyOrigin short-circuit — a runtime recovery clears
@@ -172,7 +180,7 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
         process.env.BILLION_CONTEXT_PROXY = home;
         return home;
     }
-    const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    const pinned = explicitAttachOrigin ?? state.routedOrigin ?? (await observeRoutedOrigin(state));
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
         if (back !== undefined) {
@@ -181,7 +189,13 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
             logHostEvent("info", "[native-client]", `bili-native(pi): attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
-        logHostEvent("error", "[native-client]", `bili-native(pi): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        logHostEvent(
+            "error",
+            "[native-client]",
+            explicitAttachOrigin !== undefined
+                ? `bili-native(pi): explicit attach target ${pinned} unreachable within the health deadline — refusing to spawn a second instance (your declared endpoint stays authoritative). Start your proxy at ${pinned} or unset BILLION_CONTEXT_ATTACH; bili keeps re-checking and self-heals when it comes back.`
+                : `bili-native(pi): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`,
+        );
         state.origin = undefined;
         return undefined;
     }

@@ -49,6 +49,38 @@ export const WIRE_RULES: readonly WireRule[] = [
             "bili #3159 production 400 (dsh-vertex-argon 1.1.4 / DSH 0.2.0-rc.2 over billion-context 0.1.196, official Vertex endpoint, gemini-4-argon generateContent): after a successful tool call the next request 400'd because Bili appended a plain-text nudge AFTER the trailing functionResponse part. Controlled A/B matrix on the official endpoint (issue table, 2026-10-14): [functionResponse]→200, [functionResponse, text]→400, [text, functionResponse]→200. The Gemini Developer API accepts both orders — the strictness is Vertex-specific.",
     },
     {
+        id: "WC-019",
+        wire: "anthropic",
+        lane: "vertex-anthropic",
+        summary: 'on the Vertex Anthropic wire the API version is a BODY field, not a header: anthropic_version must be "vertex-2023-10-16" inside the request body, while the client still sends anthropic-version: 2023-06-01 as a header — both must survive to the upstream, and a compression path that rebuilds the body from an allowlist must carry anthropic_version or it drops the field the wire requires',
+        provenance:
+            'Anthropic Claude-on-Agent-Platform docs (platform.claude.com/docs/en/build-with-claude/claude-on-vertex-ai): "On Agent Platform, model is not passed in the request body. Instead, it is specified in the Google Cloud endpoint URL" and "anthropic_version is passed in the request body (rather than as a header), and must be set to the value vertex-2023-10-16". Both halves confirmed against the real client: the captured request in tests/fixtures/vertex-anthropic/ carries anthropic_version in the body AND anthropic-version: 2023-06-01 in the headers (claude-cli/2.1.300, 2026-10-15, loopback recorder). No rule is recorded for a body `model` field: whether Vertex tolerates one is unverified and the client never sends it.',
+    },
+    {
+        id: "WC-020",
+        wire: "anthropic",
+        lane: "vertex-anthropic",
+        summary: 'the Vertex Anthropic endpoint is the publisher path /v1/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:rawPredict|streamRawPredict and it is the ONLY source of the model — a request to /v1/messages, or any path carrying no model segment, is not this wire',
+        provenance:
+            'Vertex serves /v1/projects/…:rawPredict with a 429 quota error and 404s the version-less /projects/… form (live, 2026-10-15, project aolshev-playground); the real client appends that path verbatim to ANTHROPIC_VERTEX_BASE_URL, so the /v1 segment arrives from the base URL (capture, tests/fixtures/vertex-anthropic/). Google documents the same form in docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/use-claude. Enforcement in the fake is the upstream behavior itself: a wrong path answers 404.',
+    },
+    {
+        id: "WC-021",
+        wire: "anthropic",
+        lane: "vertex-anthropic",
+        summary: 'on :streamRawPredict an error body is a JSON ARRAY wrapping the error object ([{error:{…}}]) while the unary :rawPredict path sends the bare object — a consumer that assumes one shape breaks on the other',
+        provenance:
+            'live probe 2026-10-15: :streamRawPredict with "stream": true against the real endpoint answered 429 with an array-wrapped {"error":{"code":429,…,"status":"RESOURCE_EXHAUSTED"}}, the same request on :rawPredict answered the bare object. The fake reproduces the split so an error-path regression fails in CI rather than in production.',
+    },
+    {
+        id: "WC-022",
+        wire: "anthropic",
+        summary:
+            'tool_addition / tool_removal content blocks are only valid inside a role:"system" message in messages[] — the same blocks under role:"user" are a 400; a mid-conversation system message must therefore round-trip with its role intact, never be re-emitted as user or merged into an adjacent user turn',
+        provenance:
+            'live probe 2026-10-20 (pi 1.3.0 + pi-subagents 0.79.2, api.anthropic.com, claude-haiku-5-5) through a master b156c02f proxy: pi declares tools activated mid-session as tool_addition blocks inside a mid-conversation role:"system" message; #3410\'s unknown-block passthrough kept the blocks but coreToAnthropic re-emitted the message as role:"user" → upstream 400 "messages.2.content: \'tool_addition\'/\'tool_removal\' blocks are only permitted within `role: "system"` messages". On v0.1.202 the blocks were silently dropped instead (tools never reached the model). Repair: kernel/src/wire/anthropic.ts keeps each wire system message whole on the rawAnthropicMessage sidecar and re-emits it verbatim.',
+    },
+    {
         id: "WC-016",
         wire: "anthropic",
         summary:
@@ -225,10 +257,17 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** WC-001..WC-003, WC-007, WC-010, WC-016 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022 on an Anthropic /v1/messages body. Returns violation strings. */
 function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
+    if (Array.isArray(body.messages))
+        body.messages.forEach((m, i) => {
+            if (!isPlainObject(m) || m.role === "system" || !Array.isArray(m.content)) return;
+            for (const b of m.content)
+                if (isPlainObject(b) && (b.type === "tool_addition" || b.type === "tool_removal"))
+                    out.push(`WC-022 messages[${i}].content: '${b.type}' blocks are only permitted within role:"system" messages`);
+        });
     if ("prompt_cache_key" in body)
         out.push("WC-007 top-level prompt_cache_key is not part of the Anthropic Messages API (#1403)");
     // WC-010 runs before the tools early-return: breakpoints can live in
@@ -526,10 +565,18 @@ export const VALIDATORS: Record<Wire, (body: unknown) => string[]> = {
 export interface CapturedRequest {
     url: string;
     body: unknown;
+    /** Present on the Vertex Anthropic lane: the model read off the publisher path (the body never carries one). */
+    model?: string | null;
 }
+
+/** Lane-scoped fakes: a constraint that holds only on one client's or endpoint's lane lives in that lane's own
+ *  fake, not in the wire's shared VALIDATOR (WC-017's rule-scoping precedent). */
+type FakeLane = "vertex-anthropic";
 
 interface FakeUpstream {
     wire: Wire;
+    /** Set when the fake enforces a lane's contract rather than the wire's. */
+    lane?: FakeLane;
     port: number;
     url: string;
     requests: CapturedRequest[];
@@ -537,14 +584,15 @@ interface FakeUpstream {
     close(): Promise<void>;
 }
 
-function sse(res: http.ServerResponse, events: Array<[string, unknown]>): void {
+function sse(res: http.ServerResponse, events: Array<[string, unknown]>, opts?: { done?: boolean }): void {
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
     // OpenAI streams carry no `event:` line at all — only Anthropic/Gemini name their events.
     for (const [ev, data] of events) {
         if (ev) res.write(`event: ${ev}\n`);
         res.write(`data: ${JSON.stringify(data)}\n\n`);
     }
-    res.write("data: [DONE]\n\n");
+    // The [DONE] sentinel is an OpenAI convention; Anthropic and Vertex streams end at message_stop.
+    if (opts?.done !== false) res.write("data: [DONE]\n\n");
     res.end();
 }
 
@@ -617,6 +665,83 @@ function errorEnvelope(wire: Wire, message: string): { status: number; body: str
     }
 }
 
+/** Vertex Anthropic publisher path (WC-020). The model rides the path — the body never carries one. */
+const VERTEX_ANTHROPIC_PATH_RE =
+    /^\/v1\/projects\/(?<project>[^/]+)\/locations\/(?<location>[^/]+)\/publishers\/anthropic\/models\/(?<model>[^:]+):(?<method>rawPredict|streamRawPredict)$/;
+
+interface VertexAnthropicPathInfo {
+    readonly project: string;
+    readonly location: string;
+    readonly model: string;
+    readonly method: "rawPredict" | "streamRawPredict";
+}
+
+/** Parse the Vertex publisher path, or null when the URL is not that wire (WC-020). */
+export function vertexAnthropicPathInfo(url: string): VertexAnthropicPathInfo | null {
+    const m = VERTEX_ANTHROPIC_PATH_RE.exec(url.split("?")[0]);
+    if (!m?.groups) return null;
+    return {
+        project: m.groups.project,
+        location: m.groups.location,
+        model: m.groups.model,
+        method: m.groups.method as "rawPredict" | "streamRawPredict",
+    };
+}
+
+/** WC-019, lane-scoped: the version lives in the BODY on the Vertex Anthropic wire. Deliberately silent about a
+ *  body `model` field — whether Vertex tolerates one is unverified and the real client never sends it. */
+export function validateVertexAnthropicBody(body: unknown): string[] {
+    const out: string[] = [];
+    if (!isPlainObject(body)) return out;
+    if (body.anthropic_version !== "vertex-2023-10-16")
+        out.push(
+            `WC-019 anthropic_version must be "vertex-2023-10-16" in the body on the Vertex Anthropic wire (saw ${JSON.stringify(body.anthropic_version)}) — the version is a body field here, not a header`,
+        );
+    return out;
+}
+
+/** The doc-derived unary `Message` (msg_vrtx_ id) and the documented SSE sequence, ping included (see
+ *  tests/fixtures/vertex-anthropic/README.md — a parity test keeps this in step with the fixture). */
+function vertexAnthropicReply(res: http.ServerResponse, parsed: Record<string, unknown>, text: string, model: string | null): void {
+    const id = "msg_vrtx_fake";
+    if (parsed.stream !== true) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+            JSON.stringify({
+                id,
+                type: "message",
+                role: "assistant",
+                model: model ?? "claude-unknown",
+                content: [{ type: "text", text }],
+                stop_reason: "end_turn",
+                stop_sequence: null,
+                usage: { input_tokens: 10, output_tokens: 3 },
+            }),
+        );
+        return;
+    }
+    sse(
+        res,
+        [
+            ["message_start", { type: "message_start", message: { id, type: "message", role: "assistant", model: model ?? "claude-unknown", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1 } } }],
+            ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+            ["ping", { type: "ping" }],
+            ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }],
+            ["content_block_stop", { type: "content_block_stop", index: 0 }],
+            ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } }],
+            ["message_stop", { type: "message_stop" }],
+        ],
+        { done: false },
+    );
+}
+
+/** WC-021: the streaming path wraps errors in a JSON array, the unary path does not. Exported so the
+ *  ledger gate in tests/wire-contract.test.ts can probe this lane's live enforcement clause. */
+export function vertexErrorEnvelope(streaming: boolean, message: string): { status: number; body: string } {
+    const err = { error: { code: 400, message, status: "INVALID_ARGUMENT" } };
+    return { status: 400, body: streaming ? JSON.stringify([err]) : JSON.stringify(err) };
+}
+
 const PATH_MATCHERS: Record<Wire, (url: string) => boolean> = {
     anthropic: (u) => u.startsWith("/v1/messages"),
     "openai-chat": (u) => u.startsWith("/v1/chat/completions"),
@@ -625,12 +750,13 @@ const PATH_MATCHERS: Record<Wire, (url: string) => boolean> = {
 };
 
 /** Start a deterministic fake upstream for one wire protocol on a random loopback port. */
-export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string }): Promise<FakeUpstream> {
+export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string; lane?: FakeLane }): Promise<FakeUpstream> {
     const replyText = opts?.replyText ?? "ok";
+    const lane = opts?.lane;
     const requests: CapturedRequest[] = [];
     const violations: string[] = [];
-    const validate = VALIDATORS[wire];
-    const pathOk = PATH_MATCHERS[wire];
+    const validate = lane === "vertex-anthropic" ? validateVertexAnthropicBody : VALIDATORS[wire];
+    const pathOk = lane === "vertex-anthropic" ? (u: string) => vertexAnthropicPathInfo(u) !== null : PATH_MATCHERS[wire];
 
     const server = http.createServer((req, res) => {
         if (req.method === "GET" && wire === "responses" && req.url?.startsWith("/v1/models")) {
@@ -651,17 +777,25 @@ export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string 
                 parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
             } catch { /* non-JSON body: nothing to validate */ }
             const found = validate(parsed);
-            requests.push({ url: req.url ?? "", body: parsed });
+            const pathInfo = lane === "vertex-anthropic" ? vertexAnthropicPathInfo(req.url ?? "") : null;
+            const streaming = pathInfo?.method === "streamRawPredict";
+            requests.push({ url: req.url ?? "", body: parsed, ...(lane === "vertex-anthropic" ? { model: pathInfo?.model ?? null } : {}) });
             if (found.length > 0) {
                 violations.push(...found);
-                const env = errorEnvelope(wire, `wire-contract violation(s): ${found.join("; ")}`);
+                const env =
+                    lane === "vertex-anthropic"
+                        ? vertexErrorEnvelope(streaming === true, `wire-contract violation(s): ${found.join("; ")}`)
+                        : errorEnvelope(wire, `wire-contract violation(s): ${found.join("; ")}`);
                 res.writeHead(env.status, { "content-type": "application/json" });
                 res.end(env.body);
                 return;
             }
             const p = isPlainObject(parsed) ? parsed : {};
             switch (wire) {
-                case "anthropic": anthropicReply(res, replyText); break;
+                case "anthropic":
+                    if (lane === "vertex-anthropic") vertexAnthropicReply(res, p, replyText, pathInfo?.model ?? null);
+                    else anthropicReply(res, replyText);
+                    break;
                 case "openai-chat": openAiChatReply(res, p, replyText); break;
                 case "responses": responsesReply(res, p, replyText); break;
                 case "google": googleReply(res, replyText); break;
@@ -673,6 +807,7 @@ export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string 
     const port = (server.address() as { port: number }).port;
     return {
         wire,
+        ...(lane ? { lane } : {}),
         port,
         url: `http://127.0.0.1:${port}`,
         requests,

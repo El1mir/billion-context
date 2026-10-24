@@ -10,6 +10,7 @@ import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from ".
 import { logHostEvent } from "./host-log.js";
 
 import { envMillis } from "./native-bootstrap.js";
+import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
@@ -20,7 +21,22 @@ import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, 
  *  (protocol-shaped 422, the #2709 precedent) because forwarding it
  *  uncompressed cannot succeed — the body provably exceeds the model's
  *  context window. */
-export type GateVerdict = boolean | "refuse-oversized";
+export type GateVerdict = boolean | "refuse-oversized" | "refuse-oversized-unattributed";
+
+/** #3304: prepareDirectSend's verdict for one fall-back send to the real
+ *  upstream (see the state field). */
+export type DirectSendPrep =
+    | { outcome: "as-is" }
+    | { outcome: "restored"; body: string }
+    | { outcome: "unrestorable" };
+
+/** #3654: why createLiveOriginResolver found nothing to route to — the
+ *  refusal wording must tell a live-but-saturated proxy (the busy wait window
+ *  exhausted) apart from a dead one or a failed bootstrap. #4125:
+ *  "send-failed" marks the send-failure recovery paths (the held origin
+ *  answered its probe but the send threw, and recover() produced no
+ *  replacement) so a give-up line can name that branch too. */
+export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed" | "send-failed";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
@@ -35,6 +51,14 @@ export interface NativeInterceptState {
      *  BILLION_CONTEXT_PROXY env) so event-time ownership checks disarm with
      *  the traffic. */
     onGiveUp?: () => void;
+    /** #3654: set before createLiveOriginResolver returns undefined — why
+     *  nothing was routable (see UnavailableReason: "busy-exhausted" | "dead"
+     *  | "bootstrap-failed", plus #4125's "send-failed" set by the send-failure
+     *  recovery paths just before they fire onGiveUp); cleared on the next
+     *  successful resolution. The refusal builder reads it to keep a
+     *  live-but-saturated proxy out of "proxy unavailable" wording; the dsh
+     *  give-up seam appends it to the client event line (#4125). */
+    lastUnavailableReason?: UnavailableReason;
     /** Attach mode (#809): route through a user-supplied external proxy at
      *  state.origin instead of a spawned one. Set by the host entry when a
      *  BILLION_CONTEXT_ATTACH / launcher-preset BILLION_CONTEXT_PROXY is
@@ -62,15 +86,37 @@ export interface NativeInterceptState {
      *  the request init (body) and may spend async time; wire-mode requests
      *  (headersFor returns nothing) still pass through it — the hook itself
      *  gates on its own conditions. */
-    beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
+     beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
+    /** #3304: consulted immediately before ANY fall-back send to the REAL
+     *  upstream (proxy-death give-up, bootstrap-fail, unattributed direct,
+     *  signed passthrough). Lanes that mutate the outgoing payload (the
+     *  incremental-turn adapters) arm it; every other lane leaves it
+     *  undefined and each fall-back behaves byte-identically to pre-#3304.
+     *  The hook sees the SAME (input, init) pair the fall-back would send
+     *  (headers/body already mutated by the lane's own swap) and answers:
+     *  - "as-is"        — the payload is a standalone request → send it;
+     *  - "restored"     — send `body` INSTEAD (the pre-mutation original);
+     *  - "unrestorable" — the payload was mutated and cannot be undone →
+     *                     the direct send is refused locally (TypeError) so
+     *                     a lane-only body never reaches a provider that
+     *                     cannot parse it; the host's retry re-runs the full
+     *                     decision (re-probe, re-plan) from scratch. */
+    prepareDirectSend?: (url: string, input: string | URL | Request, init: RequestInit | undefined) => DirectSendPrep | Promise<DirectSendPrep>;
     /** #3248 incremental turns: response hook — fired with the routed
      *  Response BEFORE it is returned to the host, so response headers are
      *  readable without consuming the stream. Native hosts use it to read
      *  x-bili-applied-seq (the ack channel). Always fires with the
      *  HOST-REQUESTED url (the fetch argument) — never a rerouted or retried
-     *  target: consumers key their in-flight plans by the url they saw in
-     *  beforeSend/the hook. Best-effort: never throws into the request path. */
-    onResponse?: (url: string, response: Response) => void;
+     *  target. #3329: the optional third argument carries THIS DISPATCH'S
+     *  outgoing headers (lowercase-name record; init.headers wins over a
+     *  Request-object input's own headers, exactly as fetch itself resolves
+     *  them) — consumers correlate a response back to THE REQUEST that
+     *  produced it via their per-request correlation id stamped on send,
+     *  because several conversations share one provider URL and keying by
+     *  url alone mis-attributes a late response to whichever conversation
+     *  happened to plan last on that URL. Undefined for a dispatch with no
+     *  readable headers. Best-effort: never throws into the request path. */
+    onResponse?: (url: string, response: Response, headers?: Record<string, string>) => void;
     /** #1117: attribution gate — called per model-API request with the
      *  (pre-rewrite) target URL. Returning false means the caller is NOT the
      *  host itself (e.g. a third-party in-process plugin riding the host's
@@ -84,7 +130,7 @@ export interface NativeInterceptState {
      *  window; the fetch lane answers it with a protocol-shaped 422 instead
      *  of an upstream 400. The optional body size lets the gate make that
      *  call without re-reading the request. */
-    takeoverGate?: (url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>;
+    takeoverGate?: (url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -131,13 +177,32 @@ export interface NativeInterceptState {
      *  request tunnels with the x-bili-resign markers and every egress body
      *  bili produces is re-signed); undefined falls back to the #1886 direct
      *  send — bytes untouched, inbound signature intact, no compression. */
-    resignCredentialFor?: (url: string, scheme: string) => Promise<{ ak: string; sk: string; token?: string } | undefined>;
+    resignCredentialFor?: (url: string, scheme: string, inboundAk?: string) => Promise<{ ak: string; sk: string; token?: string } | undefined>;
 }
 
 // #1410: same-process installs share one identity — Symbol.for keeps the
 // double-load check working across duplicate copies of this module (a plain
 // Symbol would let a second copy re-install on top of the first).
 const INTERCEPT_FLAG = Symbol.for("billion-context.native-fetch-intercept");
+
+// #3394: which intercept state routes RIGHT NOW, read by the fetch chain AND
+// the Codex Responses WS chain (#3558) at call time. INTERCEPT_FLAG /
+// WS_INTERCEPT_FLAG only mark "a chain exists"; this ONE slot carries the live
+// instance. A host hot-reimport (DSH 0.2.1-alpha.3 profile recomposition)
+// re-applies with a FRESH state — the once-per-process chains must follow that
+// new instance instead of staying closed over the first one's dead state. Both
+// transports share this single slot so the whole plugin instance moves
+// atomically when a new module instance is applied.
+export const ACTIVE_STATE = Symbol.for("billion-context.native-intercept-state");
+
+// #3394 hardening: install generation paired with ACTIVE_STATE, bumped by every
+// installNativeFetchIntercept / installNativeWebSocketIntercept call (#3558).
+// Object identity alone cannot tell apart "a newer module instance" from "a
+// newer activation of the SAME instance" (dsh deactivate/reactivate re-applies
+// the module-level state, #2082/#2101) — the generation stops an older
+// activation's late dispose from clearing a slot a later apply() already
+// rebound.
+export const ACTIVE_STATE_SEQ = Symbol.for("billion-context.native-intercept-state-seq");
 
 // #2090: the built-in-scheme passthrough opt-in (#1884 escape hatch) is the
 // only path where a signed request goes DIRECT — make it LOUD in host logs so
@@ -158,13 +223,17 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
 // `/v1/messages`, OpenAI chat `/v1/chat/completions` (and legacy
 // `/v1/completions`), Responses `/v1/responses`, Mistral
 // `/v1/chat/completions`|`/v1/conversations`, Google native
-// `/v1beta/models/<model>:(streamGenerateContent|generateContent|countTokens)`
-// — exactly the three methods the proxy core's googlePathKind prepares
-// (#2493; other Google methods such as `:predict` have no pipeline and must
-// keep passing through direct). Version segment is optional and unpinned
-// (zhipuai uses `/v4/chat/completions`, bailian mounts
-// `/apps/anthropic/v1/messages`), so match on the trailing shape only.
-const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$/;
+// `/v1beta/models/<model>:(streamGenerateContent|generateContent|countTokens)`,
+// and Google Cloud Code / Antigravity's v1internal dialect
+// `/v1internal:(streamGenerateContent|generateContent|countTokens)` (#4256).
+// The model methods are exactly the three the proxy core prepares
+// (#2493; other Google methods such as `:predict` have no pipeline); the
+// v1internal arm matches ONLY those same three so Antigravity's non-model
+// control-plane POSTs (loadCodeAssist, fetchUserInfo, … — see
+// isV1InternalControlPlanePath) keep passing through direct. Version segment
+// is optional and unpinned (zhipuai uses `/v4/chat/completions`, bailian
+// mounts `/apps/anthropic/v1/messages`), so match on the trailing shape only.
+const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
 
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
@@ -191,13 +260,9 @@ export function isModelApiUrl(url: string): boolean {
     }
 }
 
-/** Detect a body-covering signature from either init.headers or a
- *  Request-object input — the two forms a dispatch can arrive in — by
- *  normalizing to lowercased header names and delegating to the single
- *  shape-based detector shared with the proxy guard (#1884/#2090). Returns
- *  the scheme token (e.g. "sdk-hmac-sha256") or undefined for unsigned
- *  traffic. */
-export function bodySignedSchemeOf(input: string | URL | Request, init?: RequestInit): string | undefined {
+/** Normalize either init.headers or a Request-object input — the two forms a
+ *  dispatch can arrive in — into a lowercased-name header record. */
+function headerRecordOf(input: string | URL | Request, init?: RequestInit): Record<string, string> | undefined {
     let headers: Headers | undefined;
     if (init?.headers !== undefined) headers = new Headers(init.headers);
     else if (input !== null && typeof input === "object" && !(input instanceof URL)) {
@@ -210,7 +275,33 @@ export function bodySignedSchemeOf(input: string | URL | Request, init?: Request
     if (headers === undefined) return undefined;
     const record: Record<string, string> = {};
     for (const [name, value] of headers) record[name] = value;
-    return inboundSignedScheme(record);
+    return record;
+}
+
+/** Detect a body-covering signature from either init.headers or a
+ *  Request-object input — the two forms a dispatch can arrive in — by
+ *  normalizing to lowercased header names and delegating to the single
+ *  shape-based detector shared with the proxy guard (#1884/#2090). Returns
+ *  the scheme token (e.g. "sdk-hmac-sha256") or undefined for unsigned
+ *  traffic. */
+export function bodySignedSchemeOf(input: string | URL | Request, init?: RequestInit): string | undefined {
+    const record = headerRecordOf(input, init);
+    return record === undefined ? undefined : inboundSignedScheme(record);
+}
+
+/** The SDK-HMAC-SHA256 signing account is named in the inbound Authorization
+ *  (`SDK-HMAC-SHA256 Access=<ak>,…`). bili re-signs every egress body (#1884),
+ *  so it must sign with THE SAME account the request was issued under — not an
+ *  arbitrary pool account — or a multi-account pool collapses to one credential
+ *  and off-account models break upstream (#3106). Returns `<ak>` or undefined
+ *  when the header is absent or carries no `Access=` field. */
+export function inboundApigAccessKey(input: string | URL | Request, init?: RequestInit): string | undefined {
+    const record = headerRecordOf(input, init);
+    if (record === undefined) return undefined;
+    const auth = String(record["authorization"] ?? "").trim();
+    const match = /\bAccess=([^,\s]+)/.exec(auth);
+    const ak = match?.[1];
+    return ak !== undefined && ak.trim() !== "" ? ak.trim() : undefined;
 }
 
 /** True when the URL addresses bili's own control plane (`/__bili/*`,
@@ -302,6 +393,23 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
     return { input, init };
 }
 
+/** #3329: the outgoing headers of a dispatch exactly as fetch resolves them —
+ *  init.headers wins over a Request-object input's own headers (spec: init
+ *  overrides), normalized to a lowercase-name record so response-time
+ *  consumers can look up their per-request correlation id without re-deriving
+ *  the merge rules. undefined when no headers exist or none can be read. */
+function outgoingHeadersOf(input: string | URL | Request, init?: RequestInit): Record<string, string> | undefined {
+    try {
+        const src = init?.headers !== undefined ? init.headers : input instanceof Request ? input.headers : undefined;
+        if (src === undefined) return undefined;
+        const out: Record<string, string> = {};
+        for (const [k, v] of new Headers(src)) out[k.toLowerCase()] = v;
+        return out;
+    } catch {
+        return undefined;
+    }
+}
+
 /** #2592/#2709: client-side mirror of the passthrough lane's cheap ASCII
  *  prefilter — true when the dispatch body contains DSH_COMPACTION_MARKER_SNIFF
  *  (the exact bytes the server sniffs; imported, not re-derived). A hit is NOT
@@ -358,16 +466,39 @@ function bodyByteSizeOf(init: RequestInit | undefined): { bytes: number } | unde
 /** #2924 direction 1: protocol-shaped local refusal — 422 per the #2709
  *  precedent (not 401/403 credential-class, not 408/429/5xx transient-class),
  *  so hosts and SDKs treat it as a policy refusal of this ONE request and
- *  surface it instead of retrying or disabling a credential. */
+ *  surface it instead of retrying or disabling a credential. Reachable only via
+ *  the threw+oversized arm (the host's agent scope died mid-request): while it
+ *  stays dead, retrying the same call keeps failing, so the remedy is a host
+ *  restart (session state is persisted on disk), not another attempt (#3589). */
 function oversizeRefusal(url: string): Response {
     const message =
-        "billion-context refused this request locally: host attribution failed mid-request and the request body cannot fit the model's context window — sending it uncompressed would be rejected upstream (#2924). " +
-        "Retry the turn; if it persists, the session's local history has outgrown the window and needs compaction or a fresh session.";
+        "billion-context refused this request locally: the host's attribution lookup threw mid-request (its agent scope is disposed/closing), so this body cannot be folded into the model's context window — forwarding it uncompressed would be rejected upstream (#2924). " +
+        "While that scope stays dead, retrying this same call will keep failing; restart the client host once (its session state is persisted on disk, so nothing is lost) so the oversized history can be folded back under the window. If you cannot restart, start a fresh session instead.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal" };
     if (url.endsWith("/messages")) {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
     }
     return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal", message, retryable: false } }), { status: 422, headers });
+}
+
+/** #4068/#4079: local refusal for an UNATTRIBUTED body the gate proved cannot
+ *  fit any window. `none` verdicts keep #1117 direct semantics by design — an
+ *  agentless lane is not ours to manage — but a body whose optimistic
+ *  byte-floor token count already exceeds the window has no direct future:
+ *  the raw send 400s/413s upstream and the host retries the SAME oversized
+ *  history every turn (the #4068 loop: a 6,165,048-token send against a
+ *  1,048,580 window). Refusing locally is damage control, not management —
+ *  same 422 policy-refusal class as oversizeRefusal, distinct remedy wording
+ *  (there is no broken scope to restart). */
+function unattributedOversizeRefusal(url: string): Response {
+    const message =
+        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its body provably exceeds even a 1,000,000-token window — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
+        "Route the conversation through a bili-managed session so it can be compressed (check the client's bili plugin attribution), or trim/remove the oversized content (e.g. a giant paste or tool result), or start a fresh session.";
+    const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed" };
+    if (url.endsWith("/messages")) {
+        return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
+    }
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed", message, retryable: false } }), { status: 422, headers });
 }
 
 async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
@@ -398,6 +529,14 @@ export async function readyOrigin(state: NativeInterceptState): Promise<string |
 // Observing one is therefore DIRECT EVIDENCE that this process's model channel
 // is pinned — the attach lanes consume it to decide wait/fail over spawn.
 
+// #3923: lanes without an owner hook (spawn mode — pi/opencode/dsh/omp/zcode/
+// kimi all arm the hook only in ATTACH mode) used to absorb routed-channel
+// evidence SILENTLY: baked `/bili/` URLs kept passing through to their foreign
+// origin while raw URLs followed state.origin, splitting one conversation
+// across two live instances with zero signal. Warn once per foreign origin
+// instead. (Attach lanes keep their owner-hook behavior untouched.)
+const routedMismatchWarned = new Set<string>();
+
 /** Record the origin of an already-routed model URL on the shared state and
  *  fire the owner hook on a transition (first observation or a NEW origin).
  *  MUST be called before any gate/await in the dispatch path: the recording
@@ -414,6 +553,15 @@ export function noteRoutedOrigin(state: NativeInterceptState, url: string): void
     }
     if (state.routedOrigin === origin) return;
     state.routedOrigin = origin;
+    if (state.onRoutedOriginObserved === undefined) {
+        const held = state.origin;
+        const normalizedHeld = held === undefined ? undefined : held.replace(/\/+$/, "").toLowerCase();
+        if (held !== undefined && normalizedHeld !== origin.toLowerCase() && !routedMismatchWarned.has(origin)) {
+            if (routedMismatchWarned.size >= 128) routedMismatchWarned.clear();
+            routedMismatchWarned.add(origin);
+            logHostEvent("error", "[native-client]", `bili-native: model traffic observed at ${origin} but this process's proxy is ${held} — requests will split across two bili instances and same-conversation state will desync (#394); align your client's /bili/ base URL with ${held} or stop one of the instances (#3923)`);
+        }
+    }
     state.onRoutedOriginObserved?.(origin);
 }
 
@@ -444,57 +592,80 @@ export async function observeRoutedOrigin(state: NativeInterceptState): Promise<
 // ———— Live-origin resolution (#1135) ——————————————————————————————
 // Shared by BOTH OpenCode lanes (the native entry's V2 route and the
 // launcher plugin's V2 route): each outgoing request resolves the LIVE proxy
-// origin — fast-path the held origin through a TTL-cached health probe, and
+// origin — fast-path the held origin through a TTL-cached liveness probe, and
 // when it is dead drive state.respawn (cooldown-gated unless we just lost an
 // origin we were actively routing to) and adopt whatever replacement lands.
-// A transient blip that recovers to the SAME origin costs nothing (the
-// session never migrates); a genuinely dead origin falls back to whatever the
-// owner's respawn produces (a self-spawned proxy, or another healthy shared
-// instance via discovery). Returns undefined when nothing is alive — callers
-// MUST degrade to direct sends, not fail-closed.
+// #3654: the probe is THREE-state (src/liveness.ts). Connect-refused = dead
+// (instant, unchanged fast path). Connected-but-no-health-answer = busy —
+// the event loop is saturated (a large compression in flight), NOT dead:
+// dropping a busy HELD origin would respawn into the SAME process
+// (twin-collision, #3044), so instead the origin is held and re-probed at a
+// jittered cadence inside a bounded wait window. A busy REPLACEMENT (just
+// respawned or adopted) is routed to anyway — its loop drains and the request
+// queues instead of failing for nothing. A transient blip that recovers to
+// the SAME origin costs nothing (the session never migrates); a genuinely
+// dead origin falls back to whatever the owner's respawn produces (a
+// self-spawned proxy, or another healthy shared instance via discovery).
+// Returns undefined when nothing is alive — callers MUST degrade to direct
+// sends, not fail-closed.
 
 const HEALTH_TIMEOUT_MS = 1500;
+/** #3654: total budget for re-probing a BUSY held origin before declaring it
+ *  lost. Deliberately far above HEALTH_TIMEOUT_MS: the point is to ride out
+ *  multi-second event-loop saturation (large compressions), not to widen the
+ *  single-shot probe. */
+const BUSY_WAIT_CAP_MS = 10_000;
+/** #3654: base interval between busy re-probes (jittered 0.5x–1.5x). */
+const BUSY_REPROBE_BASE_MS = 1_000;
 /** Probe-verdict trust window (#928). Far below RESPAWN_COOLDOWN_MS: that
  *  cooldown already assumes multi-second proxy stability, so a few-second
  *  detection horizon is consistent with it while removing the per-request RTT. */
 const HEALTH_PROBE_TTL_MS = 2_000;
 const RESPAWN_COOLDOWN_MS = 15_000;
 
-export async function probeHealth(origin: string): Promise<boolean> {
-    try {
-        const res = await fetch(`${origin}/__bili/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
-        return res.ok;
-    } catch {
-        return false;
-    }
+/** Default liveness probe: GET /__bili/health under the single-shot budget —
+ *  now three-state (#3654): TCP connect refused classifies dead in
+ *  milliseconds instead of eating the whole budget. */
+async function probeOriginHealth(origin: string): Promise<LivenessVerdict> {
+    return probeLiveness(origin, HEALTH_TIMEOUT_MS);
 }
 
-/** Wrap a probe in a per-origin TTL cache (#928). Both verdicts are cached: a
- *  healthy hit skips the steady-state loopback RTT; a dead hit avoids re-paying
- *  the full HEALTH_TIMEOUT_MS on every request across the death+cooldown window.
- *  Stale entries for other origins are evicted on insert, keeping the map bounded. */
-function withProbeTtl(probe: (origin: string) => Promise<boolean>, ttlMs: number): (origin: string) => Promise<boolean> {
-    const cache = new Map<string, { ok: boolean; at: number }>();
+/** Wrap a probe in a per-origin TTL cache (#928). Only DEFINITE verdicts are
+ *  cached: alive skips the steady-state loopback RTT; dead avoids re-paying
+ *  the full HEALTH_TIMEOUT_MS on every request across the death+cooldown
+ *  window. BUSY is never cached — a saturation episode ends within seconds and
+ *  caching it would solidify "slow" into "dead" (#3654). Stale entries for
+ *  other origins are evicted on insert, keeping the map bounded. */
+function withProbeTtl(probe: (origin: string) => Promise<LivenessVerdict>, ttlMs: number): (origin: string) => Promise<LivenessVerdict> {
+    const cache = new Map<string, { verdict: LivenessVerdict; at: number }>();
     return (origin) => {
         const now = Date.now();
         const hit = cache.get(origin);
-        if (hit !== undefined && now - hit.at < ttlMs) return Promise.resolve(hit.ok);
-        return probe(origin).then((ok) => {
+        if (hit !== undefined && now - hit.at < ttlMs) return Promise.resolve(hit.verdict);
+        return probe(origin).then((verdict) => {
             const t = Date.now();
             for (const [key, entry] of cache) if (t - entry.at >= ttlMs) cache.delete(key);
-            cache.set(origin, { ok, at: t });
-            return ok;
+            if (verdict.state !== "busy") cache.set(origin, { verdict, at: t });
+            return verdict;
         });
     };
 }
 
 export interface LiveOriginResolverDeps {
-    /** Injectable health probe (tests); defaults to GET /__bili/health. */
-    probe?: (origin: string) => Promise<boolean>;
+    /** Injectable liveness probe (tests); defaults to probeLiveness over
+     *  /__bili/health under HEALTH_TIMEOUT_MS. Legacy boolean probes stay
+     *  accepted (true → alive, false → dead). */
+    probe?: (origin: string) => Promise<LivenessVerdict | boolean>;
     /** Bootstrap retry interval when no live origin is held (tests shrink it). */
     respawnCooldownMs?: number;
     /** Probe-verdict cache TTL; defaults to HEALTH_PROBE_TTL_MS (tests shrink it). */
     probeTtlMs?: number;
+    /** #3654: busy-wait budget for a saturated HELD origin; defaults to
+     *  BUSY_WAIT_CAP_MS (tests shrink it). */
+    busyWaitCapMs?: number;
+    /** #3654: base interval between busy re-probes; defaults to
+     *  BUSY_REPROBE_BASE_MS (tests shrink it). */
+    busyReprobeBaseMs?: number;
 }
 
 /** Build the per-request live-origin resolver over a shared intercept state.
@@ -510,27 +681,89 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
     // cache is rebuilt (kills cached verdicts) and `generation` advances
     // (kills in-flight verdicts, which must not clear a healthy
     // replacement that already landed).
-    const healthProbe = deps.probe ?? probeHealth;
+    const rawProbe = deps.probe ?? probeOriginHealth;
+    const probeFn = (origin: string): Promise<LivenessVerdict> => rawProbe(origin).then((v) => typeof v === "boolean" ? { state: v ? "alive" : "dead" } : v);
     const probeTtlMs = deps.probeTtlMs ?? HEALTH_PROBE_TTL_MS;
-    let probe = withProbeTtl(healthProbe, probeTtlMs);
+    let probe = withProbeTtl(probeFn, probeTtlMs);
     let generation = 0;
     const respawnCooldownMs = deps.respawnCooldownMs ?? RESPAWN_COOLDOWN_MS;
+    const busyWaitCapMs = deps.busyWaitCapMs ?? BUSY_WAIT_CAP_MS;
+    const busyReprobeBaseMs = deps.busyReprobeBaseMs ?? BUSY_REPROBE_BASE_MS;
     let lastRespawn = 0;
+    // #3654: one entry per busy episode per origin (attempt count) so the log
+    // announces an episode ONCE (the first caller that sees it) and concurrent
+    // callers in the same episode only count attempts.
+    const busyEpisodes = new Map<string, { attempts: number }>();
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
     return async (): Promise<string | undefined> => {
         let ownedThenLost = false;
+        let lossReason: UnavailableReason | undefined;
         const held = state.origin;
         const gen = generation;
         if (held !== undefined) {
-            const ok = await probe(held);
+            const v = await probe(held);
             // Act on the verdict only if the world didn't move while it was
             // in flight: a concurrent caller's respawn (generation bump) or
             // any origin change underneath us voids it — re-resolve instead.
             if (gen === generation && state.origin === held) {
-                if (ok) return held;
-                // Proxy died mid-session. Clearing origin first makes concurrent
-                // callers share the same state.ready (dedup).
-                ownedThenLost = true;
-                state.origin = undefined;
+                if (v.state === "alive") {
+                    state.lastUnavailableReason = undefined;
+                    return held;
+                }
+                if (v.state === "dead") {
+                    logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} dead (${v.detail ?? "no answer"}) — clearing origin`);
+                    // Proxy died mid-session. Clearing origin first makes concurrent
+                    // callers share the same state.ready (dedup).
+                    ownedThenLost = true;
+                    lossReason = "dead";
+                    state.origin = undefined;
+                } else {
+                    // #3654: BUSY — TCP connect succeeded but /__bili/health never
+                    // answered within the budget: the event loop is saturated
+                    // (typically a large compression), not dead. Dropping this
+                    // origin would respawn into the SAME process (twin-collision,
+                    // #3044); ride out the episode instead.
+                    const freshEpisode = !busyEpisodes.has(held);
+                    const ep = busyEpisodes.get(held) ?? { attempts: 0 };
+                    busyEpisodes.set(held, ep);
+                    if (freshEpisode) {
+                        logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} BUSY (${v.detail ?? "no health answer"}) — holding origin, re-probing (budget ${busyWaitCapMs}ms) (#3654)`);
+                    }
+                    const deadline = Date.now() + busyWaitCapMs;
+                    for (;;) {
+                        if (Date.now() >= deadline) break;
+                        const jitter = 0.5 + Math.random(); // 0.5x–1.5x
+                        await sleep(Math.min(busyReprobeBaseMs * jitter, Math.max(0, deadline - Date.now())));
+                        if (gen !== generation || state.origin !== held) break;
+                        ep.attempts += 1;
+                        const again = await probe(held);
+                        if (gen !== generation || state.origin !== held) break;
+                        if (again.state === "alive") {
+                            busyEpisodes.delete(held);
+                            logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} alive again after ${ep.attempts} busy re-probe(s)`);
+                            state.lastUnavailableReason = undefined;
+                            return held;
+                        }
+                        if (again.state === "dead") {
+                            busyEpisodes.delete(held);
+                            logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} dead during busy episode (${again.detail ?? "no answer"}, attempt ${ep.attempts}) — respawning`);
+                            ownedThenLost = true;
+                            lossReason = "dead";
+                            state.origin = undefined;
+                            break;
+                        }
+                        logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} still busy — re-probe attempt ${ep.attempts}`);
+                    }
+                    if (state.origin === held && gen === generation) {
+                        // Window exhausted while still busy: lost-for-this-request,
+                        // but record WHY so the refusal says "saturated", not "dead".
+                        busyEpisodes.delete(held);
+                        logHostEvent("warn", "[native-client]", `bili-native: liveness: ${held} still busy after ${ep.attempts} re-probe(s) over ${busyWaitCapMs}ms — letting go, respawning (#3654)`);
+                        ownedThenLost = true;
+                        lossReason = "busy-exhausted";
+                        state.origin = undefined;
+                    }
+                }
             }
         }
         // Retry bootstrap whenever no live origin is held — either just lost
@@ -540,11 +773,31 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
         if (state.respawn !== undefined && (ownedThenLost || Date.now() - lastRespawn >= respawnCooldownMs)) {
             lastRespawn = Date.now();
             generation += 1;
-            probe = withProbeTtl(healthProbe, probeTtlMs);
+            probe = withProbeTtl(probeFn, probeTtlMs);
+            // Same generation boundary as the verdict-cache rebuild above: a
+            // post-respawn busy episode behind the same origin must announce
+            // itself instead of inheriting a stale pre-respawn episode entry.
+            busyEpisodes.clear();
             state.ready = state.respawn();
         }
         const o = await readyOrigin(state);
-        if (o !== undefined && (await probe(o))) return o;
+        if (o !== undefined) {
+            const v = await probe(o);
+            if (v.state === "alive") {
+                state.lastUnavailableReason = undefined;
+                return o;
+            }
+            if (v.state === "busy") {
+                // #3654: a just-landed replacement that is already busy is still
+                // ALIVE — routing to it queues the request behind the saturating
+                // fold; refusing here would fail the very request the adoption
+                // existed to save.
+                logHostEvent("info", "[native-client]", `bili-native: liveness: replacement ${o} BUSY (${v.detail ?? "no health answer"}) — routing anyway, the request will queue (#3654)`);
+                state.lastUnavailableReason = undefined;
+                return o;
+            }
+        }
+        state.lastUnavailableReason = lossReason ?? "bootstrap-failed";
         if (ownedThenLost) state.onGiveUp?.();
         return undefined;
     };
@@ -603,11 +856,60 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
     }
 }
 
-/** Install the global fetch patch. Idempotent: a second call is a no-op
- *  (returns false) so double-loading the entry cannot double-wrap. */
-export function installNativeFetchIntercept(state: NativeInterceptState): boolean {
+/** #3304: rebuild a fall-back dispatch carrying `body` INSTEAD of whatever
+ *  `init`/the Request carried. The restored body rides INIT so fetch-spec
+ *  precedence (init over Request fields) stays exactly what the original
+ *  dispatch had; a string body needs no duplex. */
+export function withRestoredBody(input: string | URL | Request, init: RequestInit | undefined, body: string): { input: string | URL | Request; init: RequestInit | undefined } {
+    if (input instanceof Request) {
+        try {
+            const plain = new Request(input.url, { method: input.method, headers: input.headers });
+            return { input: plain, init: { ...(init ?? {}), body } };
+        } catch {
+            const headers: Record<string, string> = {};
+            try {
+                for (const [k, v] of input.headers) headers[k] = v;
+            } catch {}
+            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body } };
+        }
+    }
+    return { input, init: { ...(init ?? {}), body } };
+}
+
+/** Re-point the process-level live-state slot at the activating instance and
+ *  advance its generation, so every transport (fetch + Codex Responses WS)
+ *  follows the newest applied module instance (#3394/#3558). Called at the TOP
+ *  of every install — including the ones that find a chain already present and
+ *  bail — because "which instance is active" is independent of whether THIS
+ *  transport's wrapper got (re)installed. Returns true when the slot was empty
+ *  before: the caller then warns once, since a pre-live-state chain cannot be
+ *  rewritten to read the slot until the host restarts. */
+export function bindLiveStateSlot(state: NativeInterceptState): boolean {
     const g = globalThis as Record<PropertyKey, unknown>;
-    if (g[INTERCEPT_FLAG] === true) return false;
+    const firstBind = g[ACTIVE_STATE] === undefined;
+    g[ACTIVE_STATE_SEQ] = Number(g[ACTIVE_STATE_SEQ] ?? 0) + 1;
+    g[ACTIVE_STATE] = state;
+    return firstBind;
+}
+
+/** Install the global fetch patch. The first call wraps globalThis.fetch and
+ *  returns true; later calls return false (a process installs one chain) BUT
+ *  always rebind the live-state slot, so a host hot-reimport that re-applies
+ *  with a fresh state takes over routing without a restart (#3394). */
+export function installNativeFetchIntercept(initialState: NativeInterceptState): boolean {
+    const g = globalThis as Record<PropertyKey, unknown>;
+    // Point the slot at whichever state is being activated. The dispatch below
+    // reads g[ACTIVE_STATE] per request, so the newest applied instance wins
+    // even though the chain itself was wrapped only once.
+    const hadChain = g[INTERCEPT_FLAG] === true;
+    const firstBind = bindLiveStateSlot(initialState);
+    if (hadChain) {
+        // A chain from an EARLIER build already wraps fetch and cannot be
+        // rewritten to read this slot — until the host restarts, requests route
+        // through that old closure. Say so once instead of failing silent.
+        if (firstBind) logHostEvent("warn", "[native-client]", "native fetch chain predates live-state routing; restart the host once for model requests to follow this plugin instance (#3394)");
+        return false;
+    }
     // Shared across every re-armed chain link (a re-arm replaces the chain
     // top but must not forget what this process already learned).
     let warned = false;
@@ -619,7 +921,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
 
     installFetchChain((send) => async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const url = fetchUrlOf(input);
-        if (url === undefined) return send(input, init);
+        // #3394: resolve the ACTIVE state per request instead of capturing the
+        // first installer's — a hot-reimport swapped in a fresh instance whose
+        // headersFor/takeoverGate/origin live on ITS state. No fallback to the
+        // captured one: an empty slot means no plugin is active, so pass through
+        // direct rather than hit a disposed context.
+        const state = g[ACTIVE_STATE] as NativeInterceptState | undefined;
+        if (url === undefined || state === undefined) return send(input, init);
         // #1268: hold the request until the host's ACP tool registration has
         // finished its first attempt, so headersFor can stamp it into plugin
         // mode. Steady state costs nothing (gate already resolved). A timeout
@@ -659,6 +967,47 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             return again;
         };
 
+        // #3304: ask the lane whether this fall-back payload may go to the
+        // real upstream AS-IS. Fail-safe direction: an armed hook that
+        // throws is treated as "unrestorable" — never risk sending bytes the
+        // lane may have mutated.
+        const prepareForDirectSend = async (url: string, input: string | URL | Request, init: RequestInit | undefined): Promise<DirectSendPrep> => {
+            const hook = state.prepareDirectSend;
+            if (hook === undefined) return { outcome: "as-is" };
+            try {
+                return await hook(url, input, init);
+            } catch (err) {
+                logHostEvent("error", "[native-client]", `bili-native: prepareDirectSend hook failed (${err instanceof Error ? err.message : String(err)}) — refusing the direct send (#3304)`);
+                return { outcome: "unrestorable" };
+            }
+        };
+
+        // #3304: the guarded fall-back send. `defaultInput` is what the site
+        // would send without the guard (usually `input`; makeTarget(routedTarget)
+        // on the routed give-up). Restored bodies ride INIT so fetch-spec
+        // precedence (init over Request) stays exactly what the original
+        // dispatch had.
+        const directSendOrRefuse = async (dispatchUrl: string, defaultInput: string | URL | Request, init: RequestInit | undefined): Promise<Response> => {
+            const prep = await prepareForDirectSend(dispatchUrl, defaultInput, init);
+            if (prep.outcome === "as-is") {
+                state.onDispatch?.(dispatchUrl, "direct");
+                return send(defaultInput, init);
+            }
+            if (prep.outcome === "unrestorable") {
+                // A lane-only payload (e.g. an incremental delta) cannot be
+                // forwarded to a provider that cannot parse it — refusing
+                // locally keeps the host's retry loop driving the decision
+                // again (re-probe / re-plan) instead of burning the turn on
+                // an upstream 400.
+                state.onDispatch?.(dispatchUrl, "refused");
+                logHostEvent("error", "[native-client]", `bili-native: no usable proxy and the request carries a lane-only payload — failing locally instead of sending it to the provider; retry the turn (#3304): ${dispatchUrl}`);
+                throw new TypeError("billion-context: proxy unavailable — the request payload is lane-specific (incremental turn) and cannot be forwarded to the provider directly; retry the turn (#3304)");
+            }
+            const restored = withRestoredBody(defaultInput, init, prep.body);
+            state.onDispatch?.(dispatchUrl, "direct");
+            return send(restored.input, restored.init);
+        };
+
         // Already-routed `/bili/` model requests (launcher settings overlay):
         // routing is done, but plugin headers still decide wire vs plugin
         // mode — stamp and pass through untouched otherwise.
@@ -672,20 +1021,20 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // below, and once a replacement lands the pre-emptive reroute
             // carries unattributed riders along (still passthrough-marked).
             if (state.takeoverGate !== undefined) {
-                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init));
-                if (verdict === "refuse-oversized") {
+                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init), init);
+                if (verdict === "refuse-oversized" || verdict === "refuse-oversized-unattributed") {
                     // #2924 direction 1 (routed lane): an already-routed body
                     // the gate could not claim and that provably cannot fit
                     // fails LOCALLY here too — the #1117 passthrough marker
                     // would forward it verbatim into the very upstream 400 the
-                    // raw lane already refuses.
+                    // raw lane already refuses. The unattributed variant
+                    // (#4068) covers the same shape without a broken scope.
                     state.onDispatch?.(url, "refused");
-                    return oversizeRefusal(url);
+                    return verdict === "refuse-oversized" ? oversizeRefusal(url) : unattributedOversizeRefusal(url);
                 }
                 if (verdict !== true) {
                     const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
-                    state.onDispatch?.(url, "direct");
-                    return send(stamped.input, stamped.init);
+                    return directSendOrRefuse(url, stamped.input, stamped.init);
                 }
             }
             // #1365: attributed routed traffic pins this process's model channel
@@ -717,7 +1066,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 state.onDispatch?.(target, target === url ? "self" : "retry");
                 const resp = await send(stamped.input, stamped.init);
                 try {
-                    state.onResponse?.(url, resp);
+                    state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
                 } catch {
                     // observability hook only — never break the response
                 }
@@ -757,19 +1106,19 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     state.onDispatch?.(retried, "retry");
                     const resp = await send(restamped.input, restamped.init);
                     try {
-                        state.onResponse?.(url, resp);
+                        state.onResponse?.(url, resp, outgoingHeadersOf(restamped.input, restamped.init));
                     } catch {
                         // observability hook only — never break the response
                     }
                     return resp;
                 }
+                state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;
                     logHostEvent("error", "[native-client]", `bili-native: no live proxy — model requests go direct (uncompressed): ${routedTarget}`);
                 }
-                state.onDispatch?.(routedTarget, "direct");
-                return send(makeTarget(routedTarget), init);
+                return directSendOrRefuse(routedTarget, makeTarget(routedTarget), init);
             }
         }
         if (!isModelApiUrl(url)) {
@@ -811,7 +1160,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 let cred: { ak: string; sk: string; token?: string } | undefined;
                 if (signedScheme === APIG_RESIGN_SCHEME && state.resignCredentialFor !== undefined) {
                     try {
-                        cred = await state.resignCredentialFor(url, signedScheme);
+                        cred = await state.resignCredentialFor(url, signedScheme, inboundApigAccessKey(input, init));
                     } catch {
                         cred = undefined;
                     }
@@ -826,8 +1175,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     }
                     clearSignedRefusal(signedScheme);
                     noteSignedDirect(url, signedScheme, "built-in passthrough opt-in (#1884) — byte-untouched, no compression");
-                    state.onDispatch?.(url, "direct");
-                    return send(input, init);
+                    return directSendOrRefuse(url, input, init);
                 }
                 resignExtra = {
                     [APIG_RESIGN_HEADER]: APIG_RESIGN_SCHEME,
@@ -843,7 +1191,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // #2924: the gate may need async settle-retries on a `threw`
             // attribution, and may answer `"refuse-oversized"` — both await
             // fine; a plain sync boolean (every other host) is unchanged.
-            const verdict = await state.takeoverGate(url, bodyByteSizeOf(init));
+            const verdict = await state.takeoverGate(url, bodyByteSizeOf(init), init);
             if (verdict !== true) {
                 // #2592/#2709 residual leak: an agentless dsh compaction call on a
                 // RAW provider URL (no settings overlay → nothing routed it) rode
@@ -852,9 +1200,9 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 // marker-sniffed POSTs into the proxy's unattributed passthrough
                 // lane (same stamp the overlay-routed case above uses), where the
                 // #2709 guard runs the decisive check: refused (422; dsh logs
-                // "step compaction failed" and continues the turn) or, with
-                // allowDshCompaction (#2028), relayed verbatim by explicit user
-                // decision. Everything else — plain traffic, stream bodies that
+                // "step compaction failed" and continues the turn) — the former
+                // allowDshCompaction opt-out was removed (#3666), so the refusal
+                // is unconditional. Everything else — plain traffic, stream bodies that
                 // cannot be peeked, a dead proxy — keeps #1117's direct semantics.
                 if (fetchMethodOf(input, init) === "POST" && await dshCompactionMarkerInBody(input, init)) {
                     const compactionOrigin = await readyOrigin(state);
@@ -869,12 +1217,11 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 // riding #1117's direct send into a guaranteed upstream 400 —
                 // on a >window local history that 400 kills the whole session,
                 // because every later request carries the same history.
-                if (verdict === "refuse-oversized") {
+                if (verdict === "refuse-oversized" || verdict === "refuse-oversized-unattributed") {
                     state.onDispatch?.(url, "refused");
-                    return oversizeRefusal(url);
+                    return verdict === "refuse-oversized" ? oversizeRefusal(url) : unattributedOversizeRefusal(url);
                 }
-                state.onDispatch?.(url, "direct");
-                return send(input, init);
+                return directSendOrRefuse(url, input, init);
             }
         }
 
@@ -886,8 +1233,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 warned = true;
                 logHostEvent("error", "[native-client]", `bili-native: proxy not ready — model request goes direct (uncompressed): ${url}`);
             }
-            state.onDispatch?.(url, "direct");
-            return send(input, init);
+            return directSendOrRefuse(url, input, init);
         }
         // Attach mode rewrites exactly like spawn mode (#809 semantics —
         // opencode's attach probe+rewrite; the V1 fetch patch relies on it to
@@ -914,7 +1260,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             const stamped = withHeaders(first, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
             const resp = await send(stamped.input, stamped.init);
             try {
-                state.onResponse?.(url, resp);
+                state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
             } catch {
                 // observability hook only — never break the response
             }
@@ -935,7 +1281,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     const stamped = withHeaders(retried, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
                     const resp = await send(stamped.input, stamped.init);
                     try {
-                        state.onResponse?.(url, resp);
+                        state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
                     } catch {
                         // observability hook only — never break the response
                     }
@@ -945,13 +1291,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 // lifetime. Degrade exactly like a bootstrap failure: actually
                 // send the request direct, then let the owner clear proxy-owned
                 // state.
+                state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;
                     logHostEvent("error", "[native-client]", `bili-native: proxy respawn failed — model requests go direct (uncompressed): ${url}`);
                 }
-                state.onDispatch?.(url, "direct");
-                return send(input, init);
+                return directSendOrRefuse(url, input, init);
             }
             throw err;
         }
@@ -960,11 +1306,33 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
     return true;
 }
 
+/** #3394: effect thunk for hosts whose plugin context can die while the module
+ *  lives on (dsh deactivate/reactivate, #2082/#2101). The host runs it once per
+ *  activation; the returned disposer clears the live-state slot only if THIS
+ *  activation still owns it — generation match (no newer apply, including a
+ *  re-activation of the same instance) AND bound-state match (no hot-reimported
+ *  instance). While the slot is empty the shared chain passes through direct.
+ *  The generation is captured when the host RUNS the thunk: if a host ever ran
+ *  it before this activation's install, the disposer degrades to a no-op (the
+ *  slot survives — routing unaffected), never to a wrong clear. */
+export function liveStateSlotEffect(state: NativeInterceptState): () => (() => void) {
+    return () => {
+        const g = globalThis as Record<PropertyKey, unknown>;
+        const seq = g[ACTIVE_STATE_SEQ];
+        return () => {
+            if (g[ACTIVE_STATE_SEQ] === seq && g[ACTIVE_STATE] === state) delete g[ACTIVE_STATE];
+        };
+    };
+}
+
 /** Test-only: drop the patch guard so a suite can install again. The
  *  caller owns restoring globalThis.fetch. `opts.anchor` overrides the
  *  module-load anchor (#1410) for suites that simulate a foreign scope. */
 export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): void {
-    delete (globalThis as Record<PropertyKey, unknown>)[INTERCEPT_FLAG];
+    const g = globalThis as Record<PropertyKey, unknown>;
+    delete g[INTERCEPT_FLAG];
+    delete g[ACTIVE_STATE];
+    delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
     resetFetchChainForTest(opts);
 }

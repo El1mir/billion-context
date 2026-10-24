@@ -346,8 +346,12 @@ test("warnings accumulate across multiple ranges in one batch", () => {
   const state = seededState(messages);
   const cfg = config({ preserveRecentMessages: 3 });
 
-  // Two ranges: each partially overlaps the recent zone (m00008..m00010).
-  // Both should produce warnings, and both unprotected heads should compress.
+  // Two ranges: the second now ends inside the recent zone, which under the
+  // #3939 all-or-nothing contract would reject the whole batch (a fully-
+  // protected range is a fatal apply error, pinned in issue3939-fold-boundary-
+  // pins.test.ts), so it instead OVERLAPS the first range's span — overlap
+  // warn+skip keeps the batch valid while still exercising multi-range
+  // warning accumulation.
   const result = core.applyCompression({
     ranges: [
       {
@@ -357,9 +361,9 @@ test("warnings accumulate across multiple ranges in one batch", () => {
         topic: "a",
       },
       {
-        startRef: "m00010",
+        startRef: "m00008",
         endRef: "m00010",
-        summary: "second range fully protected tail",
+        summary: "second range overlaps the first",
         topic: "b",
       },
     ],
@@ -372,7 +376,7 @@ test("warnings accumulate across multiple ranges in one batch", () => {
     result.result.blocksCreated >= 1,
     "at least the unprotected head compresses",
   );
-  assert.ok(result.result.warnings.length >= 1, "warnings surfaced");
+  assert.ok(result.result.warnings.length >= 2, "warnings surfaced");
 });
 
 // --- neverPreserveRecentTools is configurable (billion-context#1277) ---

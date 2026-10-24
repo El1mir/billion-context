@@ -63,6 +63,8 @@ test("#1870 web surface: /__bili/overview and /__bili/status share one updateRea
     // Hermetic sessions dir: /__bili/overview walks the disk store, and a missing
     // dir rejects loudly by design (#1937) — pin an existing temp dir.
     const prevSessionsDir = process.env.BILI_SESSIONS_DIR;
+    const prevStorageMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "legacy";
     const sessionsDir = mkdtempSync(path.join(tmpdir(), "bili-update-banner-"));
     process.env.BILI_SESSIONS_DIR = sessionsDir;
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -128,12 +130,27 @@ test("#1870 web surface: /__bili/overview and /__bili/status share one updateRea
         o = await fetchWire(port, "/__bili/overview");
         assert.deepEqual(o.updateReady, { kind: "ready", version: "99.0.3", summary: "fixes cache corruption" }, "ready payload: names the disk version");
         assert.deepEqual(o.updateReady, s.updateReady, "overview/status updateReady parity (pending restart)");
+
+        const entries = [entry("99.0.4", "routine", "future routine"), entry("99.0.3", "critical", "second fix"), entry("99.0.2", "critical", "first fix")];
+        for (const diskVersion of ["99.0.1", "99.0.2", "99.0.3"]) {
+            _setReleaseNotesStateForTest({ entries, diskVersion });
+            s = await fetchWire(port, "/__bili/status");
+            o = await fetchWire(port, "/__bili/overview");
+            assert.deepEqual(o.updateReady, {
+                kind: diskVersion === "99.0.3" ? "ready" : "available",
+                version: diskVersion === "99.0.1" ? "99.0.2" : "99.0.3",
+                summary: diskVersion === "99.0.1" ? "first fix" : "second fix",
+            }, diskVersion);
+            assert.deepEqual(o.updateReady, s.updateReady, "partial-install endpoint parity");
+        }
     } finally {
         _resetReleaseNotesWatcherForTest();
         await close(proxy);
         await rmrf(sessionsDir);
         if (prevSessionsDir === undefined) delete process.env.BILI_SESSIONS_DIR;
         else process.env.BILI_SESSIONS_DIR = prevSessionsDir;
+        if (prevStorageMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevStorageMode;
     }
 });
 
@@ -152,4 +169,13 @@ test("#1870 web surface: the page ships the banner element and the client render
     // remote-doc text (registry summary) flows through innerHTML → must be escaped
     const m = /innerHTML = "<strong>" \+ t\("sys\.update"\) \+ "<\/strong> " \+ escapeHtml\(line\)/;
     assert.ok(m.test(WEB_CLIENT), "the update line is HTML-escaped before innerHTML");
+    // #3719 item3: the available-kind banner carries a one-click upgrade
+    // button; ready-kind does NOT (only a restart is left to do).
+    assert.ok(WEB_CLIENT.includes("banner-upgrade-now"), "banner upgrade button present (#3719 item3)");
+    assert.ok(WEB_CLIENT.includes('t("sys.update_now"'), "button label localized");
+    assert.ok(WEB_CLIENT.includes('t("sys.updating"'), "busy label localized");
+    assert.ok(WEB_CLIENT.includes('t("sys.update_done"'), "done label localized");
+    assert.ok(WEB_CLIENT.includes('u.kind === "available"'), "button gated to the available kind — ready never shows it");
+    // #3719 item4: zh locale picks summaryZh; banner + notices share the pick
+    assert.ok(WEB_CLIENT.includes("summaryZh"), "banner/notices read summaryZh (#3719 item4)");
 });

@@ -25,6 +25,10 @@ export interface NodeEffects {
    *  foldability judgment — on lanes whose processTurn input is itself a
    *  pruned/render view, even the pre-prune input is not the apply class. */
   applyView?: CoreMessage[];
+  /** #3939 ⑤: the post-prune, pre-transform resent view, stashed by the
+   *  pre-transform-snapshot node so the view-latch node can replay latched
+   *  bytes for messages the transform nodes dropped or rewrote. */
+  preTransformMessages?: CoreMessage[];
   readonly [key: string]: unknown;
 }
 

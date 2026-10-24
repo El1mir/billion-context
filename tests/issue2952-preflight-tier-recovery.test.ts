@@ -144,7 +144,10 @@ test("#2952: when every tier is exhausted, fail honestly and never forward over-
         };
         const result = await preflightCompress(deps, messages);
         assert.equal(result.failure?.kind, "exhausted", `expected honest exhaustion, got: ${JSON.stringify(result.failure)}`);
-        assert.match(result.failure?.detail ?? "", /every compression tier is exhausted/i, `detail must name all-tier exhaustion (got: ${result.failure?.detail})`);
+        // #3646 refined the blanket "every compression tier is exhausted" claim into
+        // cause-specific reasons; this fixture ends with no tier holding two active
+        // blocks (the T1 pairs were merged down to singletons plus higher tiers).
+        assert.match(result.failure?.detail ?? "", /no tier held two or more active blocks to distill/i, `detail must name the real end state (got: ${result.failure?.detail})`);
         assert.equal(result.fitsWindow, false, "an unrecoverable payload must NOT be marked fit-to-forward");
         // Bounded: the recovery path must stop at the cap even though it cannot win.
         assert.ok(!result.externalDispatch || result.externalDispatch.calls <= CAP, `bounded to ${CAP} calls (used ${result.externalDispatch?.calls})`);

@@ -184,7 +184,7 @@ async function withSandbox<T>(fn: () => Promise<T>): Promise<T> {
     }
 }
 
-function launch(opts: { lane?: string; port?: number; strictPort?: boolean; script?: string } = {}) {
+function launch(opts: { lane?: string; port?: number; strictPort?: boolean; script?: string; modelWindows?: Record<string, number>; modelMaxOutputs?: Record<string, number> } = {}) {
     return ensureProxyRunning(
         {
             host: "127.0.0.1",
@@ -193,6 +193,8 @@ function launch(opts: { lane?: string; port?: number; strictPort?: boolean; scri
             passthrough: false,
             debug: false,
             lane: opts.lane,
+            modelWindows: opts.modelWindows,
+            modelMaxOutputs: opts.modelMaxOutputs,
         },
         { scriptPath: opts.script ?? distCli },
     );
@@ -495,13 +497,59 @@ test(
                     child.once("exit", (code) => resolve(code));
                     setTimeout(() => resolve(undefined), 120_000).unref();
                 });
-                assert.equal(exitCode, 1, "the duplicate must fail fast with exit code 1");
+                // #3654: a twin-collision loser exits TWIN_ADOPT_EXIT_CODE (3, the spawner's adopt signal);
+                // a loser that loses at the post-bind claim exits 1. Both = lost loudly without hopping —
+                // the hop/port asserts below carry the real invariant.
+                assert.ok(exitCode === 1 || exitCode === 3, `the duplicate must fail fast (exit 1 or the #3654 adopt signal 3), got ${String(exitCode)}`);
                 assert.equal(await portOpen(ZONE_PORT_BASE + 1), false, "nothing may have hopped onto the next port — the hopper IS the orphan shape");
                 assert.equal(await portOpen(ZONE_PORT_BASE), true, "the serving twin keeps its port");
                 assert.ok(daemon1 !== undefined && isPidAlive(daemon1), "the serving twin must still be alive");
             } finally {
                 killNow(child.pid);
                 killNow(daemon1);
+            }
+        });
+    },
+);
+
+// ---------------------------------------------------------------------------
+// #3801: config drift must not wedge the lane behind its stale instance. The
+// client's model config was edited AFTER the lane's proxy spawned: attach
+// rejects the holder (correctly — new sessions must not ride an instance
+// that doesn't know the new model), but the spawned replacement must LADDER
+// OFF its port instead of dying as a false twin. Pre-fix this child was a
+// "twin" (same build, same lane) and exited without binding; the launch then
+// failed and every later launch repeated it until someone killed the holder
+// or picked another port by hand. Now: the holder keeps serving its own
+// sessions untouched, the newcomer settles base+1, sticky follows.
+// ---------------------------------------------------------------------------
+
+test(
+    "zone live: model-config drift ladders off the drifted holder instead of dying as a false twin (#3801)",
+    { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
+    async () => {
+        await withSandbox(async () => {
+            ensureDistBuilt();
+            const h1 = await launch({ lane: "zcode", modelWindows: { "model-a": 1000 } });
+            const daemon1 = h1.child?.pid;
+            trackKill(daemon1);
+            let daemon2: number | undefined;
+            try {
+                assert.equal(h1.port, ZONE_PORT_BASE, "precondition: the drifted holder serves the zone base");
+                // Same build, same lane, DIFFERENT model map — exactly the
+                // models.json edit of #3801 (a model added after spawn).
+                const h2 = await launch({ lane: "zcode", modelWindows: { "model-a": 1000, "model-b": 2000 } });
+                daemon2 = h2.child?.pid;
+                trackKill(daemon2);
+                assert.equal(h2.attached, undefined, "the drifted instance is not attachable — we got our own proxy");
+                assert.equal(h2.port, ZONE_PORT_BASE + 1, "laddered off the drifted holder's port instead of exiting");
+                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE + 1, "sticky follows the new canonical instance");
+                assert.ok(daemon1 !== undefined && isPidAlive(daemon1), "the drifted holder keeps serving undisturbed");
+                assert.equal(await portOpen(ZONE_PORT_BASE), true, "the old port still answers");
+                assert.equal(await portOpen(ZONE_PORT_BASE + 1), true, "the new instance answers at the drifted port");
+            } finally {
+                killNow(daemon1);
+                killNow(daemon2);
             }
         });
     },

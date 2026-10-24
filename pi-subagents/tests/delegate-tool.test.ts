@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs, addDelegateUsage, emitInlineUsageNote } from "../src/delegate-tool.js";
+import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs, addDelegateUsage, emitInlineUsageNote, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot } from "../src/delegate-tool.js";
 import { DEFAULT_DELEGATE_POLICY } from "../src/config.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -1256,5 +1256,68 @@ test("emitInlineUsageNote does not mark delivery when the send throws", () => {
   const pi = { sendUserMessage: () => { throw new Error("queue closed"); } };
   assert.doesNotThrow(() => emitInlineUsageNote(pi as any, run, "separate"));
   assert.notEqual(run.usageNoted, true, "failed send leaves the run recoverable");
+});
+
+// ─── #3741: wait timeout is a neutral notice, not a task failure ─────────────
+// A wait timeout only ends THIS tool call — the delegate keeps running and its
+// completion notification still arrives. The old wording led with "Failed: ...
+// result not ready", which made models and users read a plain timeout as a
+// failed delegate. Pinned end-to-end with a controlled child (PI_CLI_PATH
+// points at a sleeper script) and the minimum 1s wait timeout — no real model.
+
+test("acp_delegate_wait timeout on a running run reports neutral text and leaves the run untouched", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bili-wait-timeout-"));
+  const sleeper = join(dir, "sleeper.mjs");
+  await writeFile(sleeper, "setTimeout(() => {}, 5000);", "utf8");
+  const prevCliPath = process.env.PI_CLI_PATH;
+  process.env.PI_CLI_PATH = sleeper; // delegate child becomes `node <sleeper> ...` and stays alive
+  try {
+    const sent: string[] = [];
+    const pi = { sendUserMessage: (t: string) => sent.push(t) } as unknown as Parameters<typeof makeDelegateTool>[0];
+    const tool = makeDelegateTool(pi);
+    const waitTool = makeDelegateWaitTool(pi);
+    const cancelTool = makeDelegateCancelTool(pi);
+    const ctx = { ...mockCtx("pi"), mode: "tui", cwd: process.cwd() } as unknown as ExtensionContext;
+    // Drain terminal runs left by earlier tests so no recovery notice rides on
+    // the result under test.
+    flushDelegateNotifications(pi);
+    const res = await tool.execute(
+      "tc-wait-to",
+      { agent: "oracle", task: "stay alive", async: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const launch = (res.content[0] as { text?: string }).text ?? "";
+    const runId = /`(del_[a-z0-9_]+)`/.exec(launch)?.[1];
+    assert.ok(runId, `runId in launch message: ${launch}`);
+    const startDeadline = Date.now() + 5000;
+    while (!runningRunsSnapshot().some((r) => r.runId === runId) && Date.now() < startDeadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(runningRunsSnapshot().some((r) => r.runId === runId), "run must be running when the wait starts");
+    const t0 = Date.now();
+    const waitRes = await waitTool.execute("tc-wait-to-w", { runId: runId!, timeout: 1000 }, undefined, undefined, ctx);
+    assert.ok(Date.now() - t0 >= 950, "wait blocked until its timeout elapsed");
+    const text = (waitRes.content[0] as { text?: string }).text ?? "";
+    assert.ok(!/^Failed/i.test(text), `timeout notice must not lead with Failed: ${text}`);
+    assert.ok(!text.includes("result not ready"), `stale 'not ready' wording must be gone: ${text}`);
+    assert.match(text, /Wait timed out after 1s/, `reports the waited duration: ${text}`);
+    assert.ok(text.includes("is still running in the background"), `states the delegate keeps going: ${text}`);
+    assert.equal(waitRes.details?.status, "running", "meta status stays running");
+    assert.ok(!("usage" in waitRes), "timeout settles no usage");
+    assert.ok(runningRunsSnapshot().some((r) => r.runId === runId), "the timeout did not settle the run");
+    // The surviving run is still cancellable; cancel reaps the sleeper child.
+    await cancelTool.execute("tc-wait-to-c", { runId: runId! });
+    const reapDeadline = Date.now() + 5000;
+    while (runningRunsSnapshot().some((r) => r.runId === runId) && Date.now() < reapDeadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(!runningRunsSnapshot().some((r) => r.runId === runId), "cancelled run leaves the running set");
+  } finally {
+    if (prevCliPath === undefined) delete process.env.PI_CLI_PATH;
+    else process.env.PI_CLI_PATH = prevCliPath;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 

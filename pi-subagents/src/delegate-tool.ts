@@ -660,7 +660,7 @@ const WaitParams = Type.Object({
   runId: Type.String({ description: "The runId returned by acp_delegate to wait for." }),
   timeout: Type.Optional(
     Type.Integer({
-      description: `Maximum time to block waiting for the result, in milliseconds. Default ${WAIT_TIMEOUT_MS_DEFAULT} (10s); max ${WAIT_TIMEOUT_MS_MAX} (300s). Values below 1000 are treated as seconds (so 180 means 180s, not 180ms). If the delegate does not finish in time, returns "failed (not ready)" — do NOT keep waiting or retry; go do other work, and a completion notification will still be injected when it completes.`,
+      description: `Maximum time to block waiting for the result, in milliseconds. Default ${WAIT_TIMEOUT_MS_DEFAULT} (10s); max ${WAIT_TIMEOUT_MS_MAX} (300s). Values below 1000 are treated as seconds (so 180 means 180s, not 180ms). If the delegate does not finish in time, returns a wait-timeout notice; the delegate keeps running in the background — do NOT keep waiting or retry; go do other work, and a completion notification will still be injected when it completes.`,
     }),
   ),
 });
@@ -1328,7 +1328,7 @@ export function makeDelegateWaitTool(pi: ExtensionAPI): ToolDefinition<typeof Wa
       };
       signal?.addEventListener("abort", onAbort);
       timer = setTimeout(
-        () => finish({ details: makeResultMeta(run), content: [{ type: "text", text: `Failed: delegate \`${args.runId}\` result not ready after ${Math.round(timeoutMs / 1000)}s. Do NOT keep waiting or retry — go do other work now. The run continues in the background and a completion notification (with the result file path) will be injected into the chat when it finishes.` }] }),
+        () => finish({ details: makeResultMeta(run), content: [{ type: "text", text: `Wait timed out after ${Math.round(timeoutMs / 1000)}s — delegate \`${args.runId}\` is still running in the background. Do NOT keep waiting or retry; go do other work now. A completion notification (with the result file path) will be injected into the chat when it finishes.` }] }),
         timeoutMs,
       );
     });

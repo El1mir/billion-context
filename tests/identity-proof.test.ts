@@ -946,10 +946,19 @@ test("identity proof (control, chat wire): reconcile OFF lets the model-switch c
     }
 });
 
-// Negative control: WITHOUT the reconcile engine the same id churn destroys
-// coverage — the summary disappears and the full history re-bills. This is
-// the old-world behavior the Pass 0 claims repair (#2396 death spiral).
-test("identity proof (control, chat wire): reconcile OFF lets the churn re-bill the unfolded history", { timeout: 180_000 }, async () => {
+// id-churn control, RETIRED-AND-INVERTED by #3642: this churn class used to
+// re-key chat cores (tool_call ids + argument re-serialization moved the
+// seeds), so with reconcile OFF the fold coverage died — the control proved
+// the positive test was exercising Pass 0. Canonical core identity makes
+// toolCallId a non-seed ("transport plumbing") and normalizes tool arguments
+// (canonicalToolArgs: sorted keys, compact form), so this churn class is now
+// absorbed BY CONSTRUCTION, upstream of reconcile. The old control "failed
+// to fail" — correctly detecting that its premise is gone. Inverted, the
+// test stays useful as a canary: with reconcile deliberately OFF, the churn
+// must STILL retain the summary and not re-bill. If it ever goes red, someone
+// reintroduced id-sensitivity into the canonical seeds (or arg normalization
+// regressed) — both are #3642 contract breaks, not reconcile bugs.
+test("identity proof (control, chat wire): canonical ids absorb the id churn even with reconcile OFF (#3642)", { timeout: 180_000 }, async () => {
     const prev = process.env.BILI_FOLD_RECONCILE;
     process.env.BILI_FOLD_RECONCILE = "off";
     try {
@@ -1004,10 +1013,10 @@ test("identity proof (control, chat wire): reconcile OFF lets the churn re-bill 
             ops.churnIds();
             await sendTurn(MAX_TURNS + 1);
             const switchBody = bodies[bodies.length - 1]!;
-            const lost = !switchBody.includes(SUMMARY_MARKER);
+            const retained = switchBody.includes(SUMMARY_MARKER);
             const reBilled = switchBody.includes("file-2-row-") || Buffer.byteLength(switchBody, "utf8") >= unfoldLen * 0.8;
-            assert.ok(lost || reBilled, "control failed to fail: with reconcile OFF the id churn should lose the summary and/or re-bill the folded tool payloads — if it survives, the positive tests above are not actually exercising Pass 0");
-            console.log(`proof[chat-ctl] VERDICT reconcile=off churnFoldLost=${lost} churnReBilled=${reBilled} len=${Buffer.byteLength(switchBody, "utf8")}B (unfolded-ref=${unfoldLen}B) sha=${sha16(switchBody)}`);
+            assert.ok(retained && !reBilled, "ctl-absorb: with reconcile OFF the id churn (tool_call id rewrite + arg re-serialization) must NOT disturb fold coverage — canonical ids absorb it by construction (#3642). If this fails, id-sensitivity leaked back into the canonical seeds or canonicalToolArgs normalization regressed");
+            console.log(`proof[chat-ctl-absorb] VERDICT reconcile=off churnAbsorbed=true summaryRetained=${retained} reBilled=${reBilled} len=${Buffer.byteLength(switchBody, "utf8")}B (unfolded-ref=${unfoldLen}B) sha=${sha16(switchBody)}`);
         } finally {
             await closeServer(proxy);
             await closeServer(upstream);

@@ -4,23 +4,21 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { configFile } from "../paths.js";
 import {
-    allowDshCompactionState,
     collectNamedProviders,
     loadNamedProviders,
-    normalizeLegacyAllowDshCompaction,
+    parseBiliConfig,
+    parseCacheKeepaliveSettings,
     parseCompressSettings,
     parseNamedProviderRecipe,
     parseRouteEntry,
     parseUpstreamProxyMode,
     passthroughState,
     rejectLegacyRoute,
-    safeReadJson,
-    type DshFileSettings,
     type UpstreamProxyMode,
 } from "../config.js";
 import { log } from "../logger.js";
 import { validateHttpProxy } from "../upstream-proxy.js";
-import { SummaryCredentialStore } from "../external-summary-credentials.js";
+import { SummaryCredentialStore, type SummaryCredentialState } from "../external-summary-credentials.js";
 import { parseExternalSummaryChain, expandExternalSummaryChain } from "../external-summary-settings.js";
 import { agentProviderRecipes, agentRegistryStatus } from "../agent-providers.js";
 
@@ -30,20 +28,33 @@ type ConfigShape = Record<string, unknown> & {
     upstreamProxyMode?: string;
 };
 
-function readConfig(): ConfigShape {
-    const parsed = safeReadJson(configFile());
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as ConfigShape : {};
+// #3572: parse bili's own config file through the SAME tolerant parser the runtime
+// loader uses (loadConfigFile → parseBiliConfig), else a JSONC config that works at
+// runtime would show "not valid JSON" here and block every PUT. A genuinely malformed
+// file still throws — that is what keeps the PUT-block guard in configParseError honest.
+function readConfigRaw(): { value: unknown; error: string | null } {
+    if (!existsSync(configFile())) return { value: undefined, error: null };
+    let raw: string;
+    try { raw = readFileSync(configFile(), "utf8").replace(/^\uFEFF/, ""); }
+    catch { return { value: undefined, error: null }; }
+    try { return { value: parseBiliConfig(raw), error: null }; }
+    catch (e) { return { value: undefined, error: String(e) }; }
 }
 
-/** The config file exists on disk but does not parse as JSON (hand-edited
- *  comment, trailing comma, …). Distinct from "missing": a broken file must
- *  never be silently rebuilt from {} by a PUT — that would wipe every field
- *  the loader could not read. */
+function readConfig(): ConfigShape {
+    const { value } = readConfigRaw();
+    return value && typeof value === "object" && !Array.isArray(value) ? value as ConfigShape : {};
+}
+
+/** The config file exists on disk but does not parse as JSON/JSONC (genuinely broken
+ *  syntax, not just comments/trailing commas which are valid JSONC per #3572). Distinct
+ *  from "missing": a broken file must never be silently rebuilt from {} by a PUT — that
+ *  would wipe every field the loader could not read. Only real syntax errors block it. */
 function configParseError(): string | null {
     if (!existsSync(configFile())) return null;
-    const parsed = safeReadJson(configFile());
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return null;
-    return `config file is not valid JSON: ${configFile()}`;
+    const { value, error } = readConfigRaw();
+    if (value && typeof value === "object" && !Array.isArray(value)) return null;
+    return `config file is not valid JSON: ${configFile()}${error ? ` (${error})` : ""}`;
 }
 
 /** Raw inline `providers` block exactly as written in the config file. The
@@ -91,6 +102,9 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const config = readConfig();
     const rawCompress = config.compress && typeof config.compress === "object" ? config.compress as Record<string, unknown> : undefined;
     const credentialStatus: Record<string, boolean> = {};
+    // #3488: additive five-state view (missing vs invalid value vs unreadable
+    // store) alongside the legacy boolean record scripts already consume.
+    const credentialDetail: Record<string, SummaryCredentialState> = {};
     let hideInvalidSummary = false;
     // Disabled chains skip strict target validation (an inert chain must not
     // brick the config view), so surface credential status from the raw
@@ -112,7 +126,11 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
                 ? Object.values(loadNamedProviders()).flatMap((recipe) => recipe.credentialRef !== undefined ? [`secret:${recipe.credentialRef}`] : recipe.apiKeyEnv !== undefined ? [`env:${recipe.apiKeyEnv}`] : [])
                 : rawCredentialRefs(rawCompress.externalSummary);
             const store = new SummaryCredentialStore();
-            for (const ref of refs) credentialStatus[ref] = store.configured(ref);
+            for (const ref of refs) {
+                const state = store.status(ref);
+                credentialStatus[ref] = state === "configured";
+                credentialDetail[ref] = state;
+            }
         } catch {
             // A manually edited invalid block can contain inline credentials.
             // Never echo that block through either structured or raw config GET.
@@ -130,9 +148,9 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
         externalSummaryCredentials: credentialStatus,
+        externalSummaryCredentialStatus: credentialDetail,
         agentProviders: agentRegistryStatus(),
         passthrough: passthroughState(process.env),
-        allowDshCompaction: allowDshCompactionState(process.env),
         ...(existsSync(configFile()) ? { raw: hideInvalidSummary ? JSON.stringify(config, null, 2) : readFileSync(configFile(), "utf8") } : {}),
         ...(parseError ? { parseError } : {}),
     }, null, 2));
@@ -174,7 +192,7 @@ export async function handleConfigPut(
     const hasPassthrough = Object.prototype.hasOwnProperty.call(body, "passthrough");
     const hasDsh = Object.prototype.hasOwnProperty.call(body, "dsh");
     const hasFile = Object.prototype.hasOwnProperty.call(body, "file");
-    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasDsh && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, passthrough, dsh compaction settings, or the full config file");
+    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasDsh && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, passthrough, or the full config file");
     // Raw whole-file save (web config card): validate the known fields exactly like the
     // structured payload, then replace the ENTIRE config — preserving unknown keys such
     // as promptPack/ccr that per-field PUTs cannot touch.
@@ -182,11 +200,12 @@ export async function handleConfigPut(
         if (typeof body.file !== "string") return sendError(res, 400, "file must be a string (raw config JSON text)");
         let next: ConfigShape;
         try {
-            const p = JSON.parse(body.file);
+            const p = parseBiliConfig(body.file);
             if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("top level must be a JSON object");
-            const rec = p as Record<string, unknown>;
-            normalizeLegacyAllowDshCompaction(rec);
-            next = rec as ConfigShape;
+            // #3666: legacy dsh.* / top-level allowDshCompaction keys are no
+            // longer relocated — whole-file saves preserve them verbatim (the
+            // load path warns once that they are ignored).
+            next = p as ConfigShape;
         } catch (error) {
             return sendError(res, 400, `file is not valid JSON: ${String(error)}`);
         }
@@ -215,6 +234,7 @@ export async function handleConfigPut(
         }
         if (next.upstreamProxyMode !== undefined && (typeof next.upstreamProxyMode !== "string" || !["auto", "manual", "direct"].includes(next.upstreamProxyMode))) return sendError(res, 400, "upstreamProxyMode must be auto, manual, or direct");
         if (next.compress !== undefined && next.compress !== null && parseCompressSettings(next.compress) === undefined) return sendError(res, 400, "invalid compress settings");
+        if (next.cacheKeepalive !== undefined && next.cacheKeepalive !== null && parseCacheKeepaliveSettings(next.cacheKeepalive) === undefined) return sendError(res, 400, "invalid cacheKeepalive settings");
         // The chain references named recipes — validate the expansion against
         // the providers table BEING SAVED (not the on-disk one), so a save
         // cannot strand the config on a dangling reference. Only enabled
@@ -237,12 +257,9 @@ export async function handleConfigPut(
         }
         if (next.passthrough !== undefined && next.passthrough !== null && typeof next.passthrough !== "boolean") return sendError(res, 400, "passthrough must be a boolean or null");
         if (next.passthrough === true && passthroughState(process.env).source === "env") return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
-        const fileDshFlag = ((next.dsh ?? {}) as Partial<DshFileSettings>).allowDshCompaction;
-        if (fileDshFlag !== undefined && fileDshFlag !== null && typeof fileDshFlag !== "boolean") return sendError(res, 400, "dsh.allowDshCompaction must be a boolean");
-        if (fileDshFlag === true || fileDshFlag === false) {
-            const dshForced = allowDshCompactionState(process.env);
-            if (dshForced.source === "env" && fileDshFlag !== dshForced.enabled) return sendError(res, 409, "dsh.allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
-        }
+        // #3666: dsh.* settings were removed — whole-file saves preserve any
+        // leftover dsh keys verbatim (the load path warns once that they are
+        // ignored), so there is nothing to validate or reconcile here.
         try {
             atomicWriteConfig(next);
             onChanged?.();
@@ -332,21 +349,11 @@ export async function handleConfigPut(
         }
     }
 
-    // #2028: same read/clear contract as passthrough (#405) — an env
-    // BILI_ALLOW_DSH_COMPACTION outranks the file on every reload, so a
-    // contradicting file write would be a silent no-op: refuse with the exact
-    // way out instead. A matching write or a clear (null) stays allowed.
+    // #3666: dsh.* settings were removed — the wire guard now refuses dsh
+    // native compaction unconditionally, so any dsh write is rejected loudly
+    // instead of silently ignored (loud-reject rule for user config).
     if (hasDsh) {
-        const dshBody = (body.dsh ?? {}) as Partial<DshFileSettings>;
-        if (dshBody.allowDshCompaction !== null && dshBody.allowDshCompaction !== undefined && typeof dshBody.allowDshCompaction !== "boolean") {
-            return sendError(res, 400, "dsh.allowDshCompaction must be a boolean or null");
-        }
-        if (dshBody.allowDshCompaction === true || dshBody.allowDshCompaction === false) {
-            const dshState = allowDshCompactionState(process.env);
-            if (dshState.source === "env" && dshBody.allowDshCompaction !== dshState.enabled) {
-                return sendError(res, 409, "dsh.allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
-            }
-        }
+        return sendError(res, 400, "dsh.* settings were removed (#3651): dsh native compaction is refused unconditionally — delete the key(s) from your config");
     }
 
     const config = readConfig();
@@ -364,16 +371,6 @@ export async function handleConfigPut(
         if (body.passthrough === true) config.passthrough = true;
         else delete config.passthrough;
     }
-    if (hasDsh) {
-        const curDsh = (config.dsh ?? undefined) as Partial<DshFileSettings> | undefined;
-        if (((body.dsh ?? {}) as Partial<DshFileSettings>).allowDshCompaction === true) {
-            config.dsh = { ...curDsh, allowDshCompaction: true };
-        } else if (curDsh) {
-            const rest: Partial<DshFileSettings> = { ...curDsh };
-            delete rest.allowDshCompaction;
-            config.dsh = Object.keys(rest).length > 0 ? rest : undefined;
-        }
-    }
     try {
         atomicWriteConfig(config);
         onChanged?.();
@@ -385,7 +382,6 @@ export async function handleConfigPut(
     if (hasProxy || hasMode) changed.push("network");
     if (hasCompress) changed.push("compress");
     if (hasPassthrough) changed.push("passthrough");
-    if (hasDsh) changed.push("dsh compaction");
     log("info", `[acp-web] configuration updated (${changed.join(", ") || "none"})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, providers: hasProviders && rawProviders ? Object.keys(rawProviders).length : undefined }));

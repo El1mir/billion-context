@@ -45,8 +45,20 @@ import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { driveWire, WIRES, type Wire } from "./golden-storage-drive.ts";
 import { rmrf } from "./tmp-rm.ts";
+import { ENGPROOF_CHECKS, spawnCorruptIndexChild, viewDigest, viewStateDigest } from "./corrupt-index-child.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
+// #3400: pin the legacy wire shape. This suite proves STORAGE restart
+// invisibility against committed reference digests; the new default egress
+// image rescale (#3400) changes those digests by design and is covered by its
+// own suite (tests/issue3400-image-rescale.test.ts) — keep the two concerns apart.
+process.env.BILI_IMAGE_RESCALE = "0";
+// #3756 follow-up: the shadow observability lane writes a snapshotShadow blob
+// into session.metadata on armed turns; goldens pin wire+state bytes for the
+// RENDER/STORAGE shape, not observability — keep them free of the new field
+// (the shadow lane has its own suite, tests/snapshot-shadow.test.ts).
+process.env.BILI_SNAPSHOT_SHADOW = "0";
+
 
 // Same hermeticity contract as the corpus suites: a developer machine with
 // storage.unified in its real config must not leak a tier into these tests.
@@ -92,37 +104,10 @@ function recordDigest(record: Record<string, unknown>): string {
     })));
 }
 
-function viewDigest(view: ReturnType<typeof loadLegacyView>): string {
-    return sha256(JSON.stringify(canonicalize({
-        id: view.id,
-        meta: view.meta,
-        stats: view.stats,
-        metadata: view.metadata,
-        state: view.state,
-        blockContents: [...view.blockContents.entries()],
-        lastMessages: view.lastMessages,
-        lastMessagesFolded: view.lastMessagesFolded,
-        pluginSnapshot: view.pluginSnapshot,
-        contentStore: view.contentStore,
-    })));
-}
-
-/** #2960 ⑤: viewDigest minus the tail pointer fields — full mode serves the
- *  RAW tail from the table while legacy serves the envelope's bounded folded
- *  re-render, so cross-mode "identical state" proofs compare the state proper
- *  (folds/refs/blocks/contents) and pin the tail relationship separately. */
-function viewStateDigest(view: ReturnType<typeof loadLegacyView>): string {
-    return sha256(JSON.stringify(canonicalize({
-        id: view.id,
-        meta: view.meta,
-        stats: view.stats,
-        metadata: view.metadata,
-        state: view.state,
-        blockContents: [...view.blockContents.entries()],
-        pluginSnapshot: view.pluginSnapshot,
-        contentStore: view.contentStore,
-    })));
-}
+/** #2960 ⑤ viewStateDigest and its viewDigest sibling moved to
+ *  ./corrupt-index-child.ts (#4338) — the corrupt-index scenario runs in a
+ *  spawned child that needs the exact same digest definitions, so there is
+ *  one copy, imported by both sides. */
 
 /** Finds the persisted envelope payload for `id` under `root`. */
 function findWrittenRecord(root: string, id: string): Record<string, unknown> | null {
@@ -367,7 +352,7 @@ test("storage engine: sidecar self-disables after 3 consecutive failures (reads 
 // CORRUPT INDEX (#2771): construction degrades to legacy-only.
 // ---------------------------------------------------------------------------
 
-test("storage engine: corrupt index.db degrades to legacy-only instead of bricking construction (#2771)", async () => {
+test("storage engine: corrupt index.db degrades to legacy-only instead of bricking construction (#2771)", { timeout: 180_000 }, async () => {
     const dir = tmpdir("bili-engproof-corrupt-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
@@ -383,31 +368,31 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         const viaFull = clean.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         clean.closeQuietly();
         assert.ok(viaFull, "full-mode read returned null");
-        const digestClean = viewDigest(toLegacyLike(viaFull));
 
-        // Corrupt the index header (crashed checkpoint / stray write).
-        const fd = fs.openSync(path.join(dir, "index.db"), "r+");
-        fs.writeSync(fd, Buffer.alloc(512, 0x5a), 0, 512, 0);
-        fs.closeSync(fd);
-
-        // THE #2771 regression: construction must survive, reads must fall
-        // back to the legacy file, and the digest must be exact.
-        const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
-        const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        store2.cancelAll();
-        assert.ok(reloaded, "legacy fallback returned null over a corrupt index");
-
-        // Regression (#2781): the failed open must have CLOSED its handle —
-        // Windows refuses to move/delete a directory while any process holds
-        // a file inside it open. On POSIX the rename is a no-op that always
-        // succeeds, so this guard only bites where the bug lives.
-        const moved = dir + "-moved";
-        fs.renameSync(dir, moved);
-        fs.renameSync(moved, dir);
-        assert.equal(viewStateDigest(toLegacyLike(reloaded)), viewStateDigest(toLegacyLike(viaFull)), "corrupt-index fallback state digest drift vs clean full-mode read");
-        // Writes must keep working (legacy path) — no throw, file refreshed.
-        await store2.writeNow(reloaded);
-        store2.closeQuietly();
+        // #4338: everything past this point (corrupt the header → degrade
+        // construction → fallback read → rename guards → write → close) runs
+        // in a spawned child. On Windows the FAILED open of the corrupt index
+        // can leave an OS handle with no JS reference to release, and the
+        // resulting persistent EBUSY at rmrf outlives the whole tmp-rm retry
+        // ladder; the child exiting RELEASES all its handles by OS guarantee,
+        // so this parent's rmrf below cannot be blocked. The child prints a
+        // JSON verdict of named checks; every one is re-asserted here, so
+        // assertion coverage is 1:1 with the in-process era (same asserts,
+        // executed in the child, verified in the parent). The child also runs
+        // the #2781 mid-flow rename guard plus a post-close guard, so future
+        // handle-leak drift trips there by name instead of at teardown.
+        const stateDigestClean = viewStateDigest(toLegacyLike(viaFull));
+        const childEnv: NodeJS.ProcessEnv = {
+            ...process.env,
+            BILI_STORAGE_UNIFIED: "full",
+            BILI_PERSIST_ZSTD: "0",
+        };
+        const verdict = spawnCorruptIndexChild("engproof", [dir, stateDigestClean], childEnv);
+        assert.equal(verdict.ok, true, verdict.failure ?? "corrupt-index child reported a failed check");
+        for (const name of ENGPROOF_CHECKS) {
+            const check = verdict.checks.find((c) => c.name === name);
+            assert.ok(check?.ok, `corrupt-index child check failed/missing: ${name}${check?.detail ? ` — ${check.detail}` : ""}`);
+        }
     } finally {
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;

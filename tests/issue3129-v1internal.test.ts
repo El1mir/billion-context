@@ -226,6 +226,26 @@ test("v1UnwrapStream unwraps an SSE stream and a JSON body", async () => {
     assert.deepEqual(JSON.parse(await new Response(await v1UnwrapStream(jsonBody)).text()), { totalTokens: 7 });
 });
 
+test("#3331 v1UnwrapStream: CRLF-framed SSE is unwrapped, incl. a CRLF split across chunks", async () => {
+    const enc = new TextEncoder();
+    // whole stream uses \r\n terminators (SSE-spec-legal); the second frame's
+    // terminating CRLF is split across two chunks to exercise the hold-back.
+    const f1 = `data: ${JSON.stringify(envelope(gcr("a")))}\r\n\r\n`;
+    const f2 = `data: ${JSON.stringify(envelope(gcr("b")))}\r\n\r\n`;
+    const sseBody = new ReadableStream<Uint8Array>({
+        start(c) {
+            c.enqueue(enc.encode(f1 + f2.slice(0, -1))); // ends mid-CRLF (…\r)
+            c.enqueue(enc.encode(f2.slice(-1)));          // partner \n
+            c.close();
+        },
+    });
+    const frames = ssePayloads(await new Response(await v1UnwrapStream(sseBody)).text());
+    assert.equal(frames.length, 2, "both CRLF frames unwrapped");
+    assert.deepEqual((frames[0] as Record<string, unknown>).candidates, gcr("a").candidates);
+    assert.deepEqual((frames[1] as Record<string, unknown>).candidates, gcr("b").candidates);
+    assert.equal((frames[0] as Record<string, unknown>).response, undefined, "envelope stripped");
+});
+
 test("#3129 A: an enveloped Antigravity turn round-trips the envelope end-to-end", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls);

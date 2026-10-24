@@ -259,7 +259,7 @@ test("validation: all checks disabled (0s) allows any input", () => {
   assert.equal(result.result.errors.length, 0);
 });
 
-test("validation: errors are collected per-range in batch compress", () => {
+test("validation: an empty-summary range rejects the whole batch (#3003)", () => {
   const core = createCore();
   const messages = [
     msg("a", longText),
@@ -282,7 +282,12 @@ test("validation: errors are collected per-range in batch compress", () => {
     state,
     config,
   });
-  assert.equal(result.result.blocksCreated, 1);
+  // #3003: a length-class failure (empty summary) in ANY candidate rejects the
+  // WHOLE batch — the valid sibling no longer lands. Content-class failures
+  // (unknown/invalid refs) remain per-range; see the invalid-refs batch test.
+  assert.equal(result.result.blocksCreated, 0);
+  assert.equal(result.state.blocks.length, 0);
   assert.equal(result.result.errors.length, 1);
+  assert.match(result.result.errors[0]!, /Batch rejected before folding any range/);
   assert.match(result.result.errors[0]!, /empty/i);
 });

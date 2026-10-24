@@ -43,7 +43,8 @@ import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
-import { parseCodexToml, resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
+import { parseCodexToml, readClaudeSettings, resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
+import { stripBiliWrappers, vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
@@ -503,12 +504,13 @@ export function claudeAcpCacheCommandFile(env: NodeJS.ProcessEnv = process.env):
     return path.join(path.dirname(claudeSettingsFile(env)), "commands", "acp-cache.md");
 }
 
-/** True for an ANTHROPIC_BASE_URL value written by a bili managed block:
- *  loopback /bili/-wrapped upstream. Any port matches — an older install's
- *  port differs from the current one, and both are ours to rewrite. */
+/** True for a base-URL value written by a bili managed block: loopback
+ *  /bili/-wrapped upstream. Any port matches — an older install's port differs
+ *  from the current one, and both are ours to rewrite. The optional
+ *  `<protocol>/` segment covers the Vertex form (/bili/anthropic/<url>). */
 export function isBiliClaudeBaseUrl(value: unknown): boolean {
     if (typeof value !== "string") return false;
-    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/https?:\/\//.test(value);
+    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/(?:[a-z][a-z0-9-]*\/)?https?:\/\//.test(value);
 }
 
 /** Disk evidence that the Claude Desktop app is installed — the host whose
@@ -533,9 +535,48 @@ export function claudeDesktopPresent(opts: { platform?: string; localAppData?: s
     return false;
 }
 
+/** The loopback origin a managed block bakes in: the explicit native port when
+ *  set (#964), else the current zone preference. Exported so the Vertex and the
+ *  plain variable are always written for the SAME port. */
+export function claudeNativeOrigin(env: NodeJS.ProcessEnv = process.env): string {
+    return `http://127.0.0.1:${resolveClaudeNativePort(env) ?? lanePreferredPort("claude", env)}`;
+}
+
 export function claudeNativeBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
-    const origin = `http://127.0.0.1:${resolveClaudeNativePort(env) ?? lanePreferredPort("claude", env)}`;
-    return claudeNativeBaseUrlForOrigin(origin, undefined, env);
+    return claudeNativeBaseUrlForOrigin(claudeNativeOrigin(env), undefined, env);
+}
+
+/** Vertex (Claude Code's third-party lane): the managed block has to pin
+ *  ANTHROPIC_VERTEX_BASE_URL too, because with CLAUDE_CODE_USE_VERTEX=1 the
+ *  client ignores the ANTHROPIC_BASE_URL the block bakes in — a native install
+ *  without this key calls Google directly and never touches bili.
+ *
+ *  Resolved the way the client itself resolves it: settings.json env block
+ *  first, then process env (readClaudeSettings). Returns undefined when the lane
+ *  is not on Vertex or no host is derivable, in which case the block leaves the
+ *  key alone.
+ *
+ *  The URL is protocol-qualified (/bili/anthropic/<url>) in mirror of
+ *  launcher.ts's wrapUpstream(origin, upstream, "anthropic") — copied rather than
+ *  imported because launcher.ts already imports this module.
+ *
+ *  Idempotent by construction: an existing value may be OUR OWN managed URL
+ *  (install, then the SessionStart repin, then every launch after that), so it is
+ *  unwrapped before being treated as an endpoint. Without that, each repin nests
+ *  another /bili/anthropic/ layer, and the nested hop targets the proxy's own port
+ *  — denied as a self-tunnel (403 detail:"self"). */
+export function claudeNativeVertexBaseUrl(origin: string, env: NodeJS.ProcessEnv = process.env, homeDir: string = os.homedir(), cwd: string = process.cwd()): string | undefined {
+    let settings;
+    try {
+        settings = readClaudeSettings(homeDir, cwd, env);
+    } catch {
+        return undefined;
+    }
+    if (settings.vertexEnabled !== true) return undefined;
+    const configured = typeof settings.vertexBaseUrl === "string" ? settings.vertexBaseUrl.trim() : "";
+    const upstream = vertexBaseUrlForLocation(settings.vertexRegion, configured.length > 0 ? stripBiliWrappers(configured) : undefined);
+    if (upstream === null) return undefined;
+    return origin.replace(/\/+$/, "") + "/bili/anthropic/" + upstream.replace(/\/+$/, "");
 }
 
 /** #1660: the wrapped base URL for an arbitrary live origin — the
@@ -575,18 +616,31 @@ export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv
     const settings = readJson(file);
     const cur = (settings.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
     const baseUrl = claudeNativeBaseUrlForOrigin(origin, typeof cur === "string" ? unwrapBiliBaseUrl(cur) : undefined, env);
+    // Drift repair covers the Vertex variable too: the block's port drifts the same
+    // way, and under CLAUDE_CODE_USE_VERTEX=1 that is the variable the client reads.
+    const vertexBaseUrl = claudeNativeVertexBaseUrl(origin, env);
     // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
     const hookCommand = portableHookCommand("node", [path.join(selfPackageRoot(), "dist", "claude-native-bootstrap.js")]);
-    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand });
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand, ...(vertexBaseUrl !== undefined ? { vertexBaseUrl } : {}) });
     if (JSON.stringify(data) !== JSON.stringify(settings)) writeJson(file, data);
     return notes;
+}
+
+/** #1821: the live origin of the managed block — the port the last SessionStart
+ *  hook repinned, i.e. what a RUNNING claude session dials. Undefined when the
+ *  settings file holds no bili-managed ANTHROPIC_BASE_URL (foreign or absent). */
+export function readClaudeManagedBaseUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const cur = (readJson(claudeSettingsFile(env)).env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
+    if (typeof cur !== "string" || !isBiliClaudeBaseUrl(cur)) return undefined;
+    const i = cur.indexOf("/bili/");
+    return i > 0 ? cur.slice(0, i) : undefined;
 }
 
 /** Pure merge of the #964 managed block into parsed settings (install path).
  *  Never clobbers user keys: a foreign ANTHROPIC_BASE_URL or a non-"1"
  *  DISABLE_AUTO_COMPACT is reported and skipped, not overwritten. Returns the
  *  mutated copy plus human notes. Exported for tests. */
-export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string }): { data: Record<string, unknown>; notes: string[] } {
+export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string; vertexBaseUrl?: string }): { data: Record<string, unknown>; notes: string[] } {
     const data = structuredClone(settings);
     const notes: string[] = [];
     const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
@@ -598,6 +652,19 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
         }
     } else {
         notes.push(`env.ANTHROPIC_BASE_URL left untouched (foreign value ${JSON.stringify(cur)} — unset it or set BILI_CLAUDE_UPSTREAM, then reinstall)`);
+    }
+    // Vertex AI: same rules, second variable. Pinned only when the caller resolved
+    // one (the lane is on Vertex); a foreign value is reported, never clobbered.
+    if (opts.vertexBaseUrl !== undefined) {
+        const curVertex = env.ANTHROPIC_VERTEX_BASE_URL;
+        if (curVertex === undefined || curVertex === null || isBiliClaudeBaseUrl(curVertex)) {
+            if (curVertex !== opts.vertexBaseUrl) {
+                env.ANTHROPIC_VERTEX_BASE_URL = opts.vertexBaseUrl;
+                notes.push("env.ANTHROPIC_VERTEX_BASE_URL pinned to the bili proxy (Vertex AI lane)");
+            }
+        } else {
+            notes.push(`env.ANTHROPIC_VERTEX_BASE_URL left untouched (foreign value ${JSON.stringify(curVertex)} — Vertex traffic will bypass bili; unset it and reinstall to route it)`);
+        }
     }
     const dac = env.DISABLE_AUTO_COMPACT;
     if (dac === undefined || dac === null || dac === "1") {
@@ -675,6 +742,14 @@ export function stripClaudeManagedBlock(settings: Record<string, unknown>): { da
         if (env.DISABLE_AUTO_COMPACT === "1") {
             delete env.DISABLE_AUTO_COMPACT;
             removed.push("env.DISABLE_AUTO_COMPACT");
+        }
+        // Vertex (phase 1, decision 4): the managed block pins this key too, so
+        // removal has to take it back — otherwise `bili plugin remove claude`
+        // leaves the client pointed at a /bili/ URL that no longer serves it. A
+        // foreign endpoint is the user's and stays, same rule as install.
+        if (isBiliClaudeBaseUrl(env.ANTHROPIC_VERTEX_BASE_URL)) {
+            delete env.ANTHROPIC_VERTEX_BASE_URL;
+            removed.push("env.ANTHROPIC_VERTEX_BASE_URL");
         }
         if (Object.keys(env).length === 0) delete data.env;
     }
@@ -772,14 +847,43 @@ function defaultWhereRunner(name: string): { stdout: string | null } {
     return { stdout: r.stdout ?? null };
 }
 
+// #1821: what to do about an existing "bili" MCP registration when installing.
+// Ownership is content-based, exactly like every other managed block here:
+// only a node-run command whose script is our entry (basename match — dev
+// checkouts and pnpm stores rename the package dir) counts as ours; anything
+// else keeps the name and is never touched. An unreadable .claude.json falls
+// back to the legacy behavior (plain add; the CLI owns its own file errors).
+function claudeMcpFaceAction(entryJs: string, stableOrigin: string):
+    { kind: "current" } | { kind: "fresh" } | { kind: "replace"; reason: string } | { kind: "foreign" } {
+    let data: Record<string, unknown>;
+    try {
+        data = readJson(claudeMcpJson());
+    } catch {
+        return { kind: "fresh" };
+    }
+    const servers = typeof data.mcpServers === "object" && data.mcpServers !== null ? (data.mcpServers as Record<string, unknown>) : {};
+    const bili = servers.bili;
+    if (typeof bili !== "object" || bili === null) return { kind: "fresh" };
+    const entry = bili as { command?: unknown; args?: unknown; env?: unknown };
+    const isNodeCommand = typeof entry.command === "string" && /node(?:\.(?:exe|cmd))?$/i.test(path.basename(entry.command));
+    const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
+    const ours = isNodeCommand && args.some((a) => /dist[\\/]claude-mcp-entry\.(?:js|mjs)$/.test(a));
+    const legacy = isNodeCommand && args.some((a) => /dist[\\/]mcp\.(?:js|mjs)$/.test(a));
+    if (!ours && !legacy) return { kind: "foreign" };
+    if (!ours) return { kind: "replace", reason: "migrated from dist/mcp.js" };
+    const pin = typeof entry.env === "object" && entry.env !== null ? (entry.env as Record<string, unknown>).BILI_MCP_PROXY : undefined;
+    if (pin === stableOrigin && args.includes(entryJs)) return { kind: "current" };
+    return { kind: "replace", reason: "re-pinned" };
+}
+
 function claudeInstall(): string {
     if (process.env.BILI_NATIVE_CLAUDE === "0") {
         throw new Error("claude: install refused — BILI_NATIVE_CLAUDE=0 is set (clear it to install the native posture)");
     }
     const root = selfPackageRoot();
-    const mcpJs = path.join(root, "dist", "mcp.js");
+    const mcpEntryJs = path.join(root, "dist", "claude-mcp-entry.js");
     const bootstrapJs = path.join(root, "dist", "claude-native-bootstrap.js");
-    requireDistFile(mcpJs);
+    requireDistFile(mcpEntryJs);
     requireDistFile(bootstrapJs);
 
     // Managed block first: the static URL + bootstrap hook + compaction off.
@@ -795,19 +899,46 @@ function claudeInstall(): string {
     const settings = readJson(file);
     // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
     const hookCommand = portableHookCommand("node", [bootstrapJs]);
+    // Both variables are baked for the SAME origin; the Vertex one only exists
+    // when the lane is configured for Vertex (claudeNativeVertexBaseUrl).
+    const managedOrigin = claudeNativeOrigin();
+    const vertexManagedBaseUrl = claudeNativeVertexBaseUrl(managedOrigin);
     const { data, notes } = applyClaudeManagedBlock(settings, {
-        baseUrl: claudeNativeBaseUrl(),
+        baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, undefined),
         hookCommand,
+        ...(vertexManagedBaseUrl !== undefined ? { vertexBaseUrl: vertexManagedBaseUrl } : {}),
     });
     writeJson(file, data);
 
-    // MCP face: same registration path as before, but pinned to the STABLE
-    // port the hook brings up — never proxyOriginForInstall() (an ephemeral
-    // launcher proxy would go stale in this static config).
+    // MCP face: pinned to the STABLE port the hook brings up — never
+    // proxyOriginForInstall() (an ephemeral launcher proxy would go stale in
+    // this static config). #1821: the entry now carries the mid-session
+    // watchdog that respawns the lane proxy when it dies; pre-watchdog
+    // installs registered plain dist/mcp.js and are swapped in place below so
+    // an upgrade lands the self-heal without a manual reinstall dance.
     const stableOrigin = `http://127.0.0.1:${nativePort}`;
     const claude = resolveClaudeCli(process.env.CLAUDE?.trim() || "claude");
+    const mcpAdd = ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpEntryJs];
+    let mcpNote: string;
     try {
-        runClaudeCli(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpJs]);
+        const action = claudeMcpFaceAction(mcpEntryJs, stableOrigin);
+        switch (action.kind) {
+            case "current":
+                mcpNote = `MCP face current (${claudeMcpJson()}, pinned ${stableOrigin})`;
+                break;
+            case "fresh":
+                runClaudeCli(claude, mcpAdd);
+                mcpNote = `MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin})`;
+                break;
+            case "replace":
+                runClaudeCli(claude, ["mcp", "remove", "bili", "--scope", "user"]);
+                runClaudeCli(claude, mcpAdd);
+                mcpNote = `MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}, ${action.reason})`;
+                break;
+            case "foreign":
+                mcpNote = `MCP face left untouched (foreign bili server at ${claudeMcpJson()})`;
+                break;
+        }
     } catch (err) {
         const stderr = err instanceof Error && "stderr" in err ? String((err as { stderr?: Buffer | string }).stderr ?? "") : "";
         throw new Error(`claude: MCP registration failed (${stderr.trim() || (err instanceof Error ? err.message : String(err))}) — is the claude CLI on PATH? (the managed settings block at ${file} was written; rerun after fixing the CLI to complete the MCP face)`);
@@ -827,7 +958,7 @@ function claudeInstall(): string {
     } catch (err) {
         throw new Error(`claude: /acp-cache command write failed (${err instanceof Error ? err.message : String(err)}) — the managed settings block at ${file} and the MCP face were written; fix the permissions and rerun`);
     }
-    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}) — restart claude to activate`;
+    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); ${mcpNote} — restart claude to activate`;
 }
 
 function claudeRemove(): string {

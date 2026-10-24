@@ -284,10 +284,13 @@ test("openai: user image_url content part is restored", () => {
     ],
   };
   const { msgs } = openaiToCore(body);
+  // #3642: [text, image] splits into a text core + an image core (canonical
+  // "[image]" marker) carrying the singular raw sidecar + parsed media.
   assert.ok(msgs[0]?.text?.startsWith("what is this?"), "text preserved");
-  assert.equal(msgs[0]?.imageMediaType, "image/png");
-  assert.equal(msgs[0]?.imageBase64, IMG_DATA);
-  assert.ok(msgs[0]?.rawOpenaiContent, "rawOpenaiContent sidecar stored");
+  assert.equal(msgs[1]?.text, "[image]");
+  assert.equal(msgs[1]?.imageMediaType, "image/png");
+  assert.equal(msgs[1]?.imageBase64, IMG_DATA);
+  assert.ok(msgs[1]?.rawOpenaiContent, "rawOpenaiContent sidecar stored");
   const rebuilt = coreToOpenai(msgs);
   const u = rebuilt[0]!;
   assert.equal(u.role, "user");
@@ -333,11 +336,14 @@ test("openai: user message with multiple image_url parts round-trips ALL images"
     ],
   };
   const { msgs } = openaiToCore(body);
-  assert.ok(
-    msgs[0]?.rawOpenaiContentParts,
-    "multi-image sidecar stored (not singular rawOpenaiContent)",
+  // #3642: each image is its own core with its singular raw sidecar; the
+  // run rebuild emits all three in order.
+  assert.equal(msgs.length, 4);
+  assert.ok(msgs.slice(1).every((m) => m.rawOpenaiContent));
+  assert.deepEqual(
+    msgs.slice(1).map((m) => m.text),
+    ["[image]", "[image]", "[image]"],
   );
-  assert.equal((msgs[0]?.rawOpenaiContentParts ?? []).length, 3);
   const rebuilt = coreToOpenai(msgs);
   const u = rebuilt[0]!;
   assert.ok(Array.isArray(u.content), "content rebuilt as array");
@@ -399,17 +405,19 @@ test("openai: single remote-URL image_url round-trips via rawOpenaiContent", () 
     ],
   };
   const { msgs } = openaiToCore(body);
+  // #3642: text core + image core (remote URL: no base64/media split).
+  assert.equal(msgs.length, 2);
   assert.ok(
-    msgs[0]?.rawOpenaiContent,
+    msgs[1]?.rawOpenaiContent,
     "rawOpenaiContent sidecar stored for a single remote-URL image",
   );
   assert.equal(
-    msgs[0]?.imageBase64,
+    msgs[1]?.imageBase64,
     undefined,
     "no base64 split for non-data URLs",
   );
   assert.equal(
-    msgs[0]?.imageMediaType,
+    msgs[1]?.imageMediaType,
     undefined,
     "no mediaType split for non-data URLs",
   );
@@ -448,7 +456,8 @@ test("openai: image-only remote-URL user message survives rebuild", () => {
     ],
   };
   const { msgs } = openaiToCore(body);
-  assert.equal(msgs[0]?.text, "");
+  // #3642: a lone image part is an image core with the canonical marker.
+  assert.equal(msgs[0]?.text, "[image]");
   assert.ok(msgs[0]?.rawOpenaiContent, "sidecar stored despite empty text");
   const rebuilt = coreToOpenai(msgs);
   const u = rebuilt[0]!;
@@ -491,11 +500,13 @@ test("openai: mixed data-URL + remote-URL multi-image message preserves ALL imag
     ],
   };
   const { msgs } = openaiToCore(body);
-  assert.ok(msgs[0]?.rawOpenaiContentParts, "multi-image sidecar stored");
-  assert.equal(
-    (msgs[0]?.rawOpenaiContentParts ?? []).length,
-    2,
-    "BOTH images collected (remote included)",
+  // #3642: text core + one image core per image (each with its singular
+  // raw sidecar — data-URL and remote alike).
+  assert.equal(msgs.length, 3);
+  assert.ok(msgs.slice(1).every((m) => m.rawOpenaiContent));
+  assert.deepEqual(
+    msgs.slice(1).map((m) => m.imageBase64),
+    [IMG_DATA, undefined],
   );
   const rebuilt = coreToOpenai(msgs);
   const u = rebuilt[0]!;
@@ -526,10 +537,14 @@ test("responses: user input_image is restored via rawResponsesItem", () => {
     ],
   };
   const { msgs } = responsesToCore(body);
+  // #3642: [text, image] splits into a text core + an image core; the image
+  // core carries the raw item + parsed media, and the run rebuilds as ONE
+  // message (raw verbatim when it fully covers the run).
   assert.ok(msgs[0]?.text?.startsWith("see this"), "text preserved");
-  assert.equal(msgs[0]?.imageMediaType, "image/png");
-  assert.equal(msgs[0]?.imageBase64, IMG_DATA);
-  assert.ok(msgs[0]?.rawResponsesItem, "rawResponsesItem sidecar stored");
+  assert.equal(msgs[1]?.text, "[image]");
+  assert.equal(msgs[1]?.imageMediaType, "image/png");
+  assert.equal(msgs[1]?.imageBase64, IMG_DATA);
+  assert.ok(msgs[1]?.rawResponsesItem, "rawResponsesItem sidecar stored");
   const rebuilt = coreToResponses(msgs);
   assert.equal(rebuilt.length, 1);
   const m = rebuilt[0] as { type: string; content: unknown };
@@ -640,10 +655,13 @@ test("responses: multi-text-part + image rebuild emits no empty input_text (#308
     ],
   };
   const proj = responsesToCore(body);
-  assert.equal(proj.msgs.length, 1, "single user message tracked");
+  assert.equal(proj.msgs.length, 3, "one core per content part");
   const src = proj.msgs[0]!;
-  // Mutate .text to force patchOriginalItem onto the patchTextParts path.
-  const next = [{ ...src, text: `${src.text}\n[m00001]` }];
+  // Mutate .text to force the split-slot rebuild onto the filtered path.
+  const next = [
+    { ...src, text: `${src.text}\n[m00001]` },
+    ...proj.msgs.slice(1),
+  ];
   const rebuilt = patchResponsesInput(proj, next) as ResponseInputItem[];
   const item = rebuilt.find((i) => i.type === "message") as ResponseInputMessage;
   const content = item.content as ResponseContentPart[];
@@ -660,9 +678,9 @@ test("responses: multi-text-part + image rebuild emits no empty input_text (#308
     (p): p is { type: "input_text" | "output_text"; text: string } =>
       p.type === "input_text" || p.type === "output_text",
   );
-  assert.equal(textParts.length, 1, "secondary text slots dropped, not blanked");
-  assert.match(textParts[0]!.text, /look at this/, "first slot keeps all text");
-  assert.match(textParts[0]!.text, /describe it/, "first slot keeps all text");
+  assert.equal(textParts.length, 2, "each text part is its own slot");
+  assert.match(textParts[0]!.text, /look at this/, "first slot keeps its text");
+  assert.match(textParts[1]!.text, /describe it/, "second slot keeps its text");
   assert.ok(content.some((p) => p.type === "input_image"), "image preserved in place");
 });
 
@@ -726,12 +744,12 @@ test("responses: multi-input_image user item takes the [image] placeholder", () 
     ],
   };
   const { msgs } = responsesToCore(body);
-  assert.equal(msgs.length, 1);
-  assert.equal(
-    msgs[0]?.text,
-    "[image]",
-    'no-text multi-image item uses the placeholder (not the "\\n" join artifact)',
+  assert.equal(msgs.length, 2);
+  assert.deepEqual(
+    msgs.map((m) => m.text),
+    ["[image]", "[image]"],
   );
+  assert.notEqual(msgs[0]!.id, msgs[1]!.id, "ClusterCounter disambiguates");
   const rebuilt = coreToResponses(msgs);
   assert.deepEqual(rebuilt[0], body.input[0], "raw item re-emitted verbatim");
 });
@@ -753,16 +771,9 @@ test("responses: whitespace-only text plus image keeps its exact text", () => {
     ],
   };
   const { msgs } = responsesToCore(body);
-  assert.equal(msgs.length, 1);
-  assert.notEqual(
-    msgs[0]?.text,
-    "[image]",
-    "whitespace text counts as real text, not the placeholder",
-  );
-  assert.ok(
-    msgs[0]?.text?.startsWith("   "),
-    "exact whitespace text preserved (kernel joins non-text parts with \\n)",
-  );
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0]?.text, "   ", "exact whitespace text preserved");
+  assert.equal(msgs[1]?.text, "[image]");
   const rebuilt = coreToResponses(msgs);
   assert.deepEqual(
     rebuilt[0],
@@ -803,7 +814,7 @@ test("responses: input_image with non-string image_url is tracked without sideca
 //     (same derived id), so the already-working shape does not churn on
 //     upgrade; switching it to "[image]" would move its id for no functional
 //     gain. Verbatim round-trip holds either way (#187/#291 review).
-test("responses: empty input_text plus image keeps its join-artifact text and stable id", () => {
+test("responses: empty input_text plus image folds to the image core", () => {
   const body: ResponsesRequestBody = {
     input: [
       {
@@ -818,11 +829,7 @@ test("responses: empty input_text plus image keeps its join-artifact text and st
   };
   const { msgs } = responsesToCore(body);
   assert.equal(msgs.length, 1);
-  assert.equal(
-    msgs[0]?.text,
-    "\n",
-    'empty text part joins to the "\\n" artifact, not the placeholder',
-  );
+  assert.equal(msgs[0]?.text, "[image]", "image core only");
   const pureImage: ResponsesRequestBody = {
     input: [
       {
@@ -832,13 +839,24 @@ test("responses: empty input_text plus image keeps its join-artifact text and st
       },
     ],
   };
-  assert.notEqual(
+  assert.equal(
     msgs[0]?.id,
     responsesToCore(pureImage).msgs[0]?.id,
-    "distinct from the pure image-only placeholder id",
+    "identical to the pure image-only id (same logical content)",
   );
   const rebuilt = coreToResponses(msgs);
-  assert.deepEqual(rebuilt[0], body.input[0], "verbatim round-trip holds");
+  // The empty input_text part is intentionally dropped: strict Responses
+  // backends reject empty input_text.text with a 400 (#3089), and the part
+  // carries no content. The image survives verbatim.
+  assert.deepEqual(
+    rebuilt[0],
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_image", image_url: DATA_URL }],
+    },
+    "image part re-emitted verbatim, empty text part dropped",
+  );
 });
 
 // 7. Responses reasoning is routed into the compression pipeline (NOT the

@@ -7,12 +7,15 @@
 // KEEP IN SYNC: adding a process-spawning suite means adding it here (the
 // tripwire fails CI until you do); slot = index here.
 export const LIVE_FILES = [
+    "tests/codex-mcp-shell.test.ts",
+    "tests/codex-plugin-version-sync.test.ts",
     "tests/session-transient-memory.test.ts",
     "tests/auto-restart.test.ts",
     "tests/bounded-storage-scale.test.ts",
     "tests/build-info.test.ts",
     "tests/cache-theorem.test.ts",
     "tests/claude-native.test.ts",
+    "tests/codex-concurrent-launch.test.ts",
     "tests/e2e-plugin-tool-routing.test.ts",
     "tests/graceful-close.test.ts",
     "tests/hermes-native.test.ts",
@@ -21,6 +24,8 @@ export const LIVE_FILES = [
     "tests/index-entry-guard.test.ts",
     "tests/issue1958-routed-warn.test.ts",
     "tests/issue2752-forward-partial-outcome.test.ts",
+    "tests/issue3472-mcp-structured-text.test.ts",
+    "tests/issue4341-early-twin-adoption.test.ts",
     "tests/issue760-percall-conversation.test.ts",
     "tests/issue927-opencode-install.test.ts",
     "tests/kimi-native.test.ts",
@@ -45,6 +50,17 @@ export const LIVE_FILES = [
     "tests/win-cmd-argv.test.ts",
     "tests/zcode-mcp-degraded.test.ts",
     "tests/zcode-real-cli.test.ts",
+    // appended, NOT alphabetical: slot = index drives each file's zone port
+    // band (preload-zone-slot), so mid-list inserts renumber every later band
+    "tests/storage-durability.test.ts",
+    "tests/server-close-all-connections.test.ts",
+    // both spawn the corrupt-index-child helper (unified-store cold-load
+    // corruption probes, #4216/#4249 follow-ups); append-only per the note above
+    "tests/storage-engine-proofs.test.ts",
+    "tests/web-storage-banner.test.ts",
+    // #4434 (split-brain surface): spawns bili CLI children against a throwaway
+    // origin; own probe server is listen(0) so only the zone band matters
+    "tests/issue-split-brain-surface.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

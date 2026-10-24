@@ -1,6 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, type AnthropicRequestBody } from "acp-kernel/wire";
-import { appendSystemText } from "../util.js";
+import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
@@ -240,12 +240,28 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         return Object.keys(out).length > 0 ? out : undefined;
     };
 
+    // #4072: the cache_creation breakdown object (e.g. { ephemeral_5m_input_tokens })
+    // rides inside a frame's `usage`. Plain-object guard only — values are passed
+    // through verbatim, never synthesized (the upstream knows whether the write was
+    // 5m or 1h).
+    const cacheCreationOf = (u: Record<string, unknown>): Record<string, unknown> | undefined => {
+        const cc = u["cache_creation"];
+        return cc !== null && typeof cc === "object" && !Array.isArray(cc) ? (cc as Record<string, unknown>) : undefined;
+    };
+    // Same relays that echo `input_tokens: 0` in an incomplete message_delta usage
+    // (#660) may echo a schema-shaped all-zero breakdown — adopting it would clobber
+    // the real start-frame values. Mirror the numerics' adoption rule: only a
+    // breakdown carrying tokens is an update.
+    const cacheCreationMeaningful = (cc: Record<string, unknown>): boolean =>
+        Object.values(cc).some((v) => typeof v === "number" && v > 0);
+
     const buildTerminal = (
         stopReason: string,
         outputTokens: number,
         inputTokens: number,
         cachedTokens: number,
         creationTokens?: number,
+        cacheCreation?: Record<string, unknown>,
         extras?: Record<string, unknown>,
     ): Buffer => {
         const usage: Record<string, unknown> = {
@@ -254,6 +270,11 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             cache_read_input_tokens: cachedTokens,
         };
         if (typeof creationTokens === "number") usage.cache_creation_input_tokens = creationTokens;
+        // #4072: the breakdown's only upstream home is message_start, which is
+        // forwarded usage-neutral (#1315) — re-carry it here or hosts deriving
+        // their prompt-cache TTL from it (Claude Code VS Code countdown icon)
+        // lose it. Absent when no frame carried one; never synthesized.
+        if (cacheCreation) usage.cache_creation = cacheCreation;
         const extra: Record<string, unknown> = {};
         // #2701: report the thread tail (latest round's id) when present — on a
         // threads turn the client's next continue must target it, not round 1's id.
@@ -294,7 +315,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let roundInput: number | undefined;
             let roundCached: number | undefined;
             let roundCreation: number | undefined;
+            // #4072: verbatim cache_creation breakdown for THIS round's frames —
+            // like the numerics above, the final round's value is what the
+            // synthetic terminal carries (stitched turns take the post-fold
+            // round, matching how the totals are chosen).
+            let roundCacheCreation: Record<string, unknown> | undefined;
             let roundOutput: number | undefined;
+            // #4128: upstream billing_usage declaration that input_tokens is inclusive of cache_read.
+            let roundDeclaredInclusive: boolean | undefined;
             let stopReason: string | undefined;
             let usageYielded = false;
             const indexMap = new Map<number, number>();
@@ -408,6 +436,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     if (typeof u.input_tokens === "number") roundInput = u.input_tokens;
                     if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
                     if (typeof u.cache_creation_input_tokens === "number") roundCreation = u.cache_creation_input_tokens;
+                    // #4128: an anthropic-wire relay stamps billing_usage on the start frame.
+                    const declared = declaredInclusiveFromUsage(u);
+                    if (declared !== undefined) roundDeclaredInclusive = declared;
+                    // #4072: the breakdown lives in exactly this frame — capture
+                    // it before neutralizeStartUsage scrubs the usage object from
+                    // the forwarded copy below.
+                    const startCacheCreation = cacheCreationOf(u);
+                    if (startCacheCreation) roundCacheCreation = startCacheCreation;
                     // #1455: suppression keys off ACTUAL forwarding state, not the round
                     // parameter — a re-fetched stream (blind truncation retry) re-parses
                     // at the SAME round, and re-emitting the start frame would hand the
@@ -591,6 +627,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     const input = typeof u.input_tokens === "number" ? u.input_tokens : undefined;
                     const cached = typeof u.cache_read_input_tokens === "number" ? u.cache_read_input_tokens : undefined;
                     const creation = typeof u.cache_creation_input_tokens === "number" ? u.cache_creation_input_tokens : undefined;
+                    // #4128: honour a billing_usage stamp carried on the delta frame.
+                    const declared = declaredInclusiveFromUsage(u);
+                    if (declared !== undefined) roundDeclaredInclusive = declared;
                     if (input !== undefined && input > 0 && cached !== undefined) {
                         // Complete authoritative usage object — e.g. the synthetic
                         // terminal of a stitched multi-round stream (round1
@@ -605,6 +644,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         roundInput = input;
                         roundCached = cached;
                         if (creation !== undefined) roundCreation = creation;
+                        const completeCacheCreation = cacheCreationOf(u);
+                        if (completeCacheCreation) roundCacheCreation = completeCacheCreation;
                     } else {
                         // Incomplete usage object: the input context is FIXED within
                         // a turn, so message_start is authoritative for input/cache
@@ -617,6 +658,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         if (input !== undefined && input > 0) roundInput = input;
                         if (cached !== undefined && cached > 0) roundCached = cached;
                         if (creation !== undefined && creation > 0) roundCreation = creation;
+                        const incompleteCacheCreation = cacheCreationOf(u);
+                        if (incompleteCacheCreation && cacheCreationMeaningful(incompleteCacheCreation)) {
+                            roundCacheCreation = incompleteCacheCreation;
+                        }
                     }
                     const d = (data.delta ?? {}) as Record<string, unknown>;
                     if (typeof d.stop_reason === "string") stopReason = d.stop_reason;
@@ -629,6 +674,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             outputTokens: roundOutput,
                             cachedTokens: roundCached,
                             creationTokens: roundCreation,
+                            declaredInclusive: roundDeclaredInclusive,
+                            cacheCreation: roundCacheCreation,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
@@ -652,6 +699,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             outputTokens: roundOutput,
                             cachedTokens: roundCached,
                             creationTokens: roundCreation,
+                            declaredInclusive: roundDeclaredInclusive,
+                            cacheCreation: roundCacheCreation,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
@@ -696,6 +745,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 opts?.usage?.inputTokens ?? 0,
                 opts?.usage?.cachedTokens ?? 0,
                 opts?.usage?.creationTokens,
+                opts?.usage?.cacheCreation,
                 opts?.terminalExtra,
             );
         },

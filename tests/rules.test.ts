@@ -9,7 +9,7 @@ import {
     RULE_TOOL_NAME,
     type Config,
 } from "acp-kernel";
-import { isProxyToolFor } from "../src/proxy-tool.js";
+import { isProxyToolFor } from "../src/absorb.ts";
 import { mergeCompress, applyCompressSettings } from "../src/compress-settings.ts";
 import { parseCompressSettings } from "../src/config.ts";
 import { RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES } from "../src/compress-tool.ts";

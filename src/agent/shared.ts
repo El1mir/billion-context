@@ -191,11 +191,19 @@ export async function fetchManifest(proxyBase: string, format: "anthropic" | "op
     if (!ok || !json || typeof json !== "object") throw new Error(`manifest fetch failed: ${status}`);
     recordManifestToolDuration(proxyBase, json);
     if (format === "openai") {
-        // OpenAI function style: {name, description, parameters} (plain JSON Schema).
-        const data = json as { tools?: { openai?: { name?: string; description?: string; parameters?: unknown }[] } };
-        const tools = (data.tools?.openai ?? []).filter((t): t is { name: string; description?: string; parameters?: unknown } => typeof t.name === "string");
+        // The proxy serves OpenAI entries NESTED — {type:"function",
+        // function:{name,description,parameters}} — mirroring the wire injector
+        // (#2656). A flat {name,description,parameters} entry is accepted too so
+        // either manifest layout parses; read whichever location carries each field.
+        const data = json as { tools?: { openai?: Array<{ name?: string; description?: string; parameters?: unknown; function?: { name?: string; description?: string; parameters?: unknown } }> } };
+        const tools: ManifestTool[] = [];
+        for (const t of data.tools?.openai ?? []) {
+            const name = t.name ?? t.function?.name;
+            if (typeof name !== "string" || name.length === 0) continue;
+            tools.push({ name, description: t.description ?? t.function?.description, inputSchema: t.parameters ?? t.function?.parameters ?? { type: "object", properties: {} } });
+        }
         if (tools.length === 0) throw new Error("manifest served no openai tools");
-        return tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.parameters ?? { type: "object", properties: {} } }));
+        return tools;
     }
     const data = json as { tools?: { anthropic?: { name?: string; description?: string; input_schema?: unknown }[] } };
     const tools = (data.tools?.anthropic ?? []).filter((t): t is { name: string; description?: string; input_schema?: unknown } => typeof t.name === "string");
@@ -325,6 +333,40 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
     }
 }
 
+type AttributionHealthReport = {
+    agent: string;
+    state: "ok" | "none" | "threw";
+    /** Model requests refused direct in the current degraded episode (0 after recovery). */
+    refusals: number;
+    /** Epoch ms of the first refusal in the current episode (0 while healthy). */
+    since: number;
+    /** #3651: last thrown attribution error text — the report only fires for
+     *  diagnosable failures (`threw`), so this is what makes the banner name
+     *  the actual problem instead of a generic "takeover broken". */
+    error?: string;
+    /** #3651: masked endpoint (origin+pathname) of the last refused request. */
+    endpoint?: string;
+};
+
+/** Takeover-attribution health report (#3581, contract reworked by #3651):
+ *  when the host plugin's gate refuses model traffic because its attribution
+ *  lookup THREW (disposed injection after a version swap — #3578), the proxy
+ *  must learn about it or the silent-direct degradation stays invisible in
+ *  /__bili/status and the panel. By-design agentless lanes (`none`) are normal
+ *  interceptions and NEVER report (#3651 owner contract) — so any report on
+ *  this route is either a diagnosable failure or a recovery notice. Sent on
+ *  threw-episode events (first refusal, state change to threw, count doubling,
+ *  give-up latch) plus recovery — fire-and-forget at call sites; a missed
+ *  report delays visibility, never touches the request path. */
+export async function reportAttributionHealth(proxyBase: string, health: AttributionHealthReport): Promise<void> {
+    const { ok, status } = await fetchJson(`${proxyBase}/__bili/plugin/attribution`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(health),
+    }, STATUS_TIMEOUT_MS);
+    if (!ok) throw new Error(`attribution report failed (${status})`);
+}
+
 /** #2204: business outcome of a forwarded tool call. ok:true means the tool
  *  RAN; whether it achieved its effect rides the endpoint's machine-readable
  *  `outcome` field (#1875). `failed` mirrors mcp.ts's mapping so every host
@@ -334,8 +376,9 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
  *  partial note in `text`. Absent on legacy envelopes without the fields. */
 export type ForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<ForwardedToolResult> {
-    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false, toolCallId?: string): Promise<ForwardedToolResult> {
+    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string } = { conversationId, tool, args: args ?? {} };
+    if (toolCallId !== undefined) body.toolCallId = toolCallId;
     // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
     // by the host's own session manager — declare it so a stale sibling witness
     // can neither redirect nor fail-closed the call (ladder rung 0, #2024/#2016).

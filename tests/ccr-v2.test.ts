@@ -64,7 +64,7 @@ function fold(opts: { ccr: boolean; preStore?: MessageContentStore }): FoldResul
     const config = applyCompressSettings(
         defaultConfig(200_000),
         200_000,
-        { ccr: opts.ccr ? { enabled: true, minToolTokens: 50 } : { enabled: false, minToolTokens: 50 } },
+        { absorb: { enabled: true, minToolTokens: 50 }, ccr: opts.ccr ? { enabled: true, minToolTokens: 50 } : { enabled: false, minToolTokens: 50 } },
     ) as Config;
     const session = getSession(`ccrv2-${Math.random().toString(36).slice(2)}`);
     if (opts.ccr) storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
@@ -401,12 +401,17 @@ test("e2e CCR v2 opt-in: no ccr config at any level leaves the session unarmed â
         });
         const sse = await res.text();
         assert.ok(res.ok, `client turn failed: HTTP ${res.status}: ${sse}`);
-        assert.equal(captured.length, 3, "initial request + one re-request per executed tool");
+        // The refused decompress is a failed-only round: under #156/#4186 its
+        // ephemeral frame never reaches upstream again, so the turn ends after
+        // the compress re-request and the refusal surfaces to the client as the
+        // failure receipt instead of riding a third request.
+        assert.equal(captured.length, 2, "initial + compress re-request only; refused decompress is never re-requested");
+        assert.match(captured[1]!, /Early history: messages 1-7 covered initial setup\./, "compress fold landed before the decompress attempt");
         // [#1207 owner decision] CCR is opt-in on every lane: with no ccr key
         // at any level the session never arms, so the range restore ack is the
         // "requires CCR" refusal instead of restored content.
-        assert.ok(!/restored 3 item\(s\)/.test(captured[2]!), "no restore without explicit opt-in");
-        assert.match(captured[2]!, /requires CCR/, "range restore refused: session unarmed by default");
+        assert.ok(!/restored 3 item\(s\)/.test(sse), "no restore without explicit opt-in");
+        assert.match(sse, /requires CCR/, "refusal surfaced to the client via the failure receipt");
     } finally {
         await closeAll();
     }

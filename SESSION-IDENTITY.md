@@ -182,6 +182,25 @@ request matched the openai-lane session at prefix depth 9/11, no new
 anonymous session, no re-fold, answers served from the fold summary, cache
 hit 97 % within two rounds. Captures and log in the #2791 thread.
 
+## Snapshot render: the session id becomes the whole message identity (#3756)
+
+The anonymous-adoption ladder above exists because the wire bytes were the
+only record of an unauthenticated conversation. For sessions with a bound
+id (host-native session header or affinity key) and unified storage
+available, #3756 closes the loop: the OUTBOUND history prefix is rendered
+from the server's own transcript keyed by that session id
+(`src/server/snapshot-render.ts`, rollout feature `snapshotRender`, default
+0%). Message identity for the rendered prefix is the server row `seq` —
+content hashes demote to chain-fallback evidence that only locates where
+the client's verbatim tail joins the server prefix. Client edits, host
+checkpoints and protocol switches can no longer move, drop or duplicate
+folded coverage, because coverage is computed from the block's seq/
+signature sets, not from what the client happens to resend. The
+adoption ladder above remains the fallback for the lanes where the feature
+is off, the storage is unavailable, or the chain cannot link — degrade,
+never guess. Full mechanism and honesty boundaries:
+`MESSAGE-IDENTITY.md` §"The snapshot render engine".
+
 ## Rejected alternatives
 
 | Direction | Why rejected |

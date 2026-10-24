@@ -120,7 +120,11 @@ function armSelfHeal(session: Session, detected: "plugin-lane-gone" | "nudge-idl
     session.metadata["selfHeal"] = { detected, action, since: Date.now() };
 }
 
-function reductionKey(session: Session): string {
+/** Fingerprint of "a reduction landed": a committed fold advances
+ * nextBlockId (or the plugin-lane compress tool stamps lastCompress). Exported
+ * so other nudge machinery (#3461 emergency backoff) watches the SAME evidence
+ * instead of inventing a parallel signal. */
+export function reductionKeyOf(session: Session): string {
     return `${session.state.nextBlockId}:${session.lastCompress?.at ?? 0}`;
 }
 
@@ -129,6 +133,42 @@ function reductionKey(session: Session): string {
  * MCP-prefixed form (mcp__bili__compress, zcode/claude-code lanes). */
 function isBiliToolName(name: string): boolean {
     return name.startsWith("mcp__bili__") || PROXY_TOOL_NAMES.has(name);
+}
+
+const TOOL_WALK_MAX_DEPTH = 8;
+// Codex serializes an MCP server on the Responses wire as a namespace entry
+// named exactly `mcp__<server>` whose members carry BARE names (openai/codex:
+// callable_namespace = format!("mcp__{server_name}")); the flat
+// `mcp__bili__<tool>` spelling is the legacy/other-host form. Both declare the
+// same MCP lane (#3522). Exact match only — `mcp__bilibili` must not count.
+const MCP_BILI_NAMESPACE_NAME = "mcp__bili";
+
+function declaresMcpBiliInList(entries: unknown, depth: number): boolean {
+    if (!Array.isArray(entries) || depth > TOOL_WALK_MAX_DEPTH) return false;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        const name = rec["name"];
+        if (typeof name === "string" && (name.startsWith("mcp__bili__") || name === MCP_BILI_NAMESPACE_NAME)) return true;
+        const fn = rec["function"];
+        if (fn !== null && typeof fn === "object") {
+            const name = (fn as Record<string, unknown>)["name"];
+            if (typeof name === "string" && name.startsWith("mcp__bili__")) return true;
+        }
+        if (declaresMcpBiliInList(rec["functionDeclarations"], depth + 1)) return true;
+        if (declaresMcpBiliInList(rec["tools"], depth + 1)) return true;
+    }
+    return false;
+}
+
+/** Strict MCP-lane evidence: the request itself declares the fixed bili MCP
+ *  server — either as flat `mcp__bili__<tool>` names (legacy/other hosts) or
+ *  as a Codex-style Responses namespace entry named exactly `mcp__bili`.
+ *  Bare ACP names can also be wire-injected by the proxy, so they must not
+ *  authorize a pending MCP registration (#3522). */
+export function declaresMcpBiliToolsOnWire(parsed: unknown): boolean {
+    if (parsed === null || typeof parsed !== "object") return false;
+    return declaresMcpBiliInList((parsed as Record<string, unknown>)["tools"], 0);
 }
 
 export function countBiliToolUses(messages: CoreMessage[]): number {
@@ -142,7 +182,8 @@ type SelfHealRoundInputs = {
     pluginHeaderPresent: boolean;
     /** the request's own tools array declares bili tools (live MCP lane) */
     biliToolsDeclared: boolean;
-    /** a nudge was actually injected into this round's payload */
+    /** a nudge was injected into this round's payload, or the round carried
+     * admitted over-limit pressure held only by the #3461 backoff ("gated") */
     nudgeActive: boolean;
     /** bili tool_use entries in the re-sent history (plugin-mode evidence the agent is still compressing) */
     biliToolUses: number;
@@ -159,7 +200,7 @@ type LogFn = (level: "info" | "warn", message: string) => void;
 export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInputs, log: LogFn): void {
     const st = counters.get(session) ?? { lastReductionKey: undefined, zombieStreak: 0, idleStreak: 0 };
     counters.set(session, st);
-    const key = reductionKey(session);
+    const key = reductionKeyOf(session);
     const reduction = st.lastReductionKey !== undefined && key !== st.lastReductionKey;
     st.lastReductionKey = key;
 
@@ -238,22 +279,27 @@ export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInp
  * MCP subprocess removed mid-session) stops declaring them. Tolerant by
  * design: unknown shapes answer false and the header signal still carries
  * the healthy-plugin case. */
-export function biliToolsDeclaredOnWire(parsed: unknown, protocol: string): boolean {
+export function biliToolsDeclaredOnWire(parsed: unknown, protocol: string, named?: string): boolean {
     if (parsed === null || typeof parsed !== "object") return false;
     const body = parsed as Record<string, unknown>;
     const tools = body["tools"];
+    // #3417: with `named`, reachability is judged for the SPECIFIC tool the
+    // caller is about to advertise (e.g. the nudge names "compress") — a lane
+    // that only exposes acp_status must not arm the compress surface
+    // (#3403 review follow-up). Without it, any bili tool counts (legacy use).
+    const wanted = (name: string): boolean => named === undefined ? isBiliToolName(name) : name === named;
     if (!Array.isArray(tools)) return false;
     for (const t of tools) {
         if (t === null || typeof t !== "object") continue;
         const rec = t as Record<string, unknown>;
         // anthropic / responses: flat { name }.
         const flat = typeof rec["name"] === "string" ? (rec["name"] as string) : undefined;
-        if (flat !== undefined && isBiliToolName(flat)) return true;
+        if (flat !== undefined && wanted(flat)) return true;
         // openai chat: { function: { name } }.
         const fn = rec["function"];
         if (fn !== null && typeof fn === "object") {
             const inner = (fn as Record<string, unknown>)["name"];
-            if (typeof inner === "string" && isBiliToolName(inner)) return true;
+            if (typeof inner === "string" && wanted(inner)) return true;
         }
         // google: { functionDeclarations: [{ name }] }.
         const decls = rec["functionDeclarations"];
@@ -261,7 +307,7 @@ export function biliToolsDeclaredOnWire(parsed: unknown, protocol: string): bool
             for (const d of decls) {
                 if (d !== null && typeof d === "object") {
                     const n = (d as Record<string, unknown>)["name"];
-                    if (typeof n === "string" && isBiliToolName(n)) return true;
+                    if (typeof n === "string" && wanted(n)) return true;
                 }
             }
         }
